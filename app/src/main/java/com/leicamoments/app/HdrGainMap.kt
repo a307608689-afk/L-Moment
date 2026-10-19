@@ -207,6 +207,28 @@ object HdrGainMap {
         }
     }
 
+    /**
+     * 只保留主图：截断到主图 EOI，丢弃 EOI 之后残留的二次图（增益图 / 动态照片尾数据）。
+     *
+     * 用于「没有装配 UltraHDR」的导出：导入期已判定要走缩放重编码（hdr=null、不回嵌），
+     * 但处理链输出仍可能带着与主图不再匹配的增益图尾数据——主图被缩小、增益图还是原尺寸，
+     * 读端按 UltraHDR 渲染会发灰或高光断层。此时必须显式裁掉，保证导出是纯单图。
+     */
+    fun truncateToPrimary(jpeg: ByteArray): ByteArray = try {
+        if (!isJpeg(jpeg)) {
+            jpeg
+        } else {
+            val out = truncateAtEoi(jpeg)
+            if (out.size != jpeg.size) {
+                DiagLog.i("HdrGainMap", "剥离主图 EOI 后残留 ${jpeg.size - out.size}B" +
+                        "（未装配 UltraHDR，残留增益图与缩放后主图不匹配）")
+            }
+            out
+        }
+    } catch (t: Throwable) {
+        jpeg
+    }
+
     // ---- 装配结果自检（纯字节回读，不依赖平台解码器/相册）----
 
     /**

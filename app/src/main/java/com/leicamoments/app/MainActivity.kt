@@ -1155,8 +1155,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 // JPG 像素尺寸（仅读头）：rawSize = 存储尺寸（日志用），oriSize = 方向归一后的实际像素尺寸
                 val rawSize = if (trimmed != null) ImageUtils.probeJpegSize(bytes) else null
-                // 直通判据必须看「归一后」尺寸：竖拍 JPG 像素横存（4096×3072 + Orientation=6），
-                // 归一后是 3072×4096，高 4096 超引擎上限（引擎按轴限：宽 ≤4096 且 高 ≤3072）
+                // 直通判据按引擎的横置口径（长 ≤4096 且 短 ≤3072）：竖拍图送引擎前会被旋转 -90°，
+                // 竖 3072×4096 旋转后正好 4096×3072 合规，故竖拍 12.5MP 也能原字节直通（旧宽/高口径会误缩）
                 val oriSize = if (trimmed != null) ImageUtils.probeOrientedSize(bytes) else null
                 val jpegDirect = trimmed != null && oriSize != null &&
                     ImageUtils.withinWorkLimit(oriSize[0], oriSize[1])
@@ -1167,7 +1167,7 @@ class MainActivity : AppCompatActivity() {
                 if (isJpeg && rawSize != null && !jpegDirect) {
                     DiagLog.i("Import",
                         "JPG 存储 ${rawSize[0]}x${rawSize[1]} 归一后 ${oriSize?.get(0)}x${oriSize?.get(1)} " +
-                        "超引擎上限（宽≤4096 高≤3072）将缩放，跳过 HDR 增益图回嵌")
+                        "超引擎上限（横置口径 长≤4096 短≤3072）将缩放，跳过 HDR 增益图回嵌")
                 }
                 if (hdr != null) {
                     DiagLog.i("Import", "检测到 HDR 增益图 ${hdr.gainmapJpeg.size}B，导出将回嵌 UltraHDR")
@@ -1318,18 +1318,16 @@ class MainActivity : AppCompatActivity() {
         val h = decoded[1]
         val full = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         full.setPixels(decoded, 2, w, 0, 0, w, h)
-        // 引擎按轴限（宽 ≤4096 且 高 ≤3072）：常规 12.5MP Binned RAW（4096×3072）原样通过零变化；
-        // 超出者（如 50MP RAW、竖存 RAW）先缩到限内，否则 styletrans 直接 exit=134 硬崩
+        // 引擎上限=横置口径（长 ≤4096 且 短 ≤3072）：常规 12.5MP Binned RAW（4096×3072）原样通过零变化；
+        // 超出者（如 50MP RAW、200MP RAW）先缩到限内，否则 styletrans 直接 exit=134 硬崩
         var base = full
         if (!ImageUtils.withinWorkLimit(w, h)) {
-            val s = minOf(
-                ImageUtils.MAX_WORK_WIDTH.toFloat() / w,
-                ImageUtils.MAX_WORK_HEIGHT.toFloat() / h)
+            val s = ImageUtils.workScale(w, h)
             val nw = (w * s).toInt().coerceAtLeast(1)
             val nh = (h * s).toInt().coerceAtLeast(1)
             base = Bitmap.createScaledBitmap(full, nw, nh, true)
             if (base !== full) full.recycle()
-            DiagLog.w("Import", "RAW ${w}x${h} 超引擎上限（宽≤4096 高≤3072），工作字节缩到 ${nw}x${nh}")
+            DiagLog.w("Import", "RAW ${w}x${h} 超引擎上限（横置口径 长≤4096 短≤3072），工作字节缩到 ${nw}x${nh}")
         }
         val p = scaleBitmap(base, 1600)
         val work = ImageUtils.toJpeg(base, 95)
@@ -2969,9 +2967,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 val marked = LeicaMark.mark(out)
                 if (marked === out) DiagLog.w("Export", "徽章写入失败（返回原字节）")
-                // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）
+                // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）；
+                // 未回嵌时裁掉 EOI 之后的残留二次图，避免「主图已缩放、增益图仍是原尺寸」的错配
                 val hdrSrc = pendingHdr
-                val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc) else marked
+                val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
+                    else HdrGainMap.truncateToPrimary(marked)
                 // 装配结果自检：报告最终字节里的增益图/容器结构（detail 已进 DiagLog）
                 val hdrChk = HdrGainMap.verify(finalBytes)
                 val diag = MarkDiagnostic.describe(marked) + " " + hdrChk.brief
@@ -3016,9 +3016,10 @@ class MainActivity : AppCompatActivity() {
                     return@post
                 }
                 val marked = LeicaMark.mark(out)
-                // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF）
+                // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF）；未回嵌则裁掉残留增益图尾数据
                 val hdrSrc = pendingHdr
-                val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc) else marked
+                val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
+                    else HdrGainMap.truncateToPrimary(marked)
                 val hdrChk = HdrGainMap.verify(finalBytes)
                 val uri = saveNamed(finalBytes,
                     "Leica_${styleId}_perfect_${System.currentTimeMillis()}.jpg")

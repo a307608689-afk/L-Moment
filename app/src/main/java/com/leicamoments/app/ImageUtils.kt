@@ -40,17 +40,30 @@ object ImageUtils {
     }
 
     /**
-     * 工作字节尺寸上限：M9 系 styletrans 引擎的硬性输入限制，**按轴判定（宽 ≤4096 且 高 ≤3072）**，
-     * 不是长/短边判定。实测依据：
-     * 4096×3072 PASS、4100 宽 FAIL、**1600×3120 FAIL**——后者长边仅 3120 < 4096，只有「高 > 3072」能解释，
-     * 故高轴独立受限。超限死法 = OpenCV copyMakeBorder 负 padding 断言，exit=134 硬 abort 无降级。
+     * 工作字节尺寸上限：M9 系 styletrans 引擎只接受**横置**画面，硬限为 长边 ≤4096 且 短边 ≤3072。
+     *
+     * 为什么是长/短边而不是宽/高：引擎吃的是横置画面，而 [com.codex.leicaapp.LegendaryPostProcessor]
+     * 的 applyStyleOriented 在送引擎前会把竖图旋转 -90°（竖 3072×4096 → 横 4096×3072）再转回。
+     * 若此处按竖置宽高判定，竖拍图会被白白多缩一刀：
+     *   · 竖 3072×4096（12.5MP 竖拍）旧口径高 4096 > 3072 → 缩到 2304×3072（丢 60% 像素）；
+     *   · 横置口径长 4096 短 3072 → 合规，旋转后正好 4096×3072，零缩放零重编码。
+     * 超限死法 = OpenCV copyMakeBorder 负 padding 断言，exit=134 硬 abort 无降级，故上限必须严格守住。
      */
-    const val MAX_WORK_WIDTH = 4096
-    const val MAX_WORK_HEIGHT = 3072
+    const val MAX_WORK_LONG = 4096
+    const val MAX_WORK_SHORT = 3072
 
-    /** 像素尺寸是否已在工作上限内（宽/高逐轴判定）。 */
+    /** 像素尺寸是否已在工作上限内（横置口径：长边/短边逐轴判定）。 */
     fun withinWorkLimit(w: Int, h: Int): Boolean =
-        w in 1..MAX_WORK_WIDTH && h in 1..MAX_WORK_HEIGHT
+        w >= 1 && h >= 1 && maxOf(w, h) <= MAX_WORK_LONG && minOf(w, h) <= MAX_WORK_SHORT
+
+    /** 把 (w,h) 等比压进横置口径所需的缩放系数；已在限内返回 1f。 */
+    fun workScale(w: Int, h: Int): Float {
+        if (w < 1 || h < 1) return 1f
+        return minOf(
+            1f,
+            MAX_WORK_LONG.toFloat() / maxOf(w, h),
+            MAX_WORK_SHORT.toFloat() / minOf(w, h))
+    }
 
     /** 仅读文件头拿像素尺寸（不分配像素内存），失败返回 null。这是「存储尺寸」，未考虑 EXIF 方向。 */
     fun probeJpegSize(bytes: ByteArray): IntArray? {
@@ -66,10 +79,10 @@ object ImageUtils {
     /**
      * JPEG 的「方向归一后」像素尺寸（宽高已按 EXIF Orientation 互换）。
      *
-     * 为什么必须看归一后的尺寸：相机竖拍 JPG 像素是**横存**的（如 4096×3072）+ Orientation=6，
-     * [normalizeExifOrientation] 会把像素转正成 3072×4096。引擎上限按轴判定（高 ≤3072），
-     * 若只看存储尺寸会把它当成 4096×3072 放行，实际送进引擎的是高 4096 → 直接 exit=134。
-     * 读取失败（无 EXIF / 非 JPEG）按原尺寸返回。
+     * 相机竖拍 JPG 像素是**横存**的（如 4096×3072）+ Orientation=6，[normalizeExifOrientation]
+     * 会把像素转正成 3072×4096，日志与超分提示都需要这个「真实朝向」尺寸。
+     * 注：工作上限已改为长/短边口径（宽高互换不变），故判定结果与存储尺寸等价，
+     * 这里保留归一尺寸纯粹为了语义清晰。读取失败（无 EXIF / 非 JPEG）按原尺寸返回。
      */
     fun probeOrientedSize(bytes: ByteArray): IntArray? {
         val size = probeJpegSize(bytes) ?: return null
@@ -117,15 +130,12 @@ object ImageUtils {
     }
 
     /**
-     * 全分辨率工作位图：不做预览级降采样，仅在超过 [MAX_WORK_WIDTH]/[MAX_WORK_HEIGHT] 时按**轴**等比封顶。
+     * 全分辨率工作位图：不做预览级降采样，仅在超过横置口径（长 ≤4096 短 ≤3072）时等比封顶。
      * 缩放在 onHeaderDecoded 里用 setTargetSize 完成——超大图（50MP/200MP 级）直接解到目标尺寸，
      * 峰值内存为目标位图本身，而非「先全解再缩」。
-     * 返回位图保证两件事：①EXIF 方向已应用（像素摆正，Orientation 语义为 1）；②尺寸已在工作上限内（逐轴）。
+     * 返回位图保证两件事：①EXIF 方向已应用（像素摆正，Orientation 语义为 1）；②尺寸已在工作上限内。
      */
-    fun decodeWork(
-        context: Context, uri: Uri,
-        maxWidth: Int = MAX_WORK_WIDTH, maxHeight: Int = MAX_WORK_HEIGHT,
-    ): Bitmap? {
+    fun decodeWork(context: Context, uri: Uri): Bitmap? {
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 val source = ImageDecoder.createSource(context.contentResolver, uri)
@@ -134,7 +144,7 @@ object ImageUtils {
                     val w = info.size.width
                     val h = info.size.height
                     if (w > 0 && h > 0) {
-                        val s = minOf(1f, maxWidth.toFloat() / w, maxHeight.toFloat() / h)
+                        val s = workScale(w, h)
                         if (s < 1f) {
                             decoder.setTargetSize(
                                 (w * s).toInt().coerceAtLeast(1),
@@ -142,23 +152,21 @@ object ImageUtils {
                         }
                     }
                 }
-                // info.size 在「方向归一前/后」上是实现细节，解码后再按轴收敛一次兜底
+                // info.size 在「方向归一前/后」上是实现细节，解码后再按横置口径收敛一次兜底
                 clampToWorkLimit(decoded)
             } else {
-                // API<28 兜底：BitmapFactory 不认 EXIF 方向，这里按方向标签摆正后再按轴收敛
-                clampToWorkLimit(decodeOrientedWithBitmapFactory(context, uri, maxWidth))
+                // API<28 兜底：BitmapFactory 不认 EXIF 方向，这里按方向标签摆正后再按横置口径收敛
+                clampToWorkLimit(decodeOrientedWithBitmapFactory(context, uri, MAX_WORK_LONG))
             }
         } catch (e: Exception) {
             null
         }
     }
 
-    /** 按轴把位图收敛到工作上限内；已在限内直接返回原对象（不复制）。 */
+    /** 按横置口径把位图收敛到工作上限内；已在限内直接返回原对象（不复制）。 */
     private fun clampToWorkLimit(bmp: Bitmap): Bitmap {
         if (withinWorkLimit(bmp.width, bmp.height)) return bmp
-        val s = minOf(
-            MAX_WORK_WIDTH.toFloat() / bmp.width,
-            MAX_WORK_HEIGHT.toFloat() / bmp.height)
+        val s = workScale(bmp.width, bmp.height)
         val out = Bitmap.createScaledBitmap(
             bmp,
             (bmp.width * s).toInt().coerceAtLeast(1),

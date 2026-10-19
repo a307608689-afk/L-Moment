@@ -180,9 +180,11 @@ object SuperResTask {
                     Log.e("SuperRes", "mark failed, export unmarked", t)
                     workBytes
                 }
-                // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）
+                // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）；
+                // 未回嵌则裁掉 EOI 之后的残留二次图（增益图与超分后的主图尺寸必然不匹配）
                 val hdrSrc = pendingHdr
-                val exported = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc) else marked
+                val exported = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
+                    else HdrGainMap.truncateToPrimary(marked)
                 // 装配结果自检（detail 里的比例/容器结构进 DiagLog）
                 HdrGainMap.verify(exported)
                 val styleId = pendingStyle?.id ?: "orig"
