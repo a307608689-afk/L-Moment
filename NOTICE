@@ -1,0 +1,21 @@
+L-Moment
+Copyright (c) 2026 L-Moment contributors
+Licensed under the MIT License. See LICENSE.
+
+Third-party components
+======================
+
+1. LibRaw — https://www.libraw.org/
+   Copyright (C) 2008-2024 LibRaw LLC and contributors.
+   Dual-licensed under LGPL-2.1 and CDDL-1.0; this project uses it under
+   CDDL-1.0. The complete, unmodified source is included in
+   app/src/main/cpp/libraw/ with all original copyright headers preserved.
+   Local build flags only (LIBRAW_NO_OPENMP, LIBRAW_NOTHREADS, LIBRAW_NODLL).
+
+Not distributed
+===============
+This repository does not contain, and must not contain: vendor engine
+libraries, vendor filter snapshots, vendor parameter tables, vendor device
+metadata, third-party pre-trained model weights, or any file extracted from
+a device or an application package. Model files that are not part of this
+repository cause the related processing path to fall back automatically.

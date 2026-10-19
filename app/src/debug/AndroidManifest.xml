@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  仅 debug 变体：ADB 批量测试入口 + 它读写 /sdcard/LeicaTestIn|Out 所需的外部存储权限。
+
+  分享用的 release 变体不合并本文件，因此既不含 BatchTestActivity（类字节码也不在
+  release 的 dex 里），也不声明 MANAGE_EXTERNAL_STORAGE。
+
+  用法（debug 包）：
+      gradle assembleDebug
+      adb install -r app/build/outputs/apk/debug/app-debug.apk
+      adb shell appops set com.leicamoments.app MANAGE_EXTERNAL_STORAGE allow
+      adb shell am start -n com.leicamoments.app/.BatchTestActivity
+  启动参数（extra）：style=LM9,LP9   indir=/sdcard/LeicaTestIn   outdir=/sdcard/LeicaTestOut
+  注：本注释刻意不写 adb 的双连字符选项写法 —— XML 注释内不允许出现连续两个连字符。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application>
+        <activity
+            android:name=".BatchTestActivity"
+            android:exported="true" />
+    </application>
+
+</manifest>

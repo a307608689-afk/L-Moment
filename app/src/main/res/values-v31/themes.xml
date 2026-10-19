@@ -1,0 +1,10 @@
+<resources>
+    <!--
+      Android 12+ 启动画面：splash 背景默认取 windowBackground，这里显式钉成纯黑，
+      避免冷启动时先白一下再进正文。
+      公共项都放在 Base 里，这里只补 v31 独有的一条。
+    -->
+    <style name="Theme.LeicaMoments" parent="Base.Theme.LeicaMoments">
+        <item name="android:windowSplashScreenBackground">#FF000000</item>
+    </style>
+</resources>

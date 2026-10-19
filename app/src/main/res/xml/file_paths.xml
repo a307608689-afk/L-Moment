@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 分享面板生成单条色彩 .lmc 的落点，随缓存清理自动回收 -->
+    <cache-path
+        name="share"
+        path="share/" />
+</paths>

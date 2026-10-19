@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 标题右侧的小三角：表示「点这里可展开分类列表」 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="10dp"
+    android:height="7dp"
+    android:viewportWidth="10"
+    android:viewportHeight="7">
+    <path
+        android:fillColor="#8E8E93"
+        android:pathData="M0,0 L10,0 L5,7 Z" />
+</vector>

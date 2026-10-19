@@ -1,0 +1,401 @@
+package com.leicamoments.app
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Matrix
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import com.codex.leicaapp.Dither
+import com.codex.leicaapp.LegendaryPostProcessor
+import com.codex.leicaapp.MadridLegendary
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.FloatBuffer
+import java.util.zip.CRC32
+import kotlin.math.roundToInt
+
+/**
+ * M9「一体化蒸馏」微网推理链（学生网 = 整条重链的蒸馏结果）。
+ *
+ * 定位：M9OrtFallback 把 StyleTrans(1024x768) + 真 ColorFix(544 分块) 两段重网络搬到端上
+ * （网络段 ~3s）；本链用蒸馏出的 0.64MB 微网（HDRNet-lite 双边网格）**一次前向直接在全分辨率
+ * 分块上出图**，取代「小图推理 + 上采样 + 高频搬运」整段。
+ *
+ * 接线：M9 / M9+ / M10R 三张卡片的降级链「降级 1.25」，插在 ORT 重链（降级 1.5）**之前**；
+ * 因此三处的调用形状与 M9OrtFallback.run 一致——暖调 LUT、M9P 色彩后推、M10R 暗角颗粒
+ * 都由调用方照旧施加，本对象只负责 styled 段。另有独立卡片 Style.M9D 直接调用它。
+ *
+ * 学生网输入/输出（与训练口径严格一致，勿改）：
+ *   lowres (1,3,n/2,n/2) : 该分块自身 2:1 盒降采样后 /255（训练时 = cv2.resize(tile,256,INTER_AREA)）
+ *   full   (1,3,n,n)     : 该分块 /255
+ *   out    (1,3,n,n)     : [0,1] 直接是整块结果（网格仿射 + 中频残差都已在网内）
+ *   n = 分块输入边长。权重/图与 ckpt 导出逐位一致，仅 lowres 的 H/W 声明为动态
+ *   （原资产写死 256x256，只够喂 512 块；halo 口径需要能喂 1216 → 已重导并逐位对拍通过）。
+ *
+ * 几何协议 v2（2026-10-12 接缝修复，PC 端 23/25 号脚本验证）：
+ *   fit 4096x3072 → 按「保留区」KEEP 步进、每块四周各多喂 HALO 像素（越界行列边缘复制）、
+ *   **只取中心 KEEP×KEEP** 拼回（末块贴边、后写覆盖）→ 画布域结果 → 缩放回原尺寸 → 竖图转回。
+ *   为什么必须裁边：微网的低分分支在每个输入分块的边界是零填充，边界一圈（实测 ≈96px）的
+ *   色调场与中频残差都是脏的；旧口径（512 块直接拼）把脏边正好摆在接缝上，在大平滑面
+ *   （天空/旗面）表现为可见「格子」（平坦区跨线 z：旧 +7.2~+8.4 → halo96 +0.3~+1.1 = 噪声地板）。
+ *   代价：单块面积比 (KEEP+2*HALO)²/KEEP² = 1.42×（4096x3072 共 12 块，PC 0.76s → 1.08s）。
+ *   PC 实测：切片输出 vs teacher = 4.03 u8（crop 口径 3.61）；外观漂移（新旧对比）mean 0.4~0.5/255。
+ *
+ * 失败（OOM/asset 缺失/推理异常）返回 null，调用方继续往下一级降级，不崩。
+ */
+object M9Distill {
+
+    private const val TAG = "M9DIST"
+    private const val MODEL_ASSET = "m9_distill.onnx"
+
+    // 分块口径 v2：保留区 KEEP、四周各喂 HALO（见文件头几何协议 v2）
+    private const val KEEP = 1024
+    private const val HALO = 96
+    private const val MIN_CANVAS = 256          // 画布最小边下限（更小先放大再跑，保证网格有足够格数）
+    private const val W4K = 4096
+    private const val H4K = 3072
+    private const val INV255 = 1f / 255f
+
+    /**
+     * 蒸馏链专用降噪缩放（阻断平坦区色块的第一道）。
+     *
+     * native 暖调的 denoise=0.6 是为 styletrans 输出（自带网噪）配的；学生网输出本身
+     * 干净得多（实测 b* 高频 σ 0.07 vs 原图 0.11），0.6 属于过杀——它把平坦区相邻像素
+     * 抹成完全相同的常量，后级 8bit 量化后就显出 10~30px 的色块（等高线）。
+     * 乘 0.33（0.6→0.2）保留暖调/影调语义，同时让平坦区留下足以掩盖量化台阶的微结构。
+     * 只作用于本链；styletrans 原生链与 ORT 重链仍用 0.6（它们的输出本来带噪）。
+     */
+    private const val DENOISE_SCALE = 0.33f
+
+    /** 量化前抖色幅度（LSB）：①打在 LUT 输入侧，让相邻像素落到不同 LUT bin；②打在 8bit 出口。 */
+    private const val DITHER_PRE = 1.0f
+    private const val DITHER_POST = 1.0f
+
+    @Volatile private var env: OrtEnvironment? = null
+    @Volatile private var session: OrtSession? = null
+
+    // styled 单槽缓存（网络输出与暖调参数无关，M9/M9D 共用同一份输入时可直接复用）
+    @Volatile private var cacheHash: Long = Long.MIN_VALUE
+    @Volatile private var cacheStyled: Bitmap? = null
+
+    /**
+     * @param warmBin 暖调 LUT bin 资产名（蒸馏网只取代 styled 段，暖调语义与 M9 一致保留）
+     * @return 处理后 JPEG 字节；任何失败返回 null
+     */
+    fun run(
+        app: Context,
+        jpeg: ByteArray,
+        denoise: Float = 0.6f,
+        ev: Float = -0.95f,
+        warmth: Float = 0.3f,
+        warmBin: String = "leica_filter_param_m9_snapshot.bin",
+    ): ByteArray? {
+        return try {
+            val t0 = System.currentTimeMillis()
+            val styled = styledCached(app, jpeg, crc32(jpeg)) ?: return null
+
+            // 暖调必须在副本上做：applyWarmLutBitmapBin 对 mutable 输入是「原地改并返回同一对象」，
+            // 而 styled 在正常路径就是 mutable —— 直接喂它再 recycle，会把单槽缓存里那张位图废掉
+            // （下次命中即 "Can't compress a recycled bitmap"），同时缓存会变成「已暖调」，
+            // 命中后会再暖一次（双重暖调偏色）。改后缓存语义固定为「网络输出，未暖调」。
+            val work = styled.copy(Bitmap.Config.ARGB_8888, true) ?: return null
+            // 抖色①（LUT 输入侧）：相邻像素随机落到不同 LUT bin，bin 边界不再连成等值线
+            Dither.tpdf(work, DITHER_PRE)
+            val warmed = LegendaryPostProcessor.applyWarmLutBitmapBin(
+                app, work, warmBin, denoise * DENOISE_SCALE, ev, warmth)
+            val bos = ByteArrayOutputStream(jpeg.size)
+            val outBmp = warmed ?: work
+            // 抖色②（8bit 出口）：native 输出已是 8bit，台阶在平坦区固化成常量块，这里最后打散
+            Dither.tpdf(outBmp, DITHER_POST)
+            outBmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            if (outBmp !== work) work.recycle()
+            outBmp.recycle()
+            val out = MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            DiagLog.w(TAG, "蒸馏链完成 ${out.size}B, ${System.currentTimeMillis() - t0}ms")
+            out
+        } catch (t: Throwable) {
+            DiagLog.e(TAG, "蒸馏链失败，回落上一级", t)
+            null
+        }
+    }
+
+    private fun styledCached(app: Context, jpeg: ByteArray, hash: Long): Bitmap? {
+        cacheStyled?.let { cached ->
+            if (cacheHash == hash) {
+                DiagLog.w(TAG, "styled 缓存命中 (${cached.width}x${cached.height})")
+                return cached
+            }
+        }
+        synchronized(this) {
+            cacheStyled?.let { cached ->
+                if (cacheHash == hash) {
+                    DiagLog.w(TAG, "styled 缓存命中 (${cached.width}x${cached.height})")
+                    return cached
+                }
+            }
+            val s = styledInternal(app, jpeg) ?: return null
+            cacheHash = hash
+            cacheStyled = s
+            return s
+        }
+    }
+
+    /** 微网推理 + 几何还原，产出未加暖调的 styled Bitmap（mutable，供暖调就地写回）。 */
+    private fun styledInternal(app: Context, jpeg: ByteArray): Bitmap? {
+        val t0 = System.currentTimeMillis()
+        val sess = obtainSession(app) ?: return null
+        val e = env!!
+
+        val src = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return null
+        val portrait = src.height > src.width
+        val landscape = if (portrait) rotate(src, -90f) else src
+        if (landscape !== src) src.recycle()
+
+        val fitted = fit(landscape)
+        if (fitted !== landscape) landscape.recycle()
+        val fw = fitted.width
+        val fh = fitted.height
+
+        // 画布过小（短边 < MIN_CANVAS，微网网格格数不够）→ 等比放大，跑完再缩回
+        var work = fitted
+        if (minOf(fw, fh) < MIN_CANVAS) {
+            val s = MIN_CANVAS.toDouble() / minOf(fw, fh)
+            work = Bitmap.createScaledBitmap(fitted, Math.ceil(fw * s).toInt(),
+                Math.ceil(fh * s).toInt(), true)
+            fitted.recycle()
+        }
+        val ww = work.width
+        val wh = work.height
+
+        val outPx = tiledInfer(sess, e, work)
+        work.recycle()
+        if (outPx == null) return null
+
+        var result = Bitmap.createBitmap(ww, wh, Bitmap.Config.ARGB_8888)
+        result.setPixels(outPx, 0, ww, 0, 0, ww, wh)
+
+        if (ww != fw || wh != fh) {
+            val back = Bitmap.createScaledBitmap(result, fw, fh, true)
+            result.recycle()
+            result = back
+        }
+        if (fw != landscape.width || fh != landscape.height) {
+            val back = Bitmap.createScaledBitmap(result, landscape.width, landscape.height, true)
+            result.recycle()
+            result = back
+        }
+        landscape.recycle()
+
+        val finalBmp = if (portrait) rotateMutable(result, 90f) else result
+        if (finalBmp !== result) result.recycle()
+        DiagLog.w(TAG, "styled 就绪 ${finalBmp.width}x${finalBmp.height}, "
+                + "${System.currentTimeMillis() - t0}ms")
+        return finalBmp
+    }
+
+    /**
+     * 分块逐块推理并拼回整幅（返回 ARGB 像素数组，失败返回 null）。
+     *
+     * v2：每块保留区 keep×keep（keep = min(KEEP, 画布短边) 向下取偶），四周各多喂 HALO 像素
+     * （越界行列边缘复制），**只取中心 keep×keep 写回** —— 把每块自身的边缘脏带裁掉。
+     */
+    private fun tiledInfer(sess: OrtSession, e: OrtEnvironment, bmp: Bitmap): IntArray? {
+        val w = bmp.width
+        val h = bmp.height
+        val outPx = IntArray(w * h)
+        var keep = minOf(KEEP, minOf(w, h))
+        keep -= keep and 1                                   // 偶数对齐（2:1 盒降采样要求）
+        if (keep < 16) return null
+        val n = keep + 2 * HALO
+        val low = n / 2
+        val xs = tileOffsets(w, keep)
+        val ys = tileOffsets(h, keep)
+        val plane = n * n
+        val lowPlane = low * low
+
+        val fullBuf = ByteBuffer.allocateDirect(4 * plane * 3)   // 3 平面 float
+            .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
+        val lowBuf = ByteBuffer.allocateDirect(4 * lowPlane * 3)
+            .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
+        val tilePx = IntArray(plane)
+        val tmpPx = IntArray(plane)
+        val lowPx = IntArray(lowPlane)
+
+        try {
+            for (y0 in ys) {
+                for (x0 in xs) {
+                    readBlock(bmp, x0, y0, n, tilePx, tmpPx)
+                    boxDown2(tilePx, n, lowPx)
+                    fillPlanesCHW(tilePx, plane, fullBuf)
+                    fillPlanesCHW(lowPx, lowPlane, lowBuf)
+
+                    val fullT = OnnxTensor.createTensor(
+                        e, fullBuf, longArrayOf(1, 3, n.toLong(), n.toLong()))
+                    val lowT = OnnxTensor.createTensor(
+                        e, lowBuf, longArrayOf(1, 3, low.toLong(), low.toLong()))
+                    fullT.use { ft ->
+                        lowT.use { lt ->
+                            sess.run(mapOf("lowres" to lt, "full" to ft)).use { res ->
+                                val ob = (res[0] as OnnxTensor).floatBuffer
+                                for (ty in 0 until keep) {
+                                    val y = y0 + ty
+                                    if (y >= h) break
+                                    var o = y * w + x0
+                                    val i = (ty + HALO) * n + HALO        // 中心区起点
+                                    val iG = plane + i
+                                    val iB = plane * 2 + i
+                                    for (tx in 0 until keep) {
+                                        if (x0 + tx >= w) break
+                                        val r = (ob.get(i + tx) * 255f).roundToInt().coerceIn(0, 255)
+                                        val g = (ob.get(iG + tx) * 255f).roundToInt().coerceIn(0, 255)
+                                        val b = (ob.get(iB + tx) * 255f).roundToInt().coerceIn(0, 255)
+                                        outPx[o++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            DiagLog.e(TAG, "分块推理失败", t)
+            return null
+        }
+        return outPx
+    }
+
+    /**
+     * 读一块 n×n（含四周 halo）：越界行列用**边缘复制**补齐。
+     * 不能用黑边——低分分支会把黑边当真内容算进色调场，画出暗角式脏边。
+     * dst/tmp 由调用方复用（tmp 为 clamped 子矩形的中转）。
+     */
+    private fun readBlock(bmp: Bitmap, x0: Int, y0: Int, n: Int,
+                          dst: IntArray, tmp: IntArray) {
+        val bx = x0 - HALO
+        val by = y0 - HALO
+        val cx0 = maxOf(0, bx)
+        val cy0 = maxOf(0, by)
+        val cx1 = minOf(bmp.width, bx + n)
+        val cy1 = minOf(bmp.height, by + n)
+        val cw = cx1 - cx0
+        bmp.getPixels(tmp, 0, cw, cx0, cy0, cw, cy1 - cy0)
+        for (ry in 0 until n) {
+            val sy = (by + ry).coerceIn(cy0, cy1 - 1)        // 行越界 → 复制最近行
+            val srcRow = (sy - cy0) * cw
+            val dstRow = ry * n
+            for (rx in 0 until n) {
+                val sx = (bx + rx).coerceIn(cx0, cx1 - 1)    // 列越界 → 复制最近列
+                dst[dstRow + rx] = tmp[srcRow + sx - cx0]
+            }
+        }
+    }
+
+    /** 覆盖 [0,total) 的分块起点：常规 keep 步进，末块贴边（与前一/几块重叠，重叠区后写覆盖）。 */
+    private fun tileOffsets(total: Int, keep: Int): IntArray {
+        if (total <= keep) return intArrayOf(0)
+        val cnt = (total + keep - 1) / keep
+        val arr = IntArray(cnt)
+        for (i in 0 until cnt) arr[i] = minOf(i * keep, total - keep)
+        return arr
+    }
+
+    /** n→n/2 精确 2:1 盒降采样（= cv2.INTER_AREA 在 2:1 下的定义，与训练低分输入一致）；n 为偶数。 */
+    private fun boxDown2(src: IntArray, n: Int, dst: IntArray) {
+        val low = n / 2
+        var d = 0
+        for (y in 0 until low) {
+            val r0 = (2 * y) * n
+            val r1 = r0 + n
+            for (x in 0 until low) {
+                val c = 2 * x
+                val p0 = src[r0 + c]
+                val p1 = src[r0 + c + 1]
+                val p2 = src[r1 + c]
+                val p3 = src[r1 + c + 1]
+                val r = (((p0 shr 16) and 0xFF) + ((p1 shr 16) and 0xFF)
+                        + ((p2 shr 16) and 0xFF) + ((p3 shr 16) and 0xFF) + 2) shr 2
+                val g = (((p0 shr 8) and 0xFF) + ((p1 shr 8) and 0xFF)
+                        + ((p2 shr 8) and 0xFF) + ((p3 shr 8) and 0xFF) + 2) shr 2
+                val b = ((p0 and 0xFF) + (p1 and 0xFF) + (p2 and 0xFF) + (p3 and 0xFF) + 2) shr 2
+                dst[d++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+    }
+
+    /** ARGB int 数组 → CHW float 平面（/255），写入复用缓冲并在末尾 rewind。 */
+    private fun fillPlanesCHW(px: IntArray, n: Int, fb: FloatBuffer) {
+        fb.rewind()
+        for (c in 0 until 3) {
+            val sh = 16 - c * 8
+            for (i in 0 until n) {
+                fb.put(((px[i] shr sh) and 0xFF) * INV255)
+            }
+        }
+        fb.rewind()
+    }
+
+    // ---- ORT session ----
+
+    private fun obtainSession(app: Context): OrtSession? {
+        session?.let { return it }
+        synchronized(this) {
+            session?.let { return it }
+            return try {
+                val e = OrtEnvironment.getEnvironment()
+                val bytes = app.assets.open(MODEL_ASSET).use { it.readBytes() }
+                val opt = OrtSession.SessionOptions()
+                opt.setIntraOpNumThreads(8)
+                val s = e.createSession(bytes, opt)
+                env = e
+                session = s
+                DiagLog.w(TAG, "ORT session 就绪 (${bytes.size / 1024}KB)")
+                s
+            } catch (t: Throwable) {
+                DiagLog.e(TAG, "session 创建失败", t)
+                null
+            }
+        }
+    }
+
+    fun release() {
+        synchronized(this) {
+            try { session?.close() } catch (_: Throwable) {}
+            session = null
+        }
+    }
+
+    // ---- 辅助 ----
+
+    private fun crc32(b: ByteArray): Long {
+        val c = CRC32()
+        c.update(b)
+        return c.value
+    }
+
+    private fun rotate(b: Bitmap, deg: Float): Bitmap {
+        val m = Matrix()
+        m.setRotate(deg)
+        return Bitmap.createBitmap(b, 0, 0, b.width, b.height, m, true)
+    }
+
+    /** 旋转并保证结果 mutable（createBitmap matrix 版返回 immutable，暖调 LUT 需就地写）。 */
+    private fun rotateMutable(b: Bitmap, deg: Float): Bitmap {
+        val rotated = rotate(b, deg)
+        if (rotated.isMutable) return rotated
+        val out = Bitmap.createBitmap(rotated.width, rotated.height, Bitmap.Config.ARGB_8888)
+        Canvas(out).drawBitmap(rotated, 0f, 0f, null)
+        rotated.recycle()
+        return out
+    }
+
+    private fun fit(b: Bitmap): Bitmap {
+        val w = b.width
+        val h = b.height
+        if (w <= W4K && h <= H4K) return b
+        val s = minOf(W4K.toFloat() / w, H4K.toFloat() / h)
+        return Bitmap.createScaledBitmap(b, (w * s).toInt(), (h * s).toInt(), true)
+    }
+}

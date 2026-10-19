@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="true"
+        android:largeHeap="true"
+        android:extractNativeLibs="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LeicaMoments">
+
+        <uses-native-library
+            android:name="libSNPE.so"
+            android:required="false" />
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 分享入口：仅单张（不声明 ACTION_SEND_MULTIPLE，多选分享时本应用不出现） -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <!-- 若 adb query-activities 实测显示文件管理器分享 DNG 不出现，取消下一行注释升 C 档 -->
+                <!-- <data android:mimeType="application/octet-stream" /> -->
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="设置"
+            android:theme="@style/Theme.LeicaMoments" />
+
+        <!-- 模型色彩：独立界面（库 / 选择 / 新建 / 管理），只能由应用内部打开 -->
+        <activity
+            android:name=".ModelActivity"
+            android:exported="false"
+            android:label="模型色彩"
+            android:parentActivityName=".MainActivity"
+            android:theme="@style/Theme.LeicaMoments" />
+
+        <!-- 模型详情：参考图 / 排除 / 加图增强 / 版本回退 -->
+        <activity
+            android:name=".ModelDetailActivity"
+            android:exported="false"
+            android:label="模型详情"
+            android:parentActivityName=".ModelActivity"
+            android:theme="@style/Theme.LeicaMoments" />
+
+        <!--
+          BatchTestActivity（ADB 批量测试）与它所需的 MANAGE_EXTERNAL_STORAGE
+          已移至 src/debug/AndroidManifest.xml：debug 变体保留，release（分享）变体不含。
+          保存/导出不受影响 —— MainActivity.saveNamed 走 MediaStore scoped storage。
+        -->
+
+        <service
+            android:name=".SuperResService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 分享色彩文件：把 cache/share 下的 .lmc 以 content:// 交给微信等应用 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+
+</manifest>

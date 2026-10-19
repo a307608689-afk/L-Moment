@@ -1,0 +1,36 @@
+<resources>
+    <!--
+      钉死深色：DayNight 在浅色系统下会把 AlertDialog / EditText / ProgressBar 全画成浅色，
+      也就是各种"白一下"。App 自身是全黑 UI，没有浅色版本，所以直接用 Dark 父主题。
+
+      windowBackground 决定窗口首帧底色（冷启动、进入设置页、被系统回收后恢复都会先画它）；
+      不设就会落到 M3 浅色 surface，那就是启动时闪的那一帧白。
+      状态栏/导航栏颜色也一并写进主题，让 setContentView 之前的第一帧就是黑的。
+
+      materialAlertDialogTheme：AppCompat 的 AlertDialog 走 alertDialogTheme，
+      背景是老的 9-patch（圆角约 2dp），所以看起来"很方"。这里换到 Material 的弹窗样式，
+      并把 shape 的圆角对齐色彩卡：cardCorner = 12dp（MainActivity.cardCorner）。
+    -->
+    <style name="Base.Theme.LeicaMoments" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:windowBackground">#FF000000</item>
+        <item name="android:statusBarColor">#FF000000</item>
+        <item name="android:navigationBarColor">#FF000000</item>
+        <item name="materialAlertDialogTheme">@style/ThemeOverlay.LeicaMoments.MaterialAlertDialog</item>
+    </style>
+
+    <style name="Theme.LeicaMoments" parent="Base.Theme.LeicaMoments" />
+
+    <!-- 弹窗外壳：沿用 M3 的配色/内边距，只替换容器形状 -->
+    <style name="ThemeOverlay.LeicaMoments.MaterialAlertDialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="alertDialogStyle">@style/MaterialAlertDialog.LeicaMoments</item>
+    </style>
+
+    <style name="MaterialAlertDialog.LeicaMoments" parent="MaterialAlertDialog.Material3">
+        <item name="shapeAppearance">@style/ShapeAppearance.LeicaMoments.Dialog</item>
+    </style>
+
+    <style name="ShapeAppearance.LeicaMoments.Dialog" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">12dp</item>
+    </style>
+</resources>
