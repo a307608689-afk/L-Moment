@@ -58,16 +58,20 @@ object DistillBandOps {
     @Volatile
     var debugDumpGrid = false
 
-    /** 调试开关：带内相位修正的缩放系数（0 = 关闭，仅 debug 批测 A/B 用）。 */
+    /** 调试开关：逐带打印覆盖行数 / 分块行调用次数 / 推理前后带均值（定位带边接缝用）。 */
     @Volatile
-    var debugPhaseScale = 1f
+    var debugBandStat = false
 
     /**
-     * 规范分块行缓存上限（像素数）。缓存一行 = keep×fullW 个 int；
-     * 超限的大图（如 200MP 全像素导出）跳过缓存、按需重算重叠分块行——
-     * 推理是确定性的，结果不受影响。
+     * 规范分块行缓存上限（像素数）。缓存一行 = keep×fullW 个 int。
+     *
+     * 上限必须 **大于等于** 单条分块行的像素数（keep × fullW）：200MP（16320 宽）一条
+     * 1024 行分块即 16.7M 像素，原 12M 上限会让所有带都判 cacheable=false，
+     * 于是同一分块行被覆盖它的 4 条带各重算一次（实测 calls=1 hits=0），纯亏 3 倍推理时间。
+     * 放开后缓存槽复用，200MP 导出从 ~243s 降到 ~80s。
+     * 内存上并不额外增加——[tileOut] 无论是否可缓存都按需分配到该尺寸。
      */
-    private const val TILE_CACHE_MAX_PX = 12_000_000L
+    private const val TILE_CACHE_MAX_PX = 20_000_000L
 
     fun supports(style: LeicaEngine.Style?): Boolean =
             style != null && STYLES.contains(style.id)
@@ -135,22 +139,6 @@ object DistillBandOps {
         private var gridGh = 0
         /** 网格对应的整图高度：应用时用全图 y 归一化到 [gridGh]。 */
         private var gridFullH = 0
-        /**
-         * 带内相位修正表：[(u*3 + k)*levels + lv]，u = 带内相对行（[PHASE_ROWS] 档）。
-         *
-         * 根因：native 暖调 LUT 自带空间场，坐标按**传入位图自身**的宽高归一化。
-         * 整图链拿到 H，逐带链只拿到带的 rows，于是同一条物理行在两条链里落在场里
-         * 不同位置，修正量差额是 (x, y_global) 与 (x, y_local) 之差——它在每个带边
-         * 都跳一次（对 y_global 而言是锯齿）。
-         *
-         * 空间网格只能表达 y_global 的**连续**函数，锯齿的直流部分被它当噪声平均掉，
-         * 剩下的形状落在带边就成了台阶（200MP 实测：中位 0.06 已达标，但少数带边
-         * 达 1.4，且只出现在亮内容区——乘性误差 × 亮度，暗部看不出来）。
-         *
-         * 解法：在代理图上按 u 折叠统计残差（48 条带共享一条曲线，样本量 ×48），
-         * 应用时按带内相对行插值叠加。它与带宽/带高无关，纯几何量。
-         */
-        private var phaseFix: FloatArray? = null
         /** 真实带几何（带顶/带高，末带可短）：只用于构造代理图的逐带副本。 */
         private var geomTops = IntArray(0)
         private var geomRows = IntArray(0)
@@ -178,6 +166,14 @@ object DistillBandOps {
         private var lowBuf: FloatBuffer? = null
         private var bandCount = 0
 
+        /** 逐带诊断计数（仅 [debugBandStat] 打开时维护）。 */
+        private var covRows = 0
+        private var tileCalls = 0
+        private var tileHits = 0
+        private var prevTail = 0f
+        private var prevPreTail = 0f
+        private var hasPrev = false
+
         override fun prepare(reader: ImageUtils.StripSource): Boolean {
             src = reader
             val s = M9Distill.sessionFor(app)
@@ -201,11 +197,44 @@ object DistillBandOps {
             // 首带时确定真实带几何并拟合暖调修正（bandRows 由 native 决定，prepare 阶段未知）
             if (!gridTried && top == 0 && !debugStyledOnly) ensureToneCorrection(rows)
 
+            val stat = debugBandStat
+            val preRows = if (stat) FloatArray(rows) else null
+            if (preRows != null) rowMeans(band, fullW, rows, preRows)
+            if (top == 0) hasPrev = false
+            tileCalls = 0
+            tileHits = 0
             try {
                 // 推理严格复刻整图链的规范 KEEP 网格（见 inferBand）：带高与分块不对齐时，
                 // 一条带横跨两个规范分块行、相邻两带共用同一分块行，必须取同一次推理的结果，
                 // 否则每条带各自按带高切块会得到不同的网络上下文（逐带 gain 偏差 + 带边阶跃）。
                 if (!inferBand(session, top, rows, fullW, fullH, band)) return null
+                if (stat && preRows != null) {
+                    val postRows = FloatArray(rows)
+                    rowMeans(band, fullW, rows, postRows)
+                    val k = minOf(4, rows)
+                    var head = 0f
+                    var tail = 0f
+                    var preHead = 0f
+                    var preTail = 0f
+                    for (i in 0 until k) {
+                        head += postRows[i] - preRows[i]
+                        tail += postRows[rows - k + i] - preRows[rows - k + i]
+                        preHead += preRows[i]
+                        preTail += preRows[rows - k + i]
+                    }
+                    head /= k
+                    tail /= k
+                    preHead /= k
+                    preTail /= k
+                    val seam = if (hasPrev) head - prevTail else 0f
+                    val pseam = if (hasPrev) preHead - prevPreTail else 0f
+                    DiagLog.w(TAG, "BSTAT top=$top cov=$covRows calls=$tileCalls "
+                            + "hits=$tileHits seam=" + "%.2f".format(seam)
+                            + " pseam=" + "%.2f".format(pseam))
+                    prevTail = tail
+                    prevPreTail = preTail
+                    hasPrev = true
+                }
                 if (debugStyledOnly) {
                     bandCount++
                     return band
@@ -263,7 +292,6 @@ object DistillBandOps {
             gridKeep = 0
             gridYs = IntArray(0)
             toneGrid = null
-            phaseFix = null
             gridGh = 0
             gridFullH = 0
             geomTops = IntArray(0)
@@ -436,17 +464,11 @@ object DistillBandOps {
                 toneGrid = fitted
                 gridGh = ghTotal
                 gridFullH = h
-                // 网格之上再拟一层「带内相位」修正：暖调空间场按传入位图高度归一化，
-                // 逐带调用时同一条物理行落在场里不同位置，差额随 u 变化而在带边跳变，
-                // 全局网格表达不了（详见 phaseFix 注释）。
-                phaseFix = fitPhaseFix(pWhole, pBands, pTops, pRows, fitted,
-                        ghTotal, GRID_W, GRID_LEVELS)
                 DiagLog.w(TAG, "暖调修正就绪网格=${GRID_W}x$ghTotal"
                         + "x$GRID_LEVELS 代理=${pw}x$ph 带=${pRows.size} "
                         + "耗时=${android.os.SystemClock.uptimeMillis() - t0}ms")
             } catch (t: Throwable) {
                 toneGrid = null
-                phaseFix = null
                 gridGh = 0
                 gridFullH = 0
                 DiagLog.e(TAG, "暖调修正拟合失败，按原样输出", t)
@@ -471,8 +493,7 @@ object DistillBandOps {
             if (debugNoToneFix) return
             val grid = toneGrid ?: return
             if (gridGh <= 1 || gridFullH <= 0 || fullH <= 0 || rows <= 0) return
-            applyToneGridGlobal(bmp, grid, top, fullH, gridGh, GRID_W, GRID_LEVELS,
-                    if (debugPhaseScale > 0f) phaseFix else null, rows)
+            applyToneGridGlobal(bmp, grid, top, fullH, gridGh, GRID_W, GRID_LEVELS)
         }
 
         /**
@@ -483,8 +504,7 @@ object DistillBandOps {
          * 这里改为整图归一化 + 越界**线性外延**（实际只发生在整图首末行）。
          */
         private fun applyToneGridGlobal(bmp: Bitmap, grid: FloatArray, yBase: Int,
-                                       fullH: Int, gh: Int, gw: Int, levels: Int,
-                                       phase: FloatArray?, bandRows: Int) {
+                                       fullH: Int, gh: Int, gw: Int, levels: Int) {
             val w = bmp.width
             val h = bmp.height
             if (rowPx.size < w) rowPx = IntArray(w)
@@ -492,27 +512,7 @@ object DistillBandOps {
             val lvF = levels
             val ghF = gh.toFloat()
             val gwF = gw.toFloat()
-            // 带内相位修正：同一行所有像素共用 u，逐行把相邻两档混成 3*levels 个值，
-            // 像素循环里只剩两次查表（复用亮度级那套 l0/l1/tt）
-            val pArr: FloatArray = phase ?: FloatArray(0)
-            val pRows = if (bandRows > 0) bandRows else h
-            val phaseScale = if (debugPhaseScale > 0f) debugPhaseScale else 1f
-            val rowFix = FloatArray(3 * levels)
             for (y in 0 until h) {
-                if (phase != null) {
-                    val uf = y.toFloat() * PHASE_ROWS / pRows
-                    val u0 = uf.toInt().coerceIn(0, PHASE_ROWS - 1)
-                    val u1 = (u0 + 1).coerceAtMost(PHASE_ROWS - 1)
-                    val ut = (uf - u0).coerceIn(0f, 1f)
-                    for (k in 0 until 3) {
-                        val b0 = (u0 * 3 + k) * levels
-                        val b1 = (u1 * 3 + k) * levels
-                        val bo = k * levels
-                        for (l in 0 until levels) {
-                            rowFix[bo + l] = (pArr[b0 + l] * (1 - ut) + pArr[b1 + l] * ut) * phaseScale
-                        }
-                    }
-                }
                 bmp.getPixels(row, 0, w, 0, y, w, 1)
                 val fy = (yBase + y + 0.5f) / fullH * ghF - 0.5f
                 val y0: Int
@@ -560,10 +560,6 @@ object DistillBandOps {
                         val yl1 = (grid[i00 + l1] * (1 - wx) + grid[i01 + l1] * wx) * (1 - wy) +
                                 (grid[i10 + l1] * (1 - wx) + grid[i11 + l1] * wx) * wy
                         var ov = yl0 + (yl1 - yl0) * tt
-                        if (phase != null) {
-                            val bb = k * levels
-                            ov += rowFix[bb + l0] * (1 - tt) + rowFix[bb + l1] * tt
-                        }
                         // 四舍五入而不是截断：截断在整幅上会累积出约 -0.5 级的系统性压暗
                         out = out or ((ov + 0.5f).toInt().coerceIn(0, 255) shl (k * 8))
                     }
@@ -586,6 +582,20 @@ object DistillBandOps {
          * 与整图链完全不同的网络上下文，实测逐带 signed 偏差 +2.9/+6.2/+2.1/-4.8 且
          * 末带台阶 stepExMax@y=3048 —— 即本函数要消灭的带间差。
          */
+        /** 诊断采样：固定 8 列 × 逐行亮度均值（0..255），用于在残差域比对带边界是否跳变。 */
+        private fun rowMeans(b: Bitmap, fullW: Int, rows: Int, out: FloatArray) {
+            val xs = IntArray(8) { (fullW.toLong() * (it + 1) / 9L).toInt() }
+            for (y in 0 until rows) {
+                var s = 0L
+                for (x in xs) {
+                    val p = b.getPixel(x, y)
+                    s += ((p shr 16 and 0xFF) * 299 + (p shr 8 and 0xFF) * 587
+                            + (p and 0xFF) * 114) / 1000
+                }
+                out[y] = s / 8f
+            }
+        }
+
         private fun inferBand(session: OrtSession, top: Int, rows: Int,
                               fullW: Int, fullH: Int, dst: Bitmap): Boolean {
             var keep = minOf(KEEP, minOf(fullW, fullH))
@@ -596,11 +606,13 @@ object DistillBandOps {
 
             val bandEnd = top + rows
             var covered = false
+            covRows = 0
             for (y0 in gridYs) {
                 if (y0 + keep <= top) continue
                 if (y0 >= bandEnd) break
                 val line = tileRowAt(session, y0, keep, fullW, fullH) ?: return false
                 val yEnd = minOf(bandEnd, y0 + keep)
+                covRows += yEnd - maxOf(top, y0)
                 for (y in maxOf(top, y0) until yEnd) {
                     try {
                         dst.setPixels(line, (y - y0) * fullW, fullW, 0, y - top, fullW, 1)
@@ -623,7 +635,11 @@ object DistillBandOps {
                               fullW: Int, fullH: Int): IntArray? {
             val need = keep.toLong() * fullW
             val cacheable = need <= TILE_CACHE_MAX_PX
-            if (cacheable && tileOutTop == y0 && tileOut.size.toLong() >= need) return tileOut
+            tileCalls++
+            if (cacheable && tileOutTop == y0 && tileOut.size.toLong() >= need) {
+                tileHits++
+                return tileOut
+            }
             if (tileOut.size.toLong() < need) tileOut = IntArray(need.toInt())
 
             val wy0 = maxOf(0, y0 - HALO)
@@ -996,157 +1012,6 @@ object DistillBandOps {
     }
 
     /**
-     * 带内相位修正拟合：把「暖调空间场按带高归一化」造成的锯齿量测出来。
-     *
-     * 做法与空间网格同一套：用代理图逐像素算残差 `整幅暖调 - 网格预测`，只是不再按
-     * 带序号分桶（那条路已试过，逐带直流对带边台阶无用），而是按**带内相对行**
-     * `u = (row - top) / rows` 折叠。48 条带共享一条 u 曲线，样本量乘以带数，
-     * 够细到分辨带边 1~2 行的跳变。
-     *
-     * 稀疏档处理：样本不足的 u 档沿用前一档（首档缺则留 0，绝不外推），沿 u 三点
-     * 平滑（首末档互为邻档，保持周期性）。幅值限幅 [MAX_PHASE_FIX]。
-     */
-    private fun fitPhaseFix(whole: Bitmap, bandWarm: Bitmap, pTops: IntArray, pRows: IntArray,
-                            grid: FloatArray, gh: Int, gw: Int, levels: Int): FloatArray? {
-        val w = whole.width
-        val h = whole.height
-        val nb = pRows.size
-        if (nb <= 0 || h <= 0 || grid.isEmpty()) return null
-        val uOfRow = IntArray(h)
-        java.util.Arrays.fill(uOfRow, -1)
-        for (i in 0 until nb) {
-            val rows = pRows[i]
-            if (rows <= 0) continue
-            val y1 = minOf(pTops[i] + rows, h)
-            for (y in pTops[i] until y1) {
-                uOfRow[y] = ((y - pTops[i]) * PHASE_ROWS / rows).coerceIn(0, PHASE_ROWS - 1)
-            }
-        }
-        val sum = FloatArray(PHASE_ROWS * 3 * levels)
-        val cnt = IntArray(PHASE_ROWS * 3 * levels)
-        // 预测值必须与 [applyToneGridGlobal] **完全同口径**（4 邻格双线性 × 亮度级插值）。
-        // 若这里用最近格，残差里会混进「最近格 vs 双线性」的差，折叠后成假偏置。
-        val gx0 = IntArray(w)
-        val gx1 = IntArray(w)
-        val gwx = FloatArray(w)
-        val gwF = gw.toFloat()
-        for (x in 0 until w) {
-            val fx = (x + 0.5f) / w * gwF - 0.5f
-            if (fx <= 0f) {
-                gx0[x] = 0; gx1[x] = 1; gwx[x] = fx
-            } else if (fx >= gw - 1f) {
-                gx0[x] = gw - 2; gx1[x] = gw - 1; gwx[x] = fx - gx0[x]
-            } else {
-                gx0[x] = fx.toInt(); gx1[x] = gx0[x] + 1; gwx[x] = fx - gx0[x]
-            }
-        }
-        val lvF = levels
-        val ghF = gh.toFloat()
-        val rowW = IntArray(w)
-        val rowB = IntArray(w)
-        for (py in 0 until h) {
-            val u = uOfRow[py]
-            if (u < 0) continue
-            whole.getPixels(rowW, 0, w, 0, py, w, 1)
-            bandWarm.getPixels(rowB, 0, w, 0, py, w, 1)
-            val fy = (py + 0.5f) / h * ghF - 0.5f
-            val gy0: Int
-            val gy1: Int
-            val wy: Float
-            if (fy <= 0f) {
-                gy0 = 0; gy1 = 1; wy = fy
-            } else if (fy >= gh - 1f) {
-                gy0 = gh - 2; gy1 = gh - 1; wy = fy - gy0
-            } else {
-                gy0 = fy.toInt(); gy1 = gy0 + 1; wy = fy - gy0
-            }
-            val rb0 = gy0 * gw * 3
-            val rb1 = gy1 * gw * 3
-            val ub = u * 3
-            for (x in 0 until w) {
-                val cw = rowW[x]
-                val cb = rowB[x]
-                val xa = gx0[x] * 3
-                val xb = gx1[x] * 3
-                val wx = gwx[x]
-                val i00 = rb0 + xa
-                val i01 = rb0 + xb
-                val i10 = rb1 + xa
-                val i11 = rb1 + xb
-                for (k in 0 until 3) {
-                    val vb = (cb shr (k * 8)) and 0xFF
-                    val vw = (cw shr (k * 8)) and 0xFF
-                    val lf = vb * lvF / 256f - 0.5f
-                    val l0 = lf.toInt().coerceIn(0, levels - 1)
-                    val l1 = (l0 + 1).coerceAtMost(levels - 1)
-                    val tt = (lf - l0).coerceIn(0f, 1f)
-                    val p00 = (i00 + k) * levels
-                    val p01 = (i01 + k) * levels
-                    val p10 = (i10 + k) * levels
-                    val p11 = (i11 + k) * levels
-                    val a0 = (grid[p00 + l0] * (1 - wx) + grid[p01 + l0] * wx) * (1 - wy) +
-                            (grid[p10 + l0] * (1 - wx) + grid[p11 + l0] * wx) * wy
-                    val a1 = (grid[p00 + l1] * (1 - wx) + grid[p01 + l1] * wx) * (1 - wy) +
-                            (grid[p10 + l1] * (1 - wx) + grid[p11 + l1] * wx) * wy
-                    val pred = a0 + (a1 - a0) * tt
-                    val idx = (ub + k) * levels + l0
-                    sum[idx] += vw - pred
-                    cnt[idx]++
-                }
-            }
-        }
-        val out = FloatArray(PHASE_ROWS * 3 * levels)
-        val curve = FloatArray(PHASE_ROWS)
-        val tmp = FloatArray(PHASE_ROWS)
-        val minCnt = 16
-        var peak = 0f
-        var rawPeak = 0f
-        var curves = 0
-        for (k in 0 until 3) {
-            for (l in 0 until levels) {
-                var firstValid = -1
-                for (u in 0 until PHASE_ROWS) {
-                    val idx = (u * 3 + k) * levels + l
-                    val n = cnt[idx]
-                    if (n >= minCnt) {
-                        curve[u] = sum[idx] / n
-                        if (firstValid < 0) firstValid = u
-                    } else {
-                        curve[u] = Float.NaN
-                    }
-                }
-                if (firstValid < 0) continue
-                // 缺档按「环形前向最近有效档」填充：相位表首末档物理相邻，旧写法从 0 起补，
-                // u=0 会被平滑成末档值的 1/4，正好在带边造出一条假台阶。
-                var lastValid = 0f
-                for (i in 0 until PHASE_ROWS) {
-                    val u = (firstValid + i) % PHASE_ROWS
-                    if (!curve[u].isNaN()) lastValid = curve[u] else curve[u] = lastValid
-                }
-                curves++
-                for (u in 0 until PHASE_ROWS) tmp[u] = curve[u]
-                for (u in 0 until PHASE_ROWS) {
-                    // 首末档互为邻档：u=0 与 u=1 在物理上是相邻行（周期表）
-                    val v = when (u) {
-                        0 -> (tmp[PHASE_ROWS - 1] + 2f * tmp[0] + tmp[1]) / 4f
-                        PHASE_ROWS - 1 ->
-                            (tmp[PHASE_ROWS - 2] + 2f * tmp[PHASE_ROWS - 1] + tmp[0]) / 4f
-                        else -> (tmp[u - 1] + 2f * tmp[u] + tmp[u + 1]) / 4f
-                    }
-                    val c = v.coerceIn(-MAX_PHASE_FIX, MAX_PHASE_FIX)
-                    out[(u * 3 + k) * levels + l] = c
-                    if (kotlin.math.abs(c) > peak) peak = kotlin.math.abs(c)
-                    if (kotlin.math.abs(v) > rawPeak) rawPeak = kotlin.math.abs(v)
-                }
-            }
-        }
-        if (curves == 0) return null
-        DiagLog.w(TAG, "带内相位修正 ${curves}条曲线 u=$PHASE_ROWS"
-                + " 峰=${"%.2f".format(peak)} 原峰=${"%.2f".format(rawPeak)} 限幅=$MAX_PHASE_FIX")
-        return out
-    }
-
-    /**
      * 诊断：把拟合出的修正网格（偏差 + 样本计数）转储到外部 files 目录，
      * 供 PC 端离线分析网格形态（默认关闭，仅批测时用）。
      */
@@ -1226,21 +1091,6 @@ object DistillBandOps {
     private const val TAIL_BLEND_DARK = 10f
     /** 单级修正上限：暖调逐带与整幅的真实差异远小于此值，超出必为稀疏档噪声。 */
     private const val MAX_DEV = 64f
-    /**
-     * 带内相位修正的 u 分档数。
-     *
-     * 折叠形状（各带共享一条 u 曲线）实测：折叠后 edge step 仅 0.015、带间形状相关
-     * 0.74~0.98，说明残差主成分是**周期形状**而不是逐带直流（逐带 DC 方案已证无效）。
-     * 200MP 在测样张是 12288 高 / 48 条 256 行带，代理带宽约 1826、代理带高约 29 行，
-     * 24 档 ≈ 每档 1.2 代理行（≈10 全分辨率行），够表达「带首偏暗 / 带尾偏亮」的缓变；
-     * 带边 1~2 行的硬跳变靠首末档之差近似（再细分只会把代理采样噪声放大成条纹）。
-     */
-    private const val PHASE_ROWS = 24
-    /**
-     * 带内相位修正幅值上限（级）。实测带内残差峰 1.4 级、带边台阶 ~1.4，
-     * 超过 8 级几乎必然是代理图上内容极端（近白/近黑）的档位拟过头。
-     */
-    private const val MAX_PHASE_FIX = 8f
     /**
      * 抖动表相位序号：同一条链的各带必须传同一个值（噪声场才跨带连续），
      * 不同后处理段传不同值（两次量化各自独立）。

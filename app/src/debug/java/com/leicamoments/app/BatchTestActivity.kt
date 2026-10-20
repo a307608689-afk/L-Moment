@@ -66,10 +66,10 @@ class BatchTestActivity : Activity() {
             DistillBandOps.debugNoToneFix = intent.getBooleanExtra("nofix", false)
             DistillBandOps.debugStyledOnly = intent.getBooleanExtra("styledonly", false)
             DistillBandOps.debugDumpGrid = intent.getBooleanExtra("griddump", false)
-            DistillBandOps.debugPhaseScale = intent.getFloatExtra("phase", 1f)
+            DistillBandOps.debugBandStat = intent.getBooleanExtra("bstat", false)
             Log.i(tag, "band A/B: nofix=${DistillBandOps.debugNoToneFix} "
                     + "styledonly=${DistillBandOps.debugStyledOnly} "
-                    + "phase=${DistillBandOps.debugPhaseScale}")
+                    + "bstat=${DistillBandOps.debugBandStat}")
             Thread { runBandSuite(File(indir), File(outdir).apply { mkdirs() }, limit, styles) }.start()
             return
         }
