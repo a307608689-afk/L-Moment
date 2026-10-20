@@ -10,7 +10,6 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
-import android.util.Log
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 
@@ -126,7 +125,7 @@ object SuperResTask {
                         try {
                             app.contentResolver.openInputStream(u)?.use { it.readBytes() }
                         } catch (t: Throwable) {
-                            Log.e("Perfect", "DNG 重读失败，回落后段", t)
+                            DiagLog.e("Perfect", "DNG 重读失败，回落后段", t)
                             null
                         }
                     }
@@ -177,7 +176,7 @@ object SuperResTask {
                 val marked = try {
                     LeicaMark.mark(workBytes)
                 } catch (t: Throwable) {
-                    Log.e("SuperRes", "mark failed, export unmarked", t)
+                    DiagLog.e("SuperRes", "mark failed, export unmarked", t)
                     workBytes
                 }
                 // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）；
@@ -192,7 +191,7 @@ object SuperResTask {
                 setState(State.Done(result.width, result.height, exported, android.os.SystemClock.elapsedRealtime() - t0))
             } catch (e: Throwable) {
                 hi?.recycle()
-                Log.e("SuperRes", "SR failed", e)
+                DiagLog.e("SuperRes", "SR failed", e)
                 try {
                     val sw = java.io.StringWriter()
                     e.printStackTrace(java.io.PrintWriter(sw))
@@ -238,7 +237,7 @@ object SuperResTask {
                 resolver.update(uri, values, null, null)
             }
         } catch (e: Exception) {
-            Log.e("SuperRes", "save failed", e)
+            DiagLog.e("SuperRes", "save failed", e)
         }
     }
 }

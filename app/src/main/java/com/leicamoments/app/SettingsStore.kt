@@ -11,6 +11,7 @@ import org.json.JSONArray
  * - `last_category`：最后一次**实际所处**的分类，切分类与冷启动确定分类后写入
  * - `coach_shown`：首次启动的分类引导气泡是否已展示
  * - `pinned_ids`：置顶项 id 列表（保序 JSON 数组，最近置顶的在最前）
+ * - `full_res_export`：全像素导出开关（C4，默认开；低端机由像素预算分档强制回落）
  * - `raw_thr_level:<MODEL>`：RAW 解码亮度档位（按机型记忆，不进备份）
  */
 object SettingsStore {
@@ -23,6 +24,7 @@ object SettingsStore {
     private const val KEY_SHARE_SEEN = "share_seen_sig"
     private const val KEY_RAW_THR = "raw_thr_level"
     private const val KEY_RAW_HINT = "raw_hint_shown"
+    private const val KEY_FULL_RES = "full_res_export"
 
     /** 「记忆上次」在 default_category 里的取值 */
     const val VALUE_LAST = "last"
@@ -150,5 +152,22 @@ object SettingsStore {
 
     fun markRawHintShown(c: Context) {
         prefs(c).edit().putBoolean(KEY_RAW_HINT, true).apply()
+    }
+
+    // ---- 全像素导出（C4）----
+
+    /**
+     * 全像素导出开关。
+     *
+     * **默认开**：C1 已验收的行为就是「200MP 原图档点导出即全像素」，默认关会让这条路径
+     * 悄悄退回 4096×3072，属于功能倒退。开关的语义是「我宁可快一点、不要 8~20 秒」，
+     * 而不是「要不要启用这个功能」。
+     *
+     * 真正的安全阀在 [ImageUtils.decideFullRes] 的低端回落：总内存 <6GB 时即使这里为 true 也不启用。
+     */
+    fun fullResEnabled(c: Context): Boolean = prefs(c).getBoolean(KEY_FULL_RES, true)
+
+    fun setFullResEnabled(c: Context, enabled: Boolean) {
+        prefs(c).edit().putBoolean(KEY_FULL_RES, enabled).apply()
     }
 }

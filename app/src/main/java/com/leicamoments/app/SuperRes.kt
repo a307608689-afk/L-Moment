@@ -58,12 +58,12 @@ object SuperRes {
                 opt.addXnnpack(mapOf("intra_op_num_threads" to "4"))
             }
         } catch (t: Throwable) {
-            android.util.Log.w("SuperRes", "XNNPACK unavailable: ${t.message}")
+            DiagLog.w("SuperRes", "XNNPACK unavailable: ${t.message}")
         }
         try {
             if (SuperResConfig.USE_NNAPI) opt.addNnapi()
         } catch (t: Throwable) {
-            android.util.Log.w("SuperRes", "NNAPI unavailable: ${t.message}")
+            DiagLog.w("SuperRes", "NNAPI unavailable: ${t.message}")
         }
         if (SuperResConfig.INTRA_OP_THREADS > 0) opt.setIntraOpNumThreads(SuperResConfig.INTRA_OP_THREADS)
         session = e.createSession(bytes, opt)
@@ -149,7 +149,10 @@ object SuperRes {
                         val ms = android.os.SystemClock.elapsedRealtime() - tTile
                         inferMsTotal += ms
                         if (ms > inferMsMax) inferMsMax = ms
-                        android.util.Log.i("SuperRes", "tile $done/$total ${ms}ms")
+                        // 逐块日志降频：仅首块、每 20 块、末块打一行（12MP 超分可达数百块，逐块打点会冲掉诊断环）
+                        if (done == 1 || done == total || done % 20 == 0) {
+                            DiagLog.i("SuperRes", "tile $done/$total ${ms}ms")
+                        }
                     }
                     onProgress(done * 100 / total)
                 }
@@ -165,7 +168,7 @@ object SuperRes {
                 .format(java.util.Date()) +
                 " SUMMARY tiles=$done avg=${avg}ms max=${inferMsMax}ms infer=${inferMsTotal}ms " +
                 "pipeline=${totalMs}ms (${w}x${h}->${w * SCALE}x${h * SCALE})"
-            android.util.Log.i("SuperRes", line)
+            DiagLog.i("SuperRes", line)
             lastSummary = line
             appendTimingFile(context, line)
         }
@@ -184,19 +187,19 @@ object SuperRes {
         try {
             if (writeViaMediaStore(context, android.provider.MediaStore.Files.getContentUri("external"), "Pictures/LeicaMoments", name, line)) return
         } catch (t: Throwable) {
-            android.util.Log.w("SuperRes", "timing pictures write failed: ${t.message}")
+            DiagLog.w("SuperRes", "timing pictures write failed: ${t.message}")
         }
         // 2) MediaStore Downloads
         try {
             if (writeViaMediaStore(context, android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, "Download", name, line)) return
         } catch (t: Throwable) {
-            android.util.Log.w("SuperRes", "timing downloads write failed: ${t.message}")
+            DiagLog.w("SuperRes", "timing downloads write failed: ${t.message}")
         }
         // 3) 应用外部目录（Android/data/.../files/）
         try {
             java.io.File(context.getExternalFilesDir(null), name).writeText(line + "\n")
         } catch (t: Throwable) {
-            android.util.Log.w("SuperRes", "timing external write failed: ${t.message}")
+            DiagLog.w("SuperRes", "timing external write failed: ${t.message}")
         }
     }
 

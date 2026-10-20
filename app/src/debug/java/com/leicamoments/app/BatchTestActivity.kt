@@ -3,8 +3,11 @@ package com.leicamoments.app
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.util.Log
+import com.codex.leicaapp.LeicaMark
+import com.codex.leicaapp.LegendaryPostProcessor
 import java.io.File
 
 /**
@@ -33,11 +36,15 @@ class BatchTestActivity : Activity() {
      */
     private var level = -1
 
+    /** 条带高度请求值（实际值由 native 流式编码器决定，见报告 band=rows x count） */
+    private var bandRowsReq = 512
+
     @SuppressLint("SdCardPath")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         thr = intent.getFloatExtra("thr", 0.01f)
         level = intent.getIntExtra("level", -1)
+        bandRowsReq = intent.getIntExtra("bandrows", 512)
         val rawOnly = intent.getBooleanExtra("rawonly", false)
         // 导出 16bit 线性 sRGB（w,h 头 + u16 RGB），供 PC 端做曲线/局部色调原型搜索
         val dumpLin = intent.getBooleanExtra("dumplin", false)
@@ -45,7 +52,51 @@ class BatchTestActivity : Activity() {
         val indir = intent.getStringExtra("indir") ?: "/sdcard/LeicaTestIn"
         val outdir = intent.getStringExtra("outdir") ?: "/sdcard/LeicaTestOut"
         val limit = intent.getIntExtra("limit", 0)
-        Log.i(tag, "启动批量测试 styles=$styles indir=$indir outdir=$outdir limit=$limit thr=$thr level=$level rawonly=$rawOnly dumplin=$dumpLin")
+        // C1 验收入口：条带全像素直通（可用 --es mode fullres 触发）
+        val mode = intent.getStringExtra("mode") ?: ""
+        Log.i(tag, "启动批量测试 mode=$mode styles=$styles indir=$indir outdir=$outdir limit=$limit thr=$thr level=$level rawonly=$rawOnly dumplin=$dumpLin")
+
+        if (mode == "fullres") {
+            Thread { runFullResSuite(File(indir), File(outdir).apply { mkdirs() }, limit) }.start()
+            return
+        }
+
+        // 乙档验收：模型链条带导出 vs 整图链参考（同尺寸下应≈一致，且无带边界接缝）
+        if (mode == "band") {
+            DistillBandOps.debugNoToneFix = intent.getBooleanExtra("nofix", false)
+            DistillBandOps.debugStyledOnly = intent.getBooleanExtra("styledonly", false)
+            DistillBandOps.debugDumpGrid = intent.getBooleanExtra("griddump", false)
+            DistillBandOps.debugPhaseScale = intent.getFloatExtra("phase", 1f)
+            Log.i(tag, "band A/B: nofix=${DistillBandOps.debugNoToneFix} "
+                    + "styledonly=${DistillBandOps.debugStyledOnly} "
+                    + "phase=${DistillBandOps.debugPhaseScale}")
+            Thread { runBandSuite(File(indir), File(outdir).apply { mkdirs() }, limit, styles) }.start()
+            return
+        }
+
+        // 暖调 LUT 逐带敏感性隔离：同一张图「整幅套一次」vs「逐带各套一次」
+        if (mode == "warm") {
+            Thread { runWarmSuite(File(indir), File(outdir).apply { mkdirs() }) }.start()
+            return
+        }
+
+        // 代理图修正场验证：逐带暖调 + 代理图（整幅 vs 逐带）增益网格 → 应逼近整幅结果
+        if (mode == "warm2") {
+            Thread { runWarmFixSuite(File(indir), File(outdir).apply { mkdirs() }) }.start()
+            return
+        }
+
+        // 纯色探针：判定 native 暖调是否含暗角（空间）与尺寸/统计依赖
+        if (mode == "flat") {
+            Thread { runFlatSuite(File(outdir).apply { mkdirs() }) }.start()
+            return
+        }
+
+        // B0 接缝基线：恒等算子应「零接缝」，故意错位算子必须被 meas 出接缝（判据灵敏度自检）
+        if (mode == "seam") {
+            Thread { runSeamSuite(File(indir), File(outdir).apply { mkdirs() }, limit) }.start()
+            return
+        }
 
         Thread {
             val summary = StringBuilder()
@@ -144,5 +195,1276 @@ class BatchTestActivity : Activity() {
         val work = ImageUtils.toJpeg(full, 95)
         full.recycle()
         return work
+    }
+
+    // ==================== C1：条带全像素直通验收（--es mode fullres） ====================
+
+    /**
+     * 对 indir 下每个 JPEG 依次跑（**与 MainActivity.exportFullRes 同为文件级链路**）：
+     *  1) ImageUtils.encodeStripFromFile（条带解码 + native 拼接编码，源不进堆）；
+     *  2) ExifTransplant.copyInPlace + LeicaMark.markFile + HdrGainMap.embedFile（头改写 + 流搬运）；
+     *  3) 采样 1/8 解码，量接缝指标（边界行梯度 vs 原图同位置）与堆占用。
+     * 结果写 _fullres_report.txt。
+     */
+    private fun runFullResSuite(indir: File, outdir: File, limit: Int) {
+        val summary = StringBuilder()
+        try {
+            val files = indir.listFiles { f ->
+                f.isFile && f.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
+            }?.sortedBy { it.name } ?: emptyList()
+            summary.append("mode=fullres files=${files.size} limit=$limit\n")
+            var idx = 0
+            for (f in files) {
+                if (limit > 0 && idx >= limit) break
+                idx++
+                summary.append(runOneFullRes(f, outdir))
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "fullres 批量异常", t)
+            summary.append("FATAL ${t.message}\n")
+        }
+        runCatching { File(outdir, "_fullres_report.txt").writeText(summary.toString()) }
+        finish()
+    }
+
+    private fun runOneFullRes(f: File, outdir: File): String {
+        val sb = StringBuilder()
+        val t0 = System.currentTimeMillis()
+        try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(f.absolutePath, bounds)
+            val dims = intArrayOf(bounds.outWidth, bounds.outHeight)
+            val ori = runCatching { androidx.exifinterface.media.ExifInterface(f.absolutePath) }
+                .map { it.getAttributeInt(androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION, 1) }
+                .getOrDefault(1)
+            val supports = ImageUtils.supportsFullResDirect(dims[0], dims[1], ori)
+            sb.append("== ${f.name} ${dims[0]}x${dims[1]} ori=$ori src=${f.length()}B ")
+                .append("heap=${ImageUtils.heapUsageLabel()} supportsDirect=$supports\n")
+
+            val strip = File(outdir, "${f.nameWithoutExtension}_strip.jpg")
+            val encT0 = System.currentTimeMillis()
+            val res = ImageUtils.encodeStripFromFile(f, strip, 95, 512)
+            val encMs = System.currentTimeMillis() - encT0
+            sb.append("  encode ok=${res.ok} fallback=${res.fallbackCopy} ")
+                .append("${res.width}x${res.height} band=${res.bandRows}x${res.bandCount} ")
+                .append("${res.outBytes}B ${encMs}ms heap=${ImageUtils.heapUsageLabel()}\n")
+            if (!res.ok && !res.fallbackCopy) return sb.append("  SKIP encode failed\n").toString()
+
+            val ob = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(strip.absolutePath, ob)
+            sb.append("  decode ${ob.outWidth}x${ob.outHeight}\n")
+
+            // 尾部（文件级）：EXIF 原地回填 → 徽章头部改写 → 增益图回嵌
+            val head = ImageUtils.readFileHeader(f)
+            val exifOk = head != null && ExifTransplant.copyInPlace(this, head, strip, "1")
+            val badgeOk = LeicaMark.markFile(strip)
+            sb.append("  exif=$exifOk mark=$badgeOk ${strip.length()}B heap=${ImageUtils.heapUsageLabel()}\n")
+            // 增益图提取仍需整幅源字节（仅测大文件时跳过，避免污染内存基线）
+            val hdr = if (f.length() <= 40L * 1024 * 1024) HdrGainMap.extract(f.readBytes()) else null
+            val hdrRes = if (hdr != null) HdrGainMap.embedFile(strip, hdr) else HdrGainMap.truncateToPrimaryFile(strip)
+            sb.append("  hdr src=${hdr != null} ok=${hdrRes.ok} ${hdrRes.brief} ")
+                .append("${strip.length()}B heap=${ImageUtils.heapUsageLabel()}\n")
+            val dst = File(outdir, "${f.nameWithoutExtension}_fullres.jpg")
+            strip.copyTo(dst, overwrite = true)
+            sb.append("  saved ${dst.name} ${dst.length()}B\n")
+
+            // 接缝：1/8 采样解码，比较边界行与原图同位置的行梯度
+            val seam = measureSeam(f, dst, res.bandRows)
+            sb.append("  seam $seam\n")
+            sb.append("  total ${System.currentTimeMillis() - t0}ms heap=${ImageUtils.heapUsageLabel()}\n")
+            runCatching { strip.delete() }
+        } catch (t: Throwable) {
+            Log.e(tag, "fullres 单张失败 ${f.name}", t)
+            sb.append("  FAIL ${t.javaClass.simpleName}: ${t.message} ")
+                .append("total ${System.currentTimeMillis() - t0}ms\n")
+        }
+        return sb.toString()
+    }
+
+    // ==================== B0：条带基础设施接缝基线（--es mode seam） ====================
+
+    /**
+     * 恒等算子（shift=0）走完 encodeStripFromFile：输出应≈原图（仅 q95 重编码），
+     * 若 seamMae 明显高于 globalMae → 条带读写/拼装本身有接缝，与滤镜无关。
+     * shift=1 故意把带内像素整体错位一行 → seamMae 必须暴涨，否则说明判据不灵敏。
+     * 带高取 320（200MP 实际值）与 1280（大带）。
+     */
+    private fun runSeamSuite(indir: File, outdir: File, limit: Int) {
+        val sb = StringBuilder()
+        try {
+            val files = indir.listFiles { f ->
+                f.isFile && f.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
+            }?.sortedBy { it.name } ?: emptyList()
+            sb.append("mode=seam files=${files.size} limit=$limit\n")
+            val f = files.firstOrNull()
+            if (f == null) {
+                sb.append("NO INPUT\n")
+            } else {
+                sb.append("input=${f.name} heap=${ImageUtils.heapUsageLabel()}\n")
+                for (bandRows in intArrayOf(320, 1280)) {
+                    for (brk in booleanArrayOf(false, true)) {
+                        val tagName = if (brk) "brk" else "id"
+                        val out = File(outdir, "seam_${f.nameWithoutExtension}_b${bandRows}_$tagName.jpg")
+                        val t0 = System.currentTimeMillis()
+                        val res = ImageUtils.encodeStripFromFile(
+                                f, out, 95, bandRows, op = IdentityOp(brk), strict = true)
+                        val ms = System.currentTimeMillis() - t0
+                        if (!res.ok) {
+                            sb.append("  b=$bandRows $tagName FAILED ${res.width}x${res.height}\n")
+                            continue
+                        }
+                        sb.append("  b=$bandRows $tagName ${res.bandRows}x${res.bandCount} ")
+                            .append("${res.outBytes}B ${ms}ms\n")
+                        sb.append("    ${compareMae(f, out, res.bandRows)}\n")
+                    }
+                }
+                sb.append("heapEnd=${ImageUtils.heapUsageLabel()}\n")
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "seam 基线异常", t)
+            sb.append("FATAL ${t.message}\n")
+        }
+        runCatching { File(outdir, "_seam_report.txt").writeText(sb.toString()) }
+        finish()
+    }
+
+    /**
+     * 恒等 / 故意破坏带边界算子（只破坏非首带的第 0 行，用于验证接缝判据灵敏度）。
+     * 破坏只影响 1 行，若 seamMae 不显著高于 globalMae 就说明判据抓不到接缝。
+     */
+    private class IdentityOp(private val breakBoundary: Boolean) : ImageUtils.StripBandOp {
+        override fun prepare(reader: ImageUtils.StripSource): Boolean = true
+
+        override fun apply(band: Bitmap, top: Int, rows: Int, fullW: Int, fullH: Int): Bitmap? {
+            if (!breakBoundary || top == 0) return band
+            val row = IntArray(fullW)
+            band.getPixels(row, 0, fullW, 0, 0, fullW, 1)
+            val out = IntArray(fullW)
+            val off = fullW / 3
+            for (x in 0 until fullW) out[x] = row[(x + off) % fullW]
+            band.setPixels(out, 0, fullW, 0, 0, fullW, 1)
+            return band
+        }
+    }
+
+    // ==================== 乙档：模型链条带导出验收（--es mode band） ====================
+
+    /**
+     * 对 indir 下每个 JPEG × 每个模型链风格：
+     *  1) 整图链（LeicaEngine.process）作为参考（仅 ≤12.5MP 有意义：整图链本身会 fit 到 4096x3072）；
+     *  2) 条带链（DistillBandOps + encodeStripFromFile，与 exportFullRes 同链路）实测；
+     *  3) 量化 globalMae / 带边界 MAE —— 接缝判据：seamMae ≈ globalMae（×1.0 附近）即无接缝；
+     * 结果写 _band_report.txt。
+     *
+     * 200MP 大图只跑条带链（整图链会把整幅解码进堆，等价性也不成立）。
+     */
+    private fun runBandSuite(indir: File, outdir: File, limit: Int, styles: List<String>) {
+        val sb = StringBuilder()
+        try {
+            val files = indir.listFiles { f ->
+                f.isFile && f.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
+            }?.sortedBy { it.name } ?: emptyList()
+            sb.append("mode=band files=${files.size} limit=$limit styles=$styles\n")
+            var idx = 0
+            for (f in files) {
+                if (limit > 0 && idx >= limit) break
+                idx++
+                for (st in styles) {
+                    // fromId 对未知 id 会回落到 M9，验收必须精确匹配 styles 参数
+                    val style = LeicaEngine.Style.values()
+                        .firstOrNull { it.id.equals(st, ignoreCase = true) }
+                    if (style == null || !DistillBandOps.supports(style)) {
+                        sb.append("SKIP ${f.name} $st\n")
+                        continue
+                    }
+                    sb.append(runOneBand(f, outdir, style))
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "band 批量异常", t)
+            sb.append("FATAL ${t.message}\n")
+        }
+        runCatching { File(outdir, "_band_report.txt").writeText(sb.toString()) }
+        finish()
+    }
+
+    /**
+     * 纯色探针：对纯灰图套暖调 LUT，观察输出是否空间均匀（有无暗角）、是否随位图尺寸/灰度变化。
+     * 用于判定 native 暖调与「内容统计 / 几何」的依赖关系。
+     */
+    private fun runFlatSuite(outdir: File) {
+        val sb = StringBuilder()
+        try {
+            fun probe(w: Int, h: Int, gray: Int, label: String) {
+                val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                val px = IntArray(w)
+                val c = (0xFF shl 24) or (gray shl 16) or (gray shl 8) or gray
+                java.util.Arrays.fill(px, c)
+                for (y in 0 until h) b.setPixels(px, 0, w, 0, y, w, 1)
+                val r = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
+                    this, b, WARM_BIN, WARM_DN, WARM_EV, WARM_WA, 12345f)
+                if (r == null) {
+                    sb.append("  $label ${w}x$h gray=$gray FAILED\n")
+                    return
+                }
+                val row = IntArray(w)
+                val rowMean = FloatArray(h)
+                for (y in 0 until h) {
+                    r.getPixels(row, 0, w, 0, y, w, 1)
+                    var s = 0L
+                    for (x in 0 until w) s += (row[x] shr 8) and 0xFF
+                    rowMean[y] = (s.toFloat() / w)
+                }
+                r.getPixels(row, 0, w, 0, h / 2, w, 1)
+                fun gAt(x: Int) = (row[x] shr 8) and 0xFF
+                sb.append(
+                    "  $label ${w}x$h gray=$gray outRow0=${"%.1f".format(rowMean[0])}" +
+                        " rowMid=${"%.1f".format(rowMean[h / 2])}" +
+                        " rowLast=${"%.1f".format(rowMean[h - 1])}" +
+                        " midRowCC=${gAt(w / 2)} midRowEdge=${gAt(0)}/${gAt(w - 1)}\n"
+                )
+                b.recycle()
+            }
+            sb.append("mode=flat heap=${ImageUtils.heapUsageLabel()}\n")
+            probe(1024, 768, 128, "small")
+            probe(4096, 768, 128, "tall-band")
+            probe(4096, 3072, 128, "full")
+            probe(4096, 768, 40, "dark")
+            probe(4096, 768, 200, "bright")
+        } catch (t: Throwable) {
+            Log.e(tag, "flat 探针失败", t)
+            sb.append("FATAL ${t.message}\n")
+        }
+        runCatching { File(outdir, "_flat_report.txt").writeText(sb.toString()) }
+        finish()
+    }
+
+    private val WARM_BIN = "leica_filter_param_m9_snapshot.bin"
+    private val WARM_DN = 0.6f * 0.33f
+    private val WARM_EV = -0.95f
+    private val WARM_WA = 0.3f
+
+    private fun warmOn(src: Bitmap): Bitmap? = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
+        this, src.copy(Bitmap.Config.ARGB_8888, true), WARM_BIN, WARM_DN, WARM_EV, WARM_WA, 12345f)
+
+    private fun warmBands(src: Bitmap, bandRows: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val cv = android.graphics.Canvas(out)
+        var top = 0
+        while (top < h) {
+            val rows = minOf(bandRows, h - top)
+            val crop = Bitmap.createBitmap(src, 0, top, w, rows).copy(Bitmap.Config.ARGB_8888, true)
+            val wr = warmOn(crop)
+            if (wr != null) cv.drawBitmap(wr, 0f, top.toFloat(), null)
+            top += rows
+        }
+        return out
+    }
+
+    /** 按显式带顶/带高（可为不等高，如末带较短）逐带暖调后拼回整幅。 */
+    private fun warmBandsAt(src: Bitmap, tops: IntArray, rowsArr: IntArray): Bitmap {
+        val w = src.width
+        val h = src.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val cv = android.graphics.Canvas(out)
+        for (i in tops.indices) {
+            val crop = Bitmap.createBitmap(src, 0, tops[i], w, rowsArr[i]).copy(Bitmap.Config.ARGB_8888, true)
+            val wr = warmOn(crop)
+            if (wr != null) cv.drawBitmap(wr, 0f, tops[i].toFloat(), null)
+        }
+        return out
+    }
+
+    /** 由代理图（整幅暖调 vs 逐带暖调）拟合 [gw]x[gh] 的逐通道仿射修正：whole ≈ a*band + b。 */
+    private fun fitAffineGrid(whole: Bitmap, band: Bitmap, gw: Int, gh: Int): FloatArray {
+        val w = whole.width
+        val h = whole.height
+        val rowW = IntArray(w)
+        val rowB = IntArray(w)
+        val sx = DoubleArray(gw * gh * 3)
+        val sy = DoubleArray(gw * gh * 3)
+        val sxx = DoubleArray(gw * gh * 3)
+        val sxy = DoubleArray(gw * gh * 3)
+        val cnt = IntArray(gw * gh * 3)
+        for (py in 0 until h) {
+            whole.getPixels(rowW, 0, w, 0, py, w, 1)
+            band.getPixels(rowB, 0, w, 0, py, w, 1)
+            val gy = ((py.toLong() * gh) / h).toInt().coerceIn(0, gh - 1)
+            for (x in 0 until w) {
+                val gx = ((x.toLong() * gw) / w).toInt().coerceIn(0, gw - 1)
+                val cell = gy * gw + gx
+                val cw = rowW[x]
+                val cb = rowB[x]
+                for (k in 0 until 3) {
+                    val vw = (cw shr (k * 8)) and 0xFF
+                    val vb = (cb shr (k * 8)) and 0xFF
+                    if (vw >= 8 && vb >= 8) {
+                        val i = cell * 3 + k
+                        sx[i] += vb.toDouble()
+                        sy[i] += vw.toDouble()
+                        sxx[i] += (vb * vb).toDouble()
+                        sxy[i] += (vb * vw).toDouble()
+                        cnt[i]++
+                    }
+                }
+            }
+        }
+        val raw = FloatArray(gw * gh * 6)
+        for (cell in 0 until gw * gh) {
+            for (k in 0 until 3) {
+                val i = cell * 3 + k
+                val n = cnt[i]
+                var a = 1.0
+                var b = 0.0
+                if (n >= 24) {
+                    val den = n * sxx[i] - sx[i] * sx[i]
+                    if (den > 1e-6) {
+                        a = (n * sxy[i] - sx[i] * sy[i]) / den
+                        b = (sy[i] - a * sx[i]) / n
+                        if (a !in 0.5..2.0 || b !in -96.0..96.0) {
+                            a = 1.0
+                            b = 0.0
+                        }
+                    }
+                }
+                raw[cell * 3 + k] = a.toFloat()
+                raw[(gw * gh * 3) + cell * 3 + k] = b.toFloat()
+            }
+        }
+        // 两轮 3x3 平滑，抹掉代理图缩放/噪声带来的网格抖动（a 平面与 b 平面分别平滑）
+        val aBase = gw * gh * 3
+        var cur = raw
+        repeat(2) {
+            val nxt = FloatArray(raw.size)
+            for (pa in 0 until 2) {
+                val base = pa * aBase
+                for (gy in 0 until gh) for (gx in 0 until gw) for (k in 0 until 3) {
+                    var s = 0f
+                    var c = 0
+                    for (dy in -1..1) for (dx in -1..1) {
+                        val yy = gy + dy
+                        val xx = gx + dx
+                        if (yy in 0 until gh && xx in 0 until gw) {
+                            s += cur[base + (yy * gw + xx) * 3 + k]
+                            c++
+                        }
+                    }
+                    nxt[base + (gy * gw + gx) * 3 + k] = s / c
+                }
+            }
+            cur = nxt
+        }
+        return cur
+    }
+
+    private fun applyAffineGrid(bmp: Bitmap, grid: FloatArray, gw: Int, gh: Int) {
+        val w = bmp.width
+        val h = bmp.height
+        val row = IntArray(w)
+        val aBase = gw * gh * 3
+        for (y in 0 until h) {
+            bmp.getPixels(row, 0, w, 0, y, w, 1)
+            val fy = ((y + 0.5f) / h * gh - 0.5f).coerceIn(0f, (gh - 1).toFloat())
+            val y0 = fy.toInt().coerceAtMost(gh - 1)
+            val y1 = (y0 + 1).coerceAtMost(gh - 1)
+            val wy = fy - y0
+            for (x in 0 until w) {
+                val fx = ((x + 0.5f) / w * gw - 0.5f).coerceIn(0f, (gw - 1).toFloat())
+                val x0 = fx.toInt().coerceAtMost(gw - 1)
+                val x1 = (x0 + 1).coerceAtMost(gw - 1)
+                val wx = fx - x0
+                val c00 = y0 * gw + x0
+                val c01 = y0 * gw + x1
+                val c10 = y1 * gw + x0
+                val c11 = y1 * gw + x1
+                val c = row[x]
+                var out = 0xFF shl 24
+                for (k in 0 until 3) {
+                    val a = (grid[c00 * 3 + k] * (1 - wx) + grid[c01 * 3 + k] * wx) * (1 - wy) +
+                        (grid[c10 * 3 + k] * (1 - wx) + grid[c11 * 3 + k] * wx) * wy
+                    val b = (grid[aBase + c00 * 3 + k] * (1 - wx) + grid[aBase + c01 * 3 + k] * wx) * (1 - wy) +
+                        (grid[aBase + c10 * 3 + k] * (1 - wx) + grid[aBase + c11 * 3 + k] * wx) * wy
+                    val v = ((c shr (k * 8)) and 0xFF) * a + b
+                    out = out or (v.toInt().coerceIn(0, 255) shl (k * 8))
+                }
+                row[x] = out
+            }
+            bmp.setPixels(row, 0, w, 0, y, w, 1)
+        }
+    }
+
+    /**
+     * 逐格亮度分段修正表：每个网格格、每通道建立 band 亮度级 → whole 目标值 的 32 级查找表。
+     * 比仿射强，可表达「暗角强度随亮度非线性变化」。
+     */
+    private fun fitToneGrid(whole: Bitmap, band: Bitmap, gw: Int, gh: Int, levels: Int): FloatArray {
+        val w = whole.width
+        val h = whole.height
+        val cells = gw * gh * 3
+        val cnt = IntArray(cells * levels)
+        val sum = DoubleArray(cells * levels)
+        val rowW = IntArray(w)
+        val rowB = IntArray(w)
+        for (py in 0 until h) {
+            whole.getPixels(rowW, 0, w, 0, py, w, 1)
+            band.getPixels(rowB, 0, w, 0, py, w, 1)
+            val gy = ((py.toLong() * gh) / h).toInt().coerceIn(0, gh - 1)
+            for (x in 0 until w) {
+                val gx = ((x.toLong() * gw) / w).toInt().coerceIn(0, gw - 1)
+                val cell = (gy * gw + gx) * 3
+                val cw = rowW[x]
+                val cb = rowB[x]
+                for (k in 0 until 3) {
+                    val vb = (cb shr (k * 8)) and 0xFF
+                    val vw = (cw shr (k * 8)) and 0xFF
+                    val lv = ((vb * levels) / 256).coerceIn(0, levels - 1)
+                    val i = (cell + k) * levels + lv
+                    sum[i] += vw.toDouble()
+                    cnt[i]++
+                }
+            }
+        }
+        val grid = FloatArray(cells * levels)
+        val vxs = IntArray(levels)
+        val vys = FloatArray(levels)
+        for (c3 in 0 until cells) {
+            val base = c3 * levels
+            var n = 0
+            for (l in 0 until levels) {
+                if (cnt[base + l] >= 8) {
+                    vxs[n] = l
+                    vys[n] = (sum[base + l] / cnt[base + l]).toFloat()
+                    n++
+                }
+            }
+            if (n == 0) {
+                for (l in 0 until levels) grid[base + l] = (l + 0.5f) * 256f / levels
+                continue
+            }
+            var j = 0
+            for (l in 0 until levels) {
+                while (j + 1 < n && vxs[j + 1] <= l) j++
+                grid[base + l] = when {
+                    vxs[j] == l -> vys[j]
+                    j + 1 < n -> {
+                        val t = (l - vxs[j]).toFloat() / (vxs[j + 1] - vxs[j])
+                        vys[j] + (vys[j + 1] - vys[j]) * t
+                    }
+                    else -> vys[j]
+                }
+            }
+        }
+        // 沿亮度轴 1-2-1 平滑一次（避免分箱台阶）
+        val sm = FloatArray(grid.size)
+        for (c3 in 0 until cells) {
+            val base = c3 * levels
+            for (l in 0 until levels) {
+                sm[base + l] = when (l) {
+                    0 -> grid[base]
+                    levels - 1 -> grid[base + levels - 1]
+                    else -> (grid[base + l - 1] + 2f * grid[base + l] + grid[base + l + 1]) / 4f
+                }
+            }
+        }
+        return sm
+    }
+
+    private fun applyToneGrid(bmp: Bitmap, grid: FloatArray, gw: Int, gh: Int, levels: Int) {
+        val w = bmp.width
+        val h = bmp.height
+        val row = IntArray(w)
+        val lvF = levels
+        for (y in 0 until h) {
+            bmp.getPixels(row, 0, w, 0, y, w, 1)
+            val fy = ((y + 0.5f) / h * gh - 0.5f).coerceIn(0f, (gh - 1).toFloat())
+            val y0 = fy.toInt().coerceAtMost(gh - 1)
+            val y1 = (y0 + 1).coerceAtMost(gh - 1)
+            val wy = fy - y0
+            for (x in 0 until w) {
+                val fx = ((x + 0.5f) / w * gw - 0.5f).coerceIn(0f, (gw - 1).toFloat())
+                val x0 = fx.toInt().coerceAtMost(gw - 1)
+                val x1 = (x0 + 1).coerceAtMost(gw - 1)
+                val wx = fx - x0
+                val c00 = (y0 * gw + x0) * 3
+                val c01 = (y0 * gw + x1) * 3
+                val c10 = (y1 * gw + x0) * 3
+                val c11 = (y1 * gw + x1) * 3
+                val c = row[x]
+                var out = 0xFF shl 24
+                for (k in 0 until 3) {
+                    val v = (c shr (k * 8)) and 0xFF
+                    val lf = v * lvF / 256f - 0.5f
+                    val l0 = lf.toInt().coerceIn(0, levels - 1)
+                    val l1 = (l0 + 1).coerceAtMost(levels - 1)
+                    val t = (lf - l0).coerceIn(0f, 1f)
+                    val i00 = (c00 + k) * levels
+                    val i01 = (c01 + k) * levels
+                    val i10 = (c10 + k) * levels
+                    val i11 = (c11 + k) * levels
+                    val yl0 = (grid[i00 + l0] * (1 - wx) + grid[i01 + l0] * wx) * (1 - wy) +
+                        (grid[i10 + l0] * (1 - wx) + grid[i11 + l0] * wx) * wy
+                    val yl1 = (grid[i00 + l1] * (1 - wx) + grid[i01 + l1] * wx) * (1 - wy) +
+                        (grid[i10 + l1] * (1 - wx) + grid[i11 + l1] * wx) * wy
+                    val ov = yl0 + (yl1 - yl0) * t
+                    out = out or ((ov + 0.5f).toInt().coerceIn(0, 255) shl (k * 8))
+                }
+                row[x] = out
+            }
+            bmp.setPixels(row, 0, w, 0, y, w, 1)
+        }
+    }
+
+    /** 每条带的纵向网格行数：最多 gh，且保证每格约 3 行样本（与主链 DistillBandOps 同口径）。 */
+    private fun bandGridRows(rowsArr: IntArray, gh: Int): IntArray =
+        IntArray(rowsArr.size) { i -> minOf(gh, maxOf(2, rowsArr[i] / 3)) }
+
+    private fun gridOffsets(ghArr: IntArray, gw: Int): IntArray {
+        val off = IntArray(ghArr.size + 1)
+        for (i in ghArr.indices) off[i + 1] = off[i] + ghArr[i] * gw * 3
+        return off
+    }
+
+    /**
+     * 逐带独立拟合的亮度分段修正表（关键：带间不插值，边界阶跃可被完整表达）。
+     * 索引布局：offs[band] + [(gy*gw + gx)*3 + k] → levels 级目标值。
+     * 带内纵向按该带实际行数归一化，因此代理图与全分辨率的最后一条短带也一一对应。
+     */
+    private fun fitToneGridPerBand(
+        whole: Bitmap, band: Bitmap,
+        tops: IntArray, rowsArr: IntArray, ghArr: IntArray, gw: Int, levels: Int
+    ): FloatArray {
+        val w = whole.width
+        val h = whole.height
+        val bands = tops.size
+        val offs = gridOffsets(ghArr, gw)
+        val cells = offs[bands]
+        val cnt = IntArray(cells * levels)
+        val sum = DoubleArray(cells * levels)
+        val rowW = IntArray(w)
+        val rowB = IntArray(w)
+        for (py in 0 until h) {
+            whole.getPixels(rowW, 0, w, 0, py, w, 1)
+            band.getPixels(rowB, 0, w, 0, py, w, 1)
+            var bi = 0
+            while (bi + 1 < bands && py >= tops[bi + 1]) bi++
+            val yIn = py - tops[bi]
+            val gh = ghArr[bi]
+            val rowsEff = rowsArr[bi].coerceAtLeast(1)
+            val gy = ((yIn.toLong() * gh) / rowsEff).toInt().coerceIn(0, gh - 1)
+            val bandBase = offs[bi]
+            for (x in 0 until w) {
+                val gx = ((x.toLong() * gw) / w).toInt().coerceIn(0, gw - 1)
+                val cell = bandBase + (gy * gw + gx) * 3
+                val cw = rowW[x]
+                val cb = rowB[x]
+                for (k in 0 until 3) {
+                    val vb = (cb shr (k * 8)) and 0xFF
+                    val vw = (cw shr (k * 8)) and 0xFF
+                    val lv = ((vb * levels) / 256).coerceIn(0, levels - 1)
+                    val i = (cell + k) * levels + lv
+                    sum[i] += vw.toDouble()
+                    cnt[i]++
+                }
+            }
+        }
+        val grid = FloatArray(cells * levels)
+        val vxs = IntArray(levels)
+        val vys = FloatArray(levels)
+        for (c3 in 0 until cells) {
+            val base = c3 * levels
+            var cellN = 0
+            for (l in 0 until levels) cellN += cnt[base + l]
+            val minCnt = maxOf(2, minOf(8, cellN / levels / 2))
+            var n = 0
+            for (l in 0 until levels) {
+                if (cnt[base + l] >= minCnt) {
+                    vxs[n] = l
+                    vys[n] = (sum[base + l] / cnt[base + l]).toFloat()
+                    n++
+                }
+            }
+            var j = 0
+            for (l in 0 until levels) {
+                if (n == 0) {
+                    grid[base + l] = (l + 0.5f) * 256f / levels
+                } else {
+                    while (j + 1 < n && vxs[j + 1] <= l) j++
+                    grid[base + l] = when {
+                        vxs[j] == l -> vys[j]
+                        j + 1 < n -> {
+                            val t = (l - vxs[j]).toFloat() / (vxs[j + 1] - vxs[j])
+                            vys[j] + (vys[j + 1] - vys[j]) * t
+                        }
+                        else -> vys[j]
+                    }
+                }
+            }
+        }
+        val sm = FloatArray(grid.size)
+        for (c3 in 0 until cells) {
+            val base = c3 * levels
+            for (l in 0 until levels) {
+                sm[base + l] = when (l) {
+                    0 -> grid[base]
+                    levels - 1 -> grid[base + levels - 1]
+                    else -> (grid[base + l - 1] + 2f * grid[base + l] + grid[base + l + 1]) / 4f
+                }
+            }
+        }
+        return sm
+    }
+
+    private fun applyToneGridPerBand(
+        bmp: Bitmap, grid: FloatArray,
+        tops: IntArray, rowsArr: IntArray, ghArr: IntArray, gw: Int, levels: Int
+    ) {
+        val w = bmp.width
+        val h = bmp.height
+        val bands = tops.size
+        val offs = gridOffsets(ghArr, gw)
+        val row = IntArray(w)
+        val lvF = levels
+        for (y in 0 until h) {
+            bmp.getPixels(row, 0, w, 0, y, w, 1)
+            var bi = 0
+            while (bi + 1 < bands && y >= tops[bi + 1]) bi++
+            val yIn = y - tops[bi]
+            val gh = ghArr[bi]
+            val rowsEff = rowsArr[bi].coerceAtLeast(1)
+            val fy = ((yIn + 0.5f) / rowsEff * gh - 0.5f).coerceIn(0f, (gh - 1).toFloat())
+            val y0 = fy.toInt().coerceAtMost(gh - 1)
+            val y1 = (y0 + 1).coerceAtMost(gh - 1)
+            val wy = fy - y0
+            val rowBase0 = offs[bi] + y0 * gw * 3
+            val rowBase1 = offs[bi] + y1 * gw * 3
+            for (x in 0 until w) {
+                val fx = ((x + 0.5f) / w * gw - 0.5f).coerceIn(0f, (gw - 1).toFloat())
+                val x0 = fx.toInt().coerceAtMost(gw - 1)
+                val x1 = (x0 + 1).coerceAtMost(gw - 1)
+                val wx = fx - x0
+                val c00 = rowBase0 + x0 * 3
+                val c01 = rowBase0 + x1 * 3
+                val c10 = rowBase1 + x0 * 3
+                val c11 = rowBase1 + x1 * 3
+                val c = row[x]
+                var out = 0xFF shl 24
+                for (k in 0 until 3) {
+                    val v = (c shr (k * 8)) and 0xFF
+                    val lf = v * lvF / 256f - 0.5f
+                    val l0 = lf.toInt().coerceIn(0, levels - 1)
+                    val l1 = (l0 + 1).coerceAtMost(levels - 1)
+                    val t = (lf - l0).coerceIn(0f, 1f)
+                    val i00 = (c00 + k) * levels
+                    val i01 = (c01 + k) * levels
+                    val i10 = (c10 + k) * levels
+                    val i11 = (c11 + k) * levels
+                    val yl0 = (grid[i00 + l0] * (1 - wx) + grid[i01 + l0] * wx) * (1 - wy) +
+                        (grid[i10 + l0] * (1 - wx) + grid[i11 + l0] * wx) * wy
+                    val yl1 = (grid[i00 + l1] * (1 - wx) + grid[i01 + l1] * wx) * (1 - wy) +
+                        (grid[i10 + l1] * (1 - wx) + grid[i11 + l1] * wx) * wy
+                    val ov = yl0 + (yl1 - yl0) * t
+                    out = out or ((ov + 0.5f).toInt().coerceIn(0, 255) shl (k * 8))
+                }
+                row[x] = out
+            }
+            bmp.setPixels(row, 0, w, 0, y, w, 1)
+        }
+    }
+
+    /**
+     * 验证「逐带暖调 + 代理图增益修正」：代理图上同时跑整幅/逐带暖调，拟合逐通道增益网格，
+     * 再套到全分辨率逐带结果上，与整幅暖调比较。
+     */
+    private fun runWarmFixSuite(indir: File, outdir: File) {
+        val sb = StringBuilder()
+        try {
+            val f = indir.listFiles { x ->
+                x.isFile && x.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
+            }?.sortedBy { it.name }?.firstOrNull()
+            if (f == null) {
+                sb.append("no jpg\n")
+            } else {
+                val bmp = BitmapFactory.decodeFile(f.absolutePath)
+                    ?: throw IllegalStateException("decode failed")
+                val src = bmp.copy(Bitmap.Config.ARGB_8888, true)
+                bmp.recycle()
+                val w = src.width
+                val h = src.height
+                val bandRows = 768
+                sb.append("mode=warm2 ${f.name} ${w}x$h band=$bandRows heap=${ImageUtils.heapUsageLabel()}\n")
+
+                val a = warmOn(src) ?: throw IllegalStateException("whole warm failed")
+                val af = File(outdir, "warmfix_whole.jpg")
+                java.io.FileOutputStream(af).use { a.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                a.recycle()
+
+                val b = warmBands(src, bandRows)
+                val bf0 = File(outdir, "warmfix_raw.jpg")
+                java.io.FileOutputStream(bf0).use { b.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                sb.append("  cmp_raw ${compareMae(af, bf0, bandRows)}\n")
+
+                // 真实逐带几何（末带可能更短，暗角强度由「该带自身宽高比」决定）
+                val hTopsL = ArrayList<Int>()
+                val hRowsL = ArrayList<Int>()
+                var tp = 0
+                while (tp < h) {
+                    val r = minOf(bandRows, h - tp)
+                    hTopsL.add(tp); hRowsL.add(r); tp += r
+                }
+                val hTops = hTopsL.toIntArray()
+                val hRows = hRowsL.toIntArray()
+
+                // 代理图：先定宽，再让每条代理带的行数 = 宽度 × 真实带行数 / 图宽，
+                // 使代理带与真实带的宽高比逐一相同（上一版按整图等比缩小，末带/非整除时会变形）
+                val pw = kotlin.math.sqrt(2_500_000.0 * w / h).toInt().coerceAtLeast(16)
+                val pTops = IntArray(hRows.size)
+                val pRows = IntArray(hRows.size)
+                var acc = 0
+                for (i in hRows.indices) {
+                    pTops[i] = acc
+                    pRows[i] = ((pw.toDouble() * hRows[i]) / w).toInt().coerceAtLeast(2)
+                    acc += pRows[i]
+                }
+                val ph = acc
+                sb.append("  proxy ${pw}x$ph pRows=${pRows.joinToString(",")}\n")
+                val proxy = Bitmap.createScaledBitmap(src, pw, ph, true)
+                val pWhole = warmOn(proxy) ?: throw IllegalStateException("proxy whole failed")
+                val pBands = warmBandsAt(proxy, pTops, pRows)
+                val gw = 24
+                val gh = 24
+                val levels = 32
+                val ghArr = bandGridRows(pRows, gh)
+                sb.append("  proxyGh=${ghArr.joinToString(",")}\n")
+                val toneBand = fitToneGridPerBand(pWhole, pBands, pTops, pRows, ghArr, gw, levels)
+                // 代理图自检：修正后与整幅目标的残差（不含 JPEG/缩放误差，纯模型精度）
+                run {
+                    val pChk = pBands.copy(Bitmap.Config.ARGB_8888, true)
+                    applyToneGridPerBand(pChk, toneBand, pTops, pRows, ghArr, gw, levels)
+                    val pr = IntArray(pw)
+                    val pc = IntArray(pw)
+                    var sd = 0.0
+                    var sn = 0L
+                    var bd = 0.0
+                    var bn = 0
+                    for (py in 0 until ph) {
+                        pWhole.getPixels(pr, 0, pw, 0, py, pw, 1)
+                        pChk.getPixels(pc, 0, pw, 0, py, pw, 1)
+                        var rs = 0.0
+                        for (x in 0 until pw) {
+                            val p = pr[x]
+                            val q = pc[x]
+                            val lp = ((p shr 16 and 0xFF) * 299 + (p shr 8 and 0xFF) * 587 + (p and 0xFF) * 114) / 1000
+                            val lq = ((q shr 16 and 0xFF) * 299 + (q shr 8 and 0xFF) * 587 + (q and 0xFF) * 114) / 1000
+                            rs += kotlin.math.abs(lp - lq)
+                        }
+                        sd += rs
+                        sn += pw
+                        if (py > 0 && pTops.any { it == py }) {
+                            bd += rs / pw
+                            bn++
+                        }
+                    }
+                    sb.append("  proxyMae=%.3f proxyBoundaryMae=%.3f\n".format(sd / sn, if (bn > 0) bd / bn else 0.0))
+                    pChk.recycle()
+                }
+                proxy.recycle()
+                pWhole.recycle()
+                pBands.recycle()
+
+                b.recycle()
+
+                val b2 = warmBandsAt(src, hTops, hRows)
+                applyToneGridPerBand(b2, toneBand, hTops, hRows, ghArr, gw, levels)
+                val bf2 = File(outdir, "warmfix_perband.jpg")
+                java.io.FileOutputStream(bf2).use { b2.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                sb.append("  cmp_perband ${compareMae(af, bf2, bandRows)}\n")
+
+                // 分辨率敏感性探针：把代理宽度放大后再拟合一次，看「传递到全分辨率的残余偏差」
+                // 是否随之收敛。收敛明显 → 提高 PROXY_PX 值得；几乎不变 → 残余是模型表达上限。
+                for (f in doubleArrayOf(1.6)) {
+                    val pw2 = (pw * f).toInt().coerceAtMost(w)
+                    if (pw2 <= pw) continue
+                    val pTops2 = IntArray(hRows.size)
+                    val pRows2 = IntArray(hRows.size)
+                    var acc2 = 0
+                    for (i in hRows.indices) {
+                        pTops2[i] = acc2
+                        pRows2[i] = ((pw2.toDouble() * hRows[i]) / w).toInt().coerceAtLeast(2)
+                        acc2 += pRows2[i]
+                    }
+                    val proxy2 = Bitmap.createScaledBitmap(src, pw2, acc2, true)
+                    val pWhole2 = warmOn(proxy2)
+                    val pBands2 = warmBandsAt(proxy2, pTops2, pRows2)
+                    val gh2 = bandGridRows(pRows2, gh)
+                    val g2 = if (pWhole2 != null)
+                        fitToneGridPerBand(pWhole2, pBands2, pTops2, pRows2, gh2, gw, levels)
+                    else FloatArray(0)
+                    val tag2 = "  scale${"%.2f".format(f)}"
+                    sb.append("$tag2 proxy ${pw2}x$acc2 pRows=${pRows2.joinToString(",")}"
+                            + " gh=${gh2.joinToString(",")}\n")
+                    val pChk2 = pBands2.copy(Bitmap.Config.ARGB_8888, true)
+                    applyToneGridPerBand(pChk2, g2, pTops2, pRows2, gh2, gw, levels)
+                    val r2 = IntArray(pw2)
+                    val c2 = IntArray(pw2)
+                    var sd2 = 0.0
+                    var sn2 = 0L
+                    for (py in 0 until acc2) {
+                        pWhole2?.getPixels(r2, 0, pw2, 0, py, pw2, 1)
+                        pChk2.getPixels(c2, 0, pw2, 0, py, pw2, 1)
+                        for (x in 0 until pw2) {
+                            val p = r2[x]
+                            val q = c2[x]
+                            val lp = ((p shr 16 and 0xFF) * 299 + (p shr 8 and 0xFF) * 587
+                                    + (p and 0xFF) * 114) / 1000
+                            val lq = ((q shr 16 and 0xFF) * 299 + (q shr 8 and 0xFF) * 587
+                                    + (q and 0xFF) * 114) / 1000
+                            sd2 += kotlin.math.abs(lp - lq)
+                            sn2++
+                        }
+                    }
+                    sb.append("$tag2 proxyMae=%.3f\n".format(sd2 / sn2))
+                    pChk2.recycle()
+                    val b3 = warmBandsAt(src, hTops, hRows)
+                    applyToneGridPerBand(b3, g2, hTops, hRows, gh2, gw, levels)
+                    val bf3 = File(outdir, "warmfix_scale.jpg")
+                    java.io.FileOutputStream(bf3).use { b3.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                    sb.append("$tag2 cmp ${compareMae(af, bf3, bandRows)}\n")
+                    b3.recycle()
+                    proxy2.recycle()
+                    pWhole2?.recycle()
+                    pBands2.recycle()
+                }
+
+                src.recycle()
+                b2.recycle()
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "warm2 失败", t)
+            sb.append("FATAL ${t.message}\n")
+        }
+        runCatching { File(outdir, "_warm2_report.txt").writeText(sb.toString()) }
+        finish()
+    }
+
+    /**
+     * 暖调 LUT 的「整幅一次」vs「逐带各一次」对比，用于判定 native 暖调是否依赖整图统计。
+     * 若两者差出一个大 MAE → 条带链的根本偏差就来自逐带暖调（与推理分块无关）。
+     */
+    private fun runWarmSuite(indir: File, outdir: File) {
+        val sb = StringBuilder()
+        try {
+            val f = indir.listFiles { x ->
+                x.isFile && x.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
+            }?.sortedBy { it.name }?.firstOrNull()
+            if (f == null) {
+                sb.append("no jpg\n")
+            } else {
+                val bmp = BitmapFactory.decodeFile(f.absolutePath)
+                    ?: throw IllegalStateException("decode failed")
+                val src = bmp.copy(Bitmap.Config.ARGB_8888, true)
+                bmp.recycle()
+                val w = src.width
+                val h = src.height
+                sb.append("mode=warm ${f.name} ${w}x$h heap=${ImageUtils.heapUsageLabel()}\n")
+                val bin = "leica_filter_param_m9_snapshot.bin"
+                val dn = 0.6f * 0.33f
+                val ev = -0.95f
+                val wa = 0.3f
+                val t = 12345f
+
+                val a = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
+                    this, src.copy(Bitmap.Config.ARGB_8888, true), bin, dn, ev, wa, t)
+                val af = File(outdir, "warm_whole.jpg")
+                if (a == null) {
+                    sb.append("  whole warm failed\n")
+                } else {
+                    java.io.FileOutputStream(af).use { a.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                }
+
+                val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                val cv = android.graphics.Canvas(out)
+                val step = minOf(768, h)
+                var top = 0
+                while (top < h) {
+                    val rows = minOf(step, h - top)
+                    val crop = Bitmap.createBitmap(src, 0, top, w, rows)
+                        .copy(Bitmap.Config.ARGB_8888, true)
+                    val wr = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
+                        this, crop, bin, dn, ev, wa, t)
+                    if (wr == null) sb.append("  band warm failed @$top\n")
+                    else cv.drawBitmap(wr, 0f, top.toFloat(), null)
+                    top += rows
+                }
+                val bf = File(outdir, "warm_band.jpg")
+                java.io.FileOutputStream(bf).use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                if (af.exists()) sb.append("  cmp ${compareMae(af, bf, step)}\n")
+                src.recycle()
+                out.recycle()
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "warm 隔离失败", t)
+            sb.append("FATAL ${t.message}\n")
+        }
+        runCatching { File(outdir, "_warm_report.txt").writeText(sb.toString()) }
+        finish()
+    }
+
+    private fun runOneBand(f: File, outdir: File, style: LeicaEngine.Style): String {
+        val sb = StringBuilder()
+        val stem = f.nameWithoutExtension
+        try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(f.absolutePath, bounds)
+            val w = bounds.outWidth
+            val h = bounds.outHeight
+            val mp = w.toLong() * h / 1_000_000.0
+            sb.append("== %s %dx%d (%.1fMP) style=%s heap=%s\n"
+                .format(stem, w, h, mp, style.id, ImageUtils.heapUsageLabel()))
+
+            // 等价性参考：只有 M9D 的整图链「就是」M9Distill.run（无前后额外步骤），
+            // 才能与条带链严格对拍；其它风格的整图链走原生引擎/额外后推，MAE 不可比。
+            var refMs = -1L
+            var refFile: File? = null
+            // 整图链自身可重复性：第二次 run 复用 styled 缓存，只差暖调 time 与抖色随机 → 测后处理噪声地板
+            var ref2File: File? = null
+            if (style.id == "M9D" && w.toLong() * h <= 12_600_000L) {
+                // 必须与条带链同像素网格：条带链按文件原始像素逐带处理（EXIF 方向靠回填保留），
+                // 这里再 normalizeExifOrientation 会变成竖版 3072x4096，与横版条带图不可比。
+                val work = f.readBytes()
+                if (DistillBandOps.debugStyledOnly) {
+                    // 只比蒸馏推理这一段：条带链关掉全部后处理，参考图 = 整图链的 styled 输出
+                    val sbmp = M9Distill.styleOnly(this, work)
+                    if (sbmp != null) {
+                        refFile = File(outdir, "${stem}_${style.id}_ref.jpg").apply {
+                            java.io.FileOutputStream(this).use {
+                                sbmp.compress(Bitmap.CompressFormat.JPEG, 95, it)
+                            }
+                        }
+                        sbmp.recycle()
+                    }
+                    sb.append("  styledOnly compare\n")
+                } else {
+                val t1 = System.currentTimeMillis()
+                val ref = M9Distill.run(this, work)
+                refMs = System.currentTimeMillis() - t1
+                if (ref != null) {
+                    refFile = File(outdir, "${stem}_${style.id}_ref.jpg").apply { writeBytes(ref) }
+                    val ref2 = M9Distill.run(this, work)
+                    if (ref2 != null) {
+                        ref2File = File(outdir, "${stem}_${style.id}_ref2.jpg").apply { writeBytes(ref2) }
+                    }
+                }
+                }
+            }
+
+            val op = DistillBandOps.create(this, style, IntArray(5))
+            if (op == null) return sb.append("  op create failed\n").toString()
+            val strip = File(outdir, "${stem}_${style.id}_band.jpg")
+            val t2 = System.currentTimeMillis()
+            val res = ImageUtils.encodeStripFromFile(f, strip, 95, bandRowsReq, op = op, strict = true)
+            val bandMs = System.currentTimeMillis() - t2
+            sb.append("  band ok=${res.ok} ${res.width}x${res.height} ")
+                .append("band=${res.bandRows}x${res.bandCount} ${res.outBytes}B ")
+                .append("${bandMs}ms heap=${ImageUtils.heapUsageLabel()}\n")
+            if (!res.ok) return sb.append("  band FAILED (strict)\n").toString()
+            sb.append("  wholeChainMs=$refMs\n")
+            if (refFile != null) sb.append("  cmp ${compareMae(refFile, strip, res.bandRows)}\n")
+            if (refFile != null && ref2File != null) {
+                sb.append("  cmpRefRef ${compareMae(refFile, ref2File, res.bandRows)}\n")
+            }
+            // 上限诊断：在「已被比较的两张图」上直接拟合同样的网格（oracle），
+            // 用来区分「修正模型表达力不足」与「代理图迁移损失」
+            if (refFile != null) {
+                sb.append("  oracle ${oracleToneFix(refFile, strip, res.bandRows)}\n")
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "band 单张失败 ${f.name} ${style.id}", t)
+            sb.append("  FAIL ${t.javaClass.simpleName}: ${t.message}\n")
+        }
+        return sb.toString()
+    }
+
+    /** 参考图 vs 条带图的亮度 MAE（1/2 采样）；带边界行单独统计，比值≈1 表示无接缝。 */
+    private fun compareMae(refFile: File, bandFile: File, bandRows: Int): String {
+        fun load(f: File): Bitmap? = runCatching {
+            BitmapFactory.decodeFile(f.absolutePath, BitmapFactory.Options().apply {
+                inSampleSize = 2
+            })
+        }.getOrNull()
+
+        val a = load(refFile) ?: return "ref decode failed"
+        val b = load(bandFile) ?: return "band decode failed"
+        try {
+            val w = minOf(a.width, b.width)
+            val h = minOf(a.height, b.height)
+            if (w <= 0 || h <= 0) return "bad size"
+            val ra = IntArray(w)
+            val rb = IntArray(w)
+            var sum = 0.0
+            var n = 0L
+            var maxRow = 0.0
+            var maxRowY = -1
+            var seamSum = 0.0
+            var seamN = 0
+            // 分带误差拆分：带内「有符号均值」大 → 仍在整带色调偏差；均值小而 MAE 大 → 只剩细节差异
+            val bands = ((h + maxOf(1, bandRows / 2) - 1) / maxOf(1, bandRows / 2))
+            val bSigned = DoubleArray(bands)
+            val bAbs = DoubleArray(bands)
+            val bN = LongArray(bands)
+            // 输出图自身的行梯度（接缝=输出在带边界多出来的阶跃，需与参考图同位置梯度相减）
+            val dRowA = DoubleArray(h)
+            val dRowB = DoubleArray(h)
+            var prevA: IntArray? = null
+            var prevB: IntArray? = null
+            val step = maxOf(1, bandRows / 2)   // 1/2 采样后的带高
+            for (y in 0 until h) {
+                a.getPixels(ra, 0, w, 0, y, w, 1)
+                b.getPixels(rb, 0, w, 0, y, w, 1)
+                var rowSum = 0.0
+                var rowSigned = 0.0
+                var gradA = 0.0
+                var gradB = 0.0
+                val lumA = IntArray(w)
+                val lumB = IntArray(w)
+                for (x in 0 until w) {
+                    val p = ra[x]
+                    val q = rb[x]
+                    val lp = ((p shr 16 and 0xFF) * 299 + (p shr 8 and 0xFF) * 587 + (p and 0xFF) * 114) / 1000
+                    val lq = ((q shr 16 and 0xFF) * 299 + (q shr 8 and 0xFF) * 587 + (q and 0xFF) * 114) / 1000
+                    lumA[x] = lp
+                    lumB[x] = lq
+                    rowSum += kotlin.math.abs(lp - lq).toDouble()
+                    rowSigned += (lq - lp).toDouble()
+                    val pa = prevA
+                    if (pa != null) gradA += kotlin.math.abs(lp - pa[x]).toDouble()
+                    val pb = prevB
+                    if (pb != null) gradB += kotlin.math.abs(lq - pb[x]).toDouble()
+                }
+                dRowA[y] = if (prevA != null) gradA / w else 0.0
+                dRowB[y] = if (prevB != null) gradB / w else 0.0
+                prevA = lumA
+                prevB = lumB
+                val rowMae = rowSum / w
+                val biIdx = (y / step).coerceAtMost(bands - 1)
+                bSigned[biIdx] += rowSigned
+                bAbs[biIdx] += rowSum
+                bN[biIdx] += w.toLong()
+                sum += rowSum
+                n += w
+                if (rowMae > maxRow) {
+                    maxRow = rowMae
+                    maxRowY = y
+                }
+                if (y > 0 && y % step == 0) {
+                    seamSum += rowMae
+                    seamN++
+                }
+            }
+            val global = if (n > 0) sum / n else 0.0
+            val seam = if (seamN > 0) seamSum / seamN else 0.0
+            val ratio = if (global > 0.01) seam / global else 1.0
+            // 带边界「多出来的阶跃」：输出梯度 - 参考图同位置梯度（>1.0 肉眼可辨）
+            var excessMax = 0.0
+            var excessMaxY = -1
+            var excessSum = 0.0
+            var excessN = 0
+            for (y in 1 until h) {
+                if (y % step != 0) continue
+                val ex = dRowB[y] - dRowA[y]
+                excessSum += ex
+                excessN++
+                if (ex > excessMax) {
+                    excessMax = ex
+                    excessMaxY = y
+                }
+            }
+            val excessMean = if (excessN > 0) excessSum / excessN else 0.0
+            val perBand = (0 until bands).joinToString(" ") { i ->
+                val cnt = if (bN[i] > 0) bN[i].toDouble() else 1.0
+                "%d:%+.2f/%.2f".format(i, bSigned[i] / cnt, bAbs[i] / cnt)
+            }
+            return ("globalMae=%.3f seamMae=%.3f (x%.2f) maxRowMae=%.3f@y=%d stepExMean=%.2f stepExMax=%.2f@y=%d"
+                + "\n  perBand signed/mae %s")
+                .format(global, seam, ratio, maxRow, maxRowY, excessMean, excessMax, excessMaxY * 2, perBand)
+        } finally {
+            a.recycle()
+            b.recycle()
+        }
+    }
+
+    /** 同尺寸两张图的有符号/绝对亮度误差（每 2 像素采样，逐带拆分）。 */
+    private fun signedMae(a: Bitmap, b: Bitmap, tops: IntArray): String {
+        val w = minOf(a.width, b.width)
+        val h = minOf(a.height, b.height)
+        val bands = tops.size
+        val sgn = DoubleArray(bands)
+        val abs = DoubleArray(bands)
+        val cnt = LongArray(bands)
+        val ra = IntArray(w)
+        val rb = IntArray(w)
+        fun lum(c: Int) = ((c shr 16 and 0xFF) * 299 + (c shr 8 and 0xFF) * 587 + (c and 0xFF) * 114) / 1000
+        var bi = 0
+        for (y in 0 until h) {
+            while (bi + 1 < bands && y >= tops[bi + 1]) bi++
+            a.getPixels(ra, 0, w, 0, y, w, 1)
+            b.getPixels(rb, 0, w, 0, y, w, 1)
+            var x = 0
+            while (x < w) {
+                val lp = lum(ra[x])
+                val lq = lum(rb[x])
+                sgn[bi] += (lq - lp).toDouble()
+                abs[bi] += kotlin.math.abs(lq - lp).toDouble()
+                cnt[bi]++
+                x += 2
+            }
+        }
+        var gs = 0.0
+        var ga = 0.0
+        var gn = 0L
+        for (i in 0 until bands) {
+            gs += sgn[i]
+            ga += abs[i]
+            gn += cnt[i]
+        }
+        val per = (0 until bands).joinToString(" ") { i ->
+            val c = if (cnt[i] > 0) cnt[i].toDouble() else 1.0
+            "%d:%+.2f/%.2f".format(i, sgn[i] / c, abs[i] / c)
+        }
+        return "mae=%.2f signed=%+.2f %s".format(ga / gn, gs / gn, per)
+    }
+
+    /**
+     * 上限诊断（oracle）：直接在「参考图」与「条带输出」之间拟合同一套逐带色调网格，
+     * 用来区分「网格表达力不足」与「代理图迁移损失」。
+     * 若 oracle 也降不下来 → 残差是细节级差异，色调网格治不了。
+     */
+    private fun oracleToneFix(refFile: File, bandFile: File, bandRows: Int): String {
+        fun load(f: File): Bitmap? = runCatching {
+            BitmapFactory.decodeFile(f.absolutePath, BitmapFactory.Options().apply {
+                inSampleSize = 2
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            })
+        }.getOrNull()
+
+        val a = load(refFile) ?: return "ref decode failed"
+        val b = load(bandFile) ?: return "band decode failed"
+        if (a.width != b.width || a.height != b.height) {
+            val res = "size mismatch ${a.width}x${a.height} vs ${b.width}x${b.height}"
+            a.recycle()
+            b.recycle()
+            return res
+        }
+        try {
+            val step = maxOf(2, bandRows / 2)
+            val bands = (b.height + step - 1) / step
+            val tops = IntArray(bands) { it * step }
+            val rows = IntArray(bands) { i -> minOf(step, b.height - tops[i]) }
+            val pre = signedMae(a, b, tops)
+            val sbO = StringBuilder("\n    pre  $pre")
+            // 网格粒度/精度扫描：判据 = 提高空间分辨率或分段精度后 post MAE 是否还下降。
+            // 若多档都收敛在同一水平 → 残差已到模型/噪声地板，再加大网格无收益。
+            for (cfg in arrayOf(
+                intArrayOf(24, 24, 32),
+                intArrayOf(48, 48, 32),
+                intArrayOf(24, 24, 64),
+                intArrayOf(48, 48, 64),
+                intArrayOf(12, 12, 32)
+            )) {
+                val gw = cfg[0]
+                val gh = cfg[1]
+                val levels = cfg[2]
+                val ghArr = bandGridRows(rows, gh)
+                val grid = fitToneGridPerBand(a, b, tops, rows, ghArr, gw, levels)
+                val b2 = b.copy(Bitmap.Config.ARGB_8888, true) ?: return "copy failed"
+                applyToneGridPerBand(b2, grid, tops, rows, ghArr, gw, levels)
+                val post = signedMae(a, b2, tops)
+                b2.recycle()
+                sbO.append("\n    post g${gw}x$gh lv$levels $post")
+            }
+            return sbO.toString()
+        } catch (t: Throwable) {
+            return "oracle failed ${t.javaClass.simpleName}"
+        } finally {
+            a.recycle()
+            b.recycle()
+        }
+    }
+
+    /**
+     * 接缝量化：把原图与条带输出都按 1/8 采样解码，逐行算亮度平均梯度；
+     * 边界行（bandRows/8 的整数倍）与原图同位置梯度之差就是接缝强度。
+     */
+    private fun measureSeam(origFile: File, outFile: File, bandRows: Int): String {
+        fun decodeSampled(f: File): Bitmap? {
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = 8
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            return runCatching { BitmapFactory.decodeFile(f.absolutePath, opts) }.getOrNull()
+        }
+
+        val a = decodeSampled(origFile) ?: return "orig decode failed"
+        val b = decodeSampled(outFile) ?: return "out decode failed"
+        try {
+            val w = minOf(a.width, b.width)
+            val h = minOf(a.height, b.height)
+            val step = maxOf(1, bandRows / 8)
+            fun rowDiff(bmp: Bitmap, y: Int): Double {
+                val row = IntArray(w)
+                bmp.getPixels(row, 0, w, 0, y, w, 1)
+                var sum = 0.0
+                for (x in 1 until w) {
+                    val p = row[x]; val q = row[x - 1]
+                    val lp = ((p shr 16 and 0xFF) * 299 + (p shr 8 and 0xFF) * 587 + (p and 0xFF) * 114) / 1000
+                    val lq = ((q shr 16 and 0xFF) * 299 + (q shr 8 and 0xFF) * 587 + (q and 0xFF) * 114) / 1000
+                    sum += kotlin.math.abs(lp - lq).toDouble()
+                }
+                return sum / (w - 1)
+            }
+            // 直接比逐像素差（同尺寸同采样，量化误差远小于接缝量级）
+            fun maeAt(y0: Int, rows: Int): Double {
+                val ra = IntArray(w * rows)
+                val rb = IntArray(w * rows)
+                a.getPixels(ra, 0, w, 0, y0, w, rows)
+                b.getPixels(rb, 0, w, 0, y0, w, rows)
+                var sum = 0.0
+                var n = 0
+                for (i in ra.indices) {
+                    val p = ra[i]; val q = rb[i]
+                    val lp = ((p shr 16 and 0xFF) * 299 + (p shr 8 and 0xFF) * 587 + (p and 0xFF) * 114) / 1000
+                    val lq = ((q shr 16 and 0xFF) * 299 + (q shr 8 and 0xFF) * 587 + (q and 0xFF) * 114) / 1000
+                    sum += kotlin.math.abs(lp - lq).toDouble()
+                    n++
+                }
+                return sum / n
+            }
+
+            var maxSeam = 0.0
+            var seamSum = 0.0
+            var seams = 0
+            var worstY = -1
+            var y = step
+            while (y < h - 1) {
+                val dOut = rowDiff(b, y)
+                val dOrig = rowDiff(a, y)
+                val d = kotlin.math.abs(dOut - dOrig)
+                if (d > maxSeam) { maxSeam = d; worstY = y }
+                seamSum += d
+                seams++
+                y += step
+            }
+            // 接缝带（最差边界上下各 3 行）MAE；对照给出全图平均 MAE
+            val win = 3
+            val seamBandMae = if (worstY > win && worstY + win < h) maeAt(worstY - win, win * 2 + 1) else 0.0
+            val globalMae = maeAt(0, h)
+            return "bands=$seams maxD=${"%.3f".format(maxSeam)} " +
+                "meanD=${"%.3f".format(if (seams > 0) seamSum / seams else 0.0)} " +
+                "worstY=$worstY seamBandMae=${"%.2f".format(seamBandMae)} " +
+                "globalMae=${"%.2f".format(globalMae)}"
+        } finally {
+            a.recycle(); b.recycle()
+        }
     }
 }

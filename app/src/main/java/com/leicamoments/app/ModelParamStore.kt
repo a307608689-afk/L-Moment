@@ -2,7 +2,6 @@ package com.leicamoments.app
 
 import android.content.Context
 import android.graphics.BitmapFactory
-import android.util.Log
 import com.codex.leicaapp.AlexaLut
 import com.codex.leicaapp.StyleA
 import com.codex.leicaapp.StyleAFit
@@ -37,7 +36,7 @@ internal object ModelParamStore {
             val f = fileOf(ctx, name)
             if (!f.isFile || f.length() != BYTES.toLong()) null else f.readBytes()
         } catch (t: Throwable) {
-            Log.w(TAG, "读取参数失败 $name", t)
+            DiagLog.w(TAG, "读取参数失败 $name", t)
             null
         }
     }
@@ -65,7 +64,7 @@ internal object ModelParamStore {
     /** 按指定文件名原子写入，成功返回文件名；失败返回空串。 */
     fun writeNamed(ctx: Context, name: String, bytes: ByteArray): String {
         if (bytes.size != BYTES) {
-            Log.w(TAG, "参数长度异常 ${bytes.size} != $BYTES，放弃写入")
+            DiagLog.w(TAG, "参数长度异常 ${bytes.size} != $BYTES，放弃写入")
             return ""
         }
         return try {
@@ -80,7 +79,7 @@ internal object ModelParamStore {
                 ""
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "写入参数失败 $name", t)
+            DiagLog.w(TAG, "写入参数失败 $name", t)
             ""
         }
     }
@@ -90,7 +89,7 @@ internal object ModelParamStore {
         try {
             fileOf(ctx, name).delete()
         } catch (t: Throwable) {
-            Log.w(TAG, "删除参数失败 $name", t)
+            DiagLog.w(TAG, "删除参数失败 $name", t)
         }
         StyleA.invalidate(AlexaLut.fileRef(name))
     }
@@ -123,20 +122,20 @@ internal object ModelFitter {
 
     fun fitFromThumbs(ctx: Context, styleId: String, indexes: List<Int>): ByteArray? {
         if (indexes.isEmpty()) {
-            Log.w(TAG, "$styleId 无可用参考索引")
+            DiagLog.w(TAG, "$styleId 无可用参考索引")
             return null
         }
         val frames = ArrayList<StyleAFit.Frame>(indexes.size)
         for (i in indexes) {
             val f = ModelRefStore.thumbFile(ctx, styleId, i)
             if (f == null || !f.isFile || f.length() < 64) {
-                Log.w(TAG, "$styleId 缺少参考图副本 #$i，退回旧烘焙")
+                DiagLog.w(TAG, "$styleId 缺少参考图副本 #$i，退回旧烘焙")
                 return null
             }
             val bmp = try {
                 BitmapFactory.decodeFile(f.absolutePath)
             } catch (t: Throwable) {
-                Log.w(TAG, "$styleId 副本解码失败 #$i", t)
+                DiagLog.w(TAG, "$styleId 副本解码失败 #$i", t)
                 null
             }
             if (bmp == null) return null
@@ -154,10 +153,10 @@ internal object ModelFitter {
         val t0 = System.currentTimeMillis()
         return try {
             val bytes = StyleAFit.fit(frames)
-            Log.i(TAG, "$styleId 拟合完成 frames=${frames.size} ${bytes?.size ?: 0}B ${System.currentTimeMillis() - t0}ms")
+            DiagLog.i(TAG, "$styleId 拟合完成 frames=${frames.size} ${bytes?.size ?: 0}B ${System.currentTimeMillis() - t0}ms")
             bytes
         } catch (t: Throwable) {
-            Log.w(TAG, "$styleId 拟合异常", t)
+            DiagLog.w(TAG, "$styleId 拟合异常", t)
             null
         }
     }
@@ -181,7 +180,7 @@ internal object ModelColor {
     fun ensure(ctx: Context, def: CustomStyleDef?, version: StyleVersion): Boolean {
         if (isParamVersion(version)) {
             if (ModelParamStore.exists(ctx, version.paramFile)) return true
-            Log.w(TAG, "参数文件缺失 ${version.paramFile}")
+            DiagLog.w(TAG, "参数文件缺失 ${version.paramFile}")
             return false
         }
         return def != null && ModelLutStore.ensure(ctx, def, version)

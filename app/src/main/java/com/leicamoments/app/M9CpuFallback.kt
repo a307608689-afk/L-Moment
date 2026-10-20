@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
-import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 
@@ -112,31 +111,10 @@ object M9CpuFallback {
             val proc = pb.start()
             val output = proc.inputStream.bufferedReader().use { it.readText() }
             val exit = proc.waitFor()
-            Log.w(TAG, "exit=$exit out=$output")
-            // 失败时抓引擎写进 logcat 的详细错误（logd 允许应用读自己 UID 的日志）
-            var logcatInfo = ""
-            if (exit != 0) {
-                logcatInfo = try {
-                    val lc = ProcessBuilder("logcat", "-d", "-t", "1200").start()
-                    val text = lc.inputStream.bufferedReader().use { it.readText() }
-                    lc.waitFor()
-                    text.lineSequence()
-                        // "mage" 大小写敏感，防 "Image"（Skia/HWUI 噪声）淹没真死因
-                        .filter { it.contains("Mage") || it.contains("MAGE") ||
-                                 it.contains("Styletrans") ||
-                                 it.contains("DIPS") || it.contains("Qnn", true) ||
-                                 it.contains("MIALGO", true) || it.contains("mialgo", true) }
-                        .filter { !it.contains("Image decoding logging dropped") }
-                        .toList()
-                        .takeLast(60)
-                        .joinToString("\n")
-                } catch (t: Throwable) {
-                    "logcat 不可用: ${t.message}"
-                }
-            }
-            // 完整诊断信息落盘（Toast 只显示摘要）
-            File(workDir, "last_run.txt").writeText("exit=$exit\nargv=$argv\noutput:\n$output\nlogcat:\n$logcatInfo")
-            lastStatus = "exit=$exit\n$output\n---logcat---\n$logcatInfo"
+            DiagLog.w(TAG, "exit=$exit out=$output")
+            // 完整诊断信息落盘（用户不可见，只进诊断日志）
+            File(workDir, "last_run.txt").writeText("exit=$exit\nargv=$argv\noutput:\n$output")
+            lastStatus = "exit=$exit\n$output"
 
             // runner 返回码：0=成功；1=argc；2/3=参数域；4=fopen(in)；5=fread；6=dlopen；
             // 7=符号；8=init；9=run；10=fopen(out)；11=写入不完整
@@ -163,7 +141,7 @@ object M9CpuFallback {
             // 回填源 EXIF（机型/拍摄参数/GPS），下游 applyToJpeg/applyWarmLut 才有可续传的 APP1 段
             return com.codex.leicaapp.MadridLegendary.copyExif(jpeg, bos.toByteArray())
         } catch (t: Throwable) {
-            Log.e(TAG, "cpu chain failed", t)
+            DiagLog.e(TAG, "cpu chain failed", t)
             lastStatus = "exception: ${t.message}"
             return null
         }

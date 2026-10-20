@@ -302,11 +302,11 @@ object Lm9Net {
                 val e = OrtEnvironment.getEnvironment()
                 val bytes = app.assets.open(MODEL_ASSET).use { it.readBytes() }
                 val opt = OrtSession.SessionOptions()
-                opt.setIntraOpNumThreads(8)
+                opt.setIntraOpNumThreads(OrtThreads.pick())
                 val s = e.createSession(bytes, opt)
                 env = e
                 session = s
-                DiagLog.w(TAG, "ORT session 就绪 (${bytes.size / 1024}KB)")
+                DiagLog.w(TAG, "ORT session 就绪 (${bytes.size / 1024}KB, 线程 ${OrtThreads.pick()})")
                 s
             } catch (t: Throwable) {
                 DiagLog.e(TAG, "session 创建失败", t)

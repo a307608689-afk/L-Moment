@@ -29,14 +29,31 @@ public final class MadridShader {
      * @param vignetteStrength 暗角强度系数（1=原有全强度，0.3≈极轻，0=无暗角）
      */
     public static void apply(Bitmap bmp, float density, float vignetteStrength) {
+        apply(bmp, density, vignetteStrength, bmp.getHeight(), 0);
+    }
+
+    /**
+     * 条带版：暗角与颗粒都依赖**全图绝对坐标**，按带调用时必须传整幅高度与带偏移，
+     * 否则每条带各自从中心重算暗角（出现横向亮度涟漪）、颗粒图案也会在带边界错位。
+     *
+     * <p>bandPx 由编码器决定（200MP=320、50MP=384、12.58MP=512），只有 512 能整除
+     * 颗粒周期 256，故颗粒索引用 {@code (yOffset+y) & 0xFF} 而非带内 y。</p>
+     *
+     * @param fullH   整幅高度（像素）
+     * @param yOffset 本条带顶部在整幅中的行号
+     */
+    public static void apply(Bitmap bmp, float density, float vignetteStrength,
+                             int fullH, int yOffset) {
         init();
         int w = bmp.getWidth();
         int h = bmp.getHeight();
+        if (fullH <= 0) fullH = h;
         int[] pixels = new int[w * h];
         bmp.getPixels(pixels, 0, w, 0, 0, w, h);
 
         for (int y = 0; y < h; y++) {
-            float ny = (float) y / (float) h;
+            int gy = yOffset + y;
+            float ny = (float) gy / (float) fullH;
             for (int x = 0; x < w; x++) {
                 int idx = y * w + x;
                 int p = pixels[idx];
@@ -64,7 +81,7 @@ public final class MadridShader {
                 if (grainAmt > 1f) grainAmt = 1f;
 
                 if (grainAmt > 0f) {
-                    float n = NOISE[(y & 0xFF) << 8 | (x & 0xFF)] * 2f;
+                    float n = NOISE[(gy & 0xFF) << 8 | (x & 0xFF)] * 2f;
                     rr = rr + (rr * n - rr) * grainAmt;
                     gg = gg + (gg * n - gg) * grainAmt;
                     bb = bb + (n * bb - bb) * grainAmt;

@@ -133,6 +133,37 @@ public final class AlexaLut {
         }
     }
 
+    /**
+     * 原地版（全像素条带用）：不复制 Bitmap，直接改写 [bmp] 的像素。
+     * 条带 12288×320 复制一份会多吃 15MB，200MP 51 条带全程下来没必要。
+     *
+     * @return false 表示 LUT 不可用（调用方应整体回落）
+     */
+    public static boolean applyInPlace(Context ctx, Bitmap bmp, String ref) {
+        if (bmp == null) {
+            com.leicamoments.app.DiagLog.w("LMAlexaLut", "applyInPlace bmp=null ref=" + ref);
+            return false;
+        }
+        if (!bmp.isMutable()) {
+            com.leicamoments.app.DiagLog.w("LMAlexaLut",
+                    "applyInPlace 位图不可变 ref=" + ref + " " + bmp.getWidth() + "x" + bmp.getHeight()
+                            + " cfg=" + bmp.getConfig());
+            return false;
+        }
+        Lut lut = ensureLoaded(ctx, ref);
+        if (lut == null) {
+            com.leicamoments.app.DiagLog.w("LMAlexaLut", "applyInPlace LUT 加载失败 ref=" + ref);
+            return false;
+        }
+        try {
+            applyLut(bmp, lut);
+            return true;
+        } catch (Throwable t) {
+            com.leicamoments.app.DiagLog.e("LMAlexaLut", "applyInPlace 异常 ref=" + ref, t);
+            return false;
+        }
+    }
+
     private static synchronized Lut ensureLoaded(Context ctx, String ref) {
         Lut cached = LUTS.get(ref);
         if (cached != null) return cached;
@@ -203,7 +234,7 @@ public final class AlexaLut {
     public static byte[] process(Context ctx, byte[] jpeg, String ref, Hooks hooks) {
         Lut lut = ensureLoaded(ctx, ref);
         if (lut == null) {
-            android.util.Log.w("LMAlexaLut", "load failed ref=" + ref + "（降级为原图）");
+            com.leicamoments.app.DiagLog.w("LMAlexaLut", "load failed ref=" + ref + "（降级为原图）");
             return jpeg;
         }
         long t0 = System.currentTimeMillis();
@@ -217,29 +248,19 @@ public final class AlexaLut {
             int w = bmp.getWidth(), h = bmp.getHeight();
             int[] px = new int[w * h];
             bmp.getPixels(px, 0, w, 0, 0, w, h);
-            int mid = (h / 2) * w + (w / 2);
-            int probeIn = px[mid];
             if (hooks != null) hooks.pre(px, w, h);
             applyLutPx(px, lut);
             if (hooks != null) hooks.post(px, w, h);
-            int probeOut = px[mid];
-            {
-                int d = lut.dim, d2 = lut.dim2, sh = lut.shift;
-                int c = (d / 2) * d2 + (d / 2) * d + (d / 2);
-                android.util.Log.i("LMAlexaLut", "probe px " + Integer.toHexString(probeIn)
-                        + " -> " + Integer.toHexString(probeOut) + " | lutMid R=" + lut.data[c]
-                        + " G=" + lut.data[sh + c] + " B=" + lut.data[2 * sh + c]);
-            }
             bmp.setPixels(px, 0, w, 0, 0, w, h);
             ByteArrayOutputStream bos = new ByteArrayOutputStream(jpeg.length);
             bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos);
             bmp.recycle();
             byte[] ret = MadridLegendary.copyExif(jpeg, bos.toByteArray());
-            android.util.Log.i("LMAlexaLut", "ok ref=" + ref + " dim=" + lut.dim + " " + w + "x" + h
+            com.leicamoments.app.DiagLog.i("LMAlexaLut", "ok ref=" + ref + " dim=" + lut.dim + " " + w + "x" + h
                     + " " + (System.currentTimeMillis() - t0) + "ms out=" + ret.length + "B");
             return ret;
         } catch (Throwable t) {
-            android.util.Log.w("LMAlexaLut", "process failed ref=" + ref + "（降级为原图）", t);
+            com.leicamoments.app.DiagLog.e("LMAlexaLut", "process failed ref=" + ref + "（降级为原图）", t);
             return jpeg;
         }
     }

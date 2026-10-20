@@ -30,6 +30,9 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var txtBackupSummary: TextView
     private lateinit var rowRaw: LinearLayout
     private lateinit var txtRawValue: TextView
+    private lateinit var rowFullRes: LinearLayout
+    private lateinit var txtFullResValue: TextView
+    private lateinit var txtFullResHint: TextView
 
     /**
      * RAW 解码亮度档位（id, 标题, 副标题）。id 与 [SettingsStore.rawThrLevel] 的存储值一一对应。
@@ -66,14 +69,19 @@ class SettingsActivity : AppCompatActivity() {
         txtBackupSummary = findViewById(R.id.txtBackupSummary)
         rowRaw = findViewById(R.id.rowRaw)
         txtRawValue = findViewById(R.id.txtRawValue)
+        rowFullRes = findViewById(R.id.rowFullRes)
+        txtFullResValue = findViewById(R.id.txtFullResValue)
+        txtFullResHint = findViewById(R.id.txtFullResHint)
         findViewById<TextView>(R.id.btnBack).setOnClickListener { finish() }
         rowDefault.setOnClickListener { showDefaultPicker() }
         rowRaw.setOnClickListener { showRawPicker() }
+        rowFullRes.setOnClickListener { showFullResPicker() }
         rowBackup.setOnClickListener { startBackup() }
         rowImport.setOnClickListener { startImport() }
         rowShareImport.setOnClickListener { startShareImport() }
         renderValue()
         renderRawValue()
+        renderFullRes()
         renderBackupSummary()
     }
 
@@ -114,6 +122,42 @@ class SettingsActivity : AppCompatActivity() {
         ) { item ->
             SettingsStore.setRawThrLevel(this, item.id.toIntOrNull() ?: 0)
             renderRawValue()
+        }
+    }
+
+    /** 全像素导出（C4）：只影响之后导入的 50MP/200MP 源（导入瞬间决定是否保留全分辨率字节）。 */
+    private fun renderFullRes() {
+        val lowEnd = ImageUtils.lowEndReason(this)
+        if (lowEnd != null) {
+            // 低端机不给开关：像素预算分档会强制回落，留着可点的开关只会误导
+            txtFullResValue.text = "自动关闭"
+            rowFullRes.isEnabled = false
+            rowFullRes.alpha = 0.55f
+            txtFullResHint.text = "$lowEnd，统一按 4096×3072 工作版导出"
+        } else {
+            rowFullRes.isEnabled = true
+            rowFullRes.alpha = 1f
+            txtFullResValue.text = if (SettingsStore.fullResEnabled(this)) "开" else "关"
+            txtFullResHint.text = "50MP / 200MP 的「原图」档按原始像素导出，耗时与内存更高；仅对之后导入的图片生效"
+        }
+    }
+
+    private fun showFullResPicker() {
+        if (ImageUtils.lowEndReason(this) != null) {
+            toast("本机内存较低，已自动关闭全像素导出")
+            return
+        }
+        CategoryPopup.show(
+            anchor = rowFullRes,
+            items = listOf(
+                CategoryPopup.Item("on", "开启（推荐）", "保全部像素"),
+                CategoryPopup.Item("off", "关闭", "省时省内存")
+            ),
+            selectedId = if (SettingsStore.fullResEnabled(this)) "on" else "off",
+            centerOnAnchor = false
+        ) { item ->
+            SettingsStore.setFullResEnabled(this, item.id == "on")
+            renderFullRes()
         }
     }
 

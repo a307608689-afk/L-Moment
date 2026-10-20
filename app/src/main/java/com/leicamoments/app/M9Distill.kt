@@ -74,6 +74,34 @@ object M9Distill {
     private const val DITHER_PRE = 1.0f
     private const val DITHER_POST = 1.0f
 
+    // ---- B1 分发保障：时间预算 / 像素预算 / 失败归因 ----
+
+    /** 单张图跑本链的基础时间预算（毫秒）。 */
+    private const val BASE_BUDGET_MS = 1500L
+    /** 每百万像素追加的预算：实测旗舰 12.58MP ≈ 4.9s（≈390ms/MP），给约 3× 余量。 */
+    private const val PER_MP_MS = 1200L
+    private const val MIN_BUDGET_MS = 4000L
+    private const val MAX_BUDGET_MS = 15000L
+
+    /** 内存估算里除位图之外还要留的量（分块平面缓冲 + ORT 内部 + 编码）。 */
+    private const val HEAP_SLACK_BYTES = 32L * 1024 * 1024
+    /** 可用堆最多允许用掉的比例（余量留给暖调副本、JPEG 编码与系统抖动）。 */
+    private const val HEAP_SAFE_RATIO = 0.7
+    /** 单张图的硬上限像素数（>64MP 本链必超预算，直接不跑）。 */
+    private const val MAX_PIXELS = 64_000_000L
+
+    /**
+     * 本链失败归因。调用方据此决定「还要不要试更重的 ORT 重链」：
+     * OOM / TIMEOUT / BUDGET 说明这台机器吃不下这一档，往上试只会更慢或直接崩；
+     * OTHER（资产缺失、图结构异常）与链的编排无关，仍按原链继续。
+     *
+     * 单例状态，只在处理线程串行使用（App 一次只处理一张）。
+     */
+    enum class Fail { NONE, OOM, TIMEOUT, BUDGET, OTHER }
+
+    @Volatile var lastFail: Fail = Fail.NONE
+        private set
+
     @Volatile private var env: OrtEnvironment? = null
     @Volatile private var session: OrtSession? = null
 
@@ -93,6 +121,7 @@ object M9Distill {
         warmth: Float = 0.3f,
         warmBin: String = "leica_filter_param_m9_snapshot.bin",
     ): ByteArray? {
+        lastFail = Fail.NONE
         return try {
             val t0 = System.currentTimeMillis()
             val styled = styledCached(app, jpeg, crc32(jpeg)) ?: return null
@@ -117,10 +146,20 @@ object M9Distill {
             DiagLog.w(TAG, "蒸馏链完成 ${out.size}B, ${System.currentTimeMillis() - t0}ms")
             out
         } catch (t: Throwable) {
-            DiagLog.e(TAG, "蒸馏链失败，回落上一级", t)
+            markFail(t)
+            DiagLog.e(TAG, "蒸馏链失败($lastFail)，回落上一级", t)
             null
         }
     }
+
+    /**
+     * 只跑蒸馏网络本体（不做暖调 / dither / 后处理），返回**未暖调**的 styled 位图。
+     *
+     * 供条带链在低分代理图上「同域」拟合暖调的逐带修正：
+     * 暖调的实际行为与输入内容的统计/细节有关，在原始图上拟合再套到推理产物上会过冲，
+     * 必须在推理产物上拟合。**不走 [styledCached] 单槽缓存**，避免把真实图的 styled 结果挤掉。
+     */
+    fun styleOnly(app: Context, jpeg: ByteArray): Bitmap? = styledInternal(app, jpeg)
 
     private fun styledCached(app: Context, jpeg: ByteArray, hash: Long): Bitmap? {
         cacheStyled?.let { cached ->
@@ -145,6 +184,13 @@ object M9Distill {
 
     /** 微网推理 + 几何还原，产出未加暖调的 styled Bitmap（mutable，供暖调就地写回）。 */
     private fun styledInternal(app: Context, jpeg: ByteArray): Bitmap? {
+        // 像素预算：解码前只读 JPEG 头判尺寸，吃不下就直接退场（别先 OOM 再退——
+        // OOM 之前必然先经历一轮 GC 风暴，用户看到的是 2~3s 卡顿之后才降级）。
+        if (!canAfford(jpeg)) {
+            lastFail = Fail.BUDGET
+            DiagLog.w(TAG, "像素/内存预算不足，跳过蒸馏链直落下一级")
+            return null
+        }
         val t0 = System.currentTimeMillis()
         val sess = obtainSession(app) ?: return null
         val e = env!!
@@ -170,7 +216,7 @@ object M9Distill {
         val ww = work.width
         val wh = work.height
 
-        val outPx = tiledInfer(sess, e, work)
+        val outPx = tiledInfer(sess, e, work, t0 + budgetMs(ww.toLong() * wh))
         work.recycle()
         if (outPx == null) return null
 
@@ -202,7 +248,8 @@ object M9Distill {
      * v2：每块保留区 keep×keep（keep = min(KEEP, 画布短边) 向下取偶），四周各多喂 HALO 像素
      * （越界行列边缘复制），**只取中心 keep×keep 写回** —— 把每块自身的边缘脏带裁掉。
      */
-    private fun tiledInfer(sess: OrtSession, e: OrtEnvironment, bmp: Bitmap): IntArray? {
+    private fun tiledInfer(sess: OrtSession, e: OrtEnvironment, bmp: Bitmap,
+                           deadlineMs: Long): IntArray? {
         val w = bmp.width
         val h = bmp.height
         val outPx = IntArray(w * h)
@@ -224,9 +271,19 @@ object M9Distill {
         val tmpPx = IntArray(plane)
         val lowPx = IntArray(lowPlane)
 
+        val total = xs.size * ys.size
+        var done = 0
         try {
             for (y0 in ys) {
                 for (x0 in xs) {
+                    // 时间预算：只在块边界检查（单块约 0.4s，粒度足够）。超时即弃掉已算结果
+                    // 往下一级降级——sess.run 无法安全中断，强杀线程会泄漏原生内存。
+                    if (System.currentTimeMillis() > deadlineMs) {
+                        lastFail = Fail.TIMEOUT
+                        DiagLog.w(TAG, "时间预算耗尽，中止分块推理 ($done/$total)")
+                        return null
+                    }
+                    done++
                     readBlock(bmp, x0, y0, n, tilePx, tmpPx)
                     boxDown2(tilePx, n, lowPx)
                     fillPlanesCHW(tilePx, plane, fullBuf)
@@ -261,7 +318,8 @@ object M9Distill {
                 }
             }
         } catch (t: Throwable) {
-            DiagLog.e(TAG, "分块推理失败", t)
+            markFail(t)
+            DiagLog.e(TAG, "分块推理失败($lastFail)", t)
             return null
         }
         return outPx
@@ -339,6 +397,12 @@ object M9Distill {
 
     // ---- ORT session ----
 
+    /**
+     * 供条带算子（[DistillBandOps]）复用同一个 ORT 会话：
+     * 模型 651KB、加载一次即缓存，避免全像素导出再建一个 session 抢占线程池。
+     */
+    internal fun sessionFor(app: Context): OrtSession? = obtainSession(app)
+
     private fun obtainSession(app: Context): OrtSession? {
         session?.let { return it }
         synchronized(this) {
@@ -347,11 +411,11 @@ object M9Distill {
                 val e = OrtEnvironment.getEnvironment()
                 val bytes = app.assets.open(MODEL_ASSET).use { it.readBytes() }
                 val opt = OrtSession.SessionOptions()
-                opt.setIntraOpNumThreads(8)
+                opt.setIntraOpNumThreads(OrtThreads.pick())
                 val s = e.createSession(bytes, opt)
                 env = e
                 session = s
-                DiagLog.w(TAG, "ORT session 就绪 (${bytes.size / 1024}KB)")
+                DiagLog.w(TAG, "ORT session 就绪 (${bytes.size / 1024}KB, 线程 ${OrtThreads.pick()})")
                 s
             } catch (t: Throwable) {
                 DiagLog.e(TAG, "session 创建失败", t)
@@ -368,6 +432,43 @@ object M9Distill {
     }
 
     // ---- 辅助 ----
+
+    /** 按像素数给时间预算：12.58MP 封顶 15s（旗舰实测 4.9s，余量留给低端机）。 */
+    private fun budgetMs(pixels: Long): Long {
+        val byArea = BASE_BUDGET_MS + (pixels / 1_000_000L) * PER_MP_MS
+        return byArea.coerceIn(MIN_BUDGET_MS, MAX_BUDGET_MS)
+    }
+
+    /**
+     * 解码前的像素/内存预算判断（只读 JPEG 头，不解码像素）。
+     *
+     * 估算口径：峰值约 3 张同尺寸 ARGB 位图（原图 / 竖转或 fitted 副本 / 输出拼回）
+     * + 一块 IntArray 结果 + 固定余量。上限取可用堆的 70%——蒸馏之后还要做暖调副本
+     * 与 JPEG 编码，这里必须留余量，否则会把「省一次 GC」换成「真 OOM」。
+     */
+    private fun canAfford(jpeg: ByteArray): Boolean {
+        val opts = BitmapFactory.Options()
+        opts.inJustDecodeBounds = true
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
+        val w = opts.outWidth.toLong()
+        val h = opts.outHeight.toLong()
+        if (w <= 0 || h <= 0) return true          // 尺寸读不出，交给正常解码路径报错
+        val px = w * h
+        if (px > MAX_PIXELS) return false
+        val need = px * 4L * 3L + HEAP_SLACK_BYTES
+        val rt = Runtime.getRuntime()
+        val avail = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
+        return need <= (avail * HEAP_SAFE_RATIO).toLong()
+    }
+
+    /** 失败归因：OOM 类（含 allocate 失败）单独标记，其余记为 OTHER。 */
+    private fun markFail(t: Throwable) {
+        lastFail = when {
+            t is OutOfMemoryError -> Fail.OOM
+            t.message?.contains("allocat", ignoreCase = true) == true -> Fail.OOM
+            else -> Fail.OTHER
+        }
+    }
 
     private fun crc32(b: ByteArray): Long {
         val c = CRC32()

@@ -74,6 +74,23 @@ public final class Dither {
      * @param ampLsb TPDF 半峰幅（LSB）。{@code <=0} 直接跳过；常用 1.0（轻微）~1.5（强掩蔽）。
      */
     public static void tpdf(Bitmap bmp, float ampLsb) {
+        tpdf(bmp, ampLsb, 0, -1);
+    }
+
+    /**
+     * 全图口径抖动（条带导出用）。
+     *
+     * <p>逐带调用时若沿用上面的旧口径，噪声表有两个带间不连续源：<br>
+     *   1. 行索引用「带内局部 y」，相邻带各自从 0 开始，表图案在带边界错位；<br>
+     *   2. 相位来自全局自增计数器，每条带每次调用都换一套图案。<br>
+     * 单看不明显（σ≈0.5 LSB 的细噪），但 300 条带累积后会在每个带边界形成
+     * 可测的亮度台阶（200MP 实测边界行跳变中位 0.196 / 峰 3.0 级）。</p>
+     *
+     * @param yBase 该位图第 0 行在整图中的行号（逐带调用传带顶），使噪声场跨带连续
+     * @param phase 表相位序号（{@code >=0} 时固定；同一条链的各带必须传同一个值，
+     *              不同后处理段传不同值以保持互相独立）。{@code <0} 走旧的自增口径
+     */
+    public static void tpdf(Bitmap bmp, float ampLsb, int yBase, int phase) {
         if (bmp == null || bmp.isRecycled() || ampLsb <= 0f) return;
         // 调用方约定传 mutable；不可变时静默跳过——绝不在这里 copy（会隐性分配 50MB）
         if (!bmp.isMutable()) return;
@@ -94,9 +111,13 @@ public final class Dither {
         }
 
         // 相位错开：整表二维环形平移，不改变分布（同链量化前/后各抖一次时图案独立）
-        final int off = (PHASE.getAndIncrement() & 0x3FFF) * 7919 % PLANE;
+        final int off = phase >= 0
+                ? (phase & 0x3FFF) * 7919 % PLANE
+                : (PHASE.getAndIncrement() & 0x3FFF) * 7919 % PLANE;
         final int xOff = off % TILE;
         final int yOff = (off / TILE) % TILE;
+        // 行号带全图偏移（floorMod 防负数），逐带调用时噪声场在带边界处连续
+        final int rowBase = Math.floorMod(yBase + yOff, TILE);
 
         final int[] xm = new int[w];
         for (int x = 0; x < w; x++) xm[x] = (x + xOff) % TILE;
@@ -107,7 +128,7 @@ public final class Dither {
             bmp.getPixels(px, 0, w, 0, y0, w, rows);
             int i = 0;
             for (int ry = 0; ry < rows; ry++) {
-                final int base = ((y0 + ry + yOff) % TILE) * TILE;
+                final int base = ((rowBase + y0 + ry) % TILE) * TILE;
                 for (int x = 0; x < w; x++, i++) {
                     final int j = (base + xm[x]) * 3;
                     final int a = px[i];

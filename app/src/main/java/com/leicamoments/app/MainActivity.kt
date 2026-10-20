@@ -23,7 +23,6 @@ import android.text.Editable
 import android.text.InputFilter
 import android.text.TextUtils
 import android.text.TextWatcher
-import android.util.Log
 import android.view.Gravity
 import java.io.File
 import android.view.HapticFeedbackConstants
@@ -47,6 +46,7 @@ import androidx.core.content.FileProvider
 import androidx.core.content.IntentCompat
 import androidx.core.view.WindowCompat
 import com.codex.leicaapp.AlexaLut
+import com.codex.leicaapp.IccProfile
 import com.codex.leicaapp.LeicaMark
 import com.codex.leicaapp.StyleA
 import com.codex.leicaapp.StyleAFit
@@ -58,6 +58,9 @@ class MainActivity : AppCompatActivity() {
         /** 增强预览注册的内存产物（不落盘），弹窗关闭时释放。 */
         const val MEM_PARAM_REF = "mem:enhance_par"
         const val MEM_LUT_REF = "mem:enhance_lut"
+
+        /** ≥1 亿像素（2 亿级）才走「耗时确认 + 前台服务 + 用时弹窗」，50MP 不打扰 */
+        const val BIG_EXPORT_PIXELS = 100_000_000L
     }
 
     private lateinit var imgPreview: ImageView
@@ -110,7 +113,17 @@ class MainActivity : AppCompatActivity() {
     private var processingGeneration = 0              // 代次，防竞态
     private var srBusy = false                        // 超分进行中（与滤镜/导出互斥）
     @Volatile
+    private var exporting = false                     // 全像素大图导出进行中（前台服务保护，期间禁止超分/完美）
+    @Volatile
     private var pendingHdr: HdrGainMap.HdrData? = null // 导入图自带的 HDR 增益图（导出时回嵌 UltraHDR）
+    // C1：200MP 级全像素原图直通源（方向=1 的静态 JPEG 主图）。只服务「原图」档导出，
+    // 不参与滤镜链路（引擎硬上限 4096×3072），因此与 originalBytes 并存。
+    // 源以 cache 文件形式驻留磁盘（50MB 级字节不进 Java 堆），EXIF 只需头部几十 KB 副本。
+    private var fullResFile: File? = null
+    private var fullResExifHead: ByteArray? = null
+    private var fullResWidth = 0
+    private var fullResHeight = 0
+    private var fullResHdr: HdrGainMap.HdrData? = null
     private var brightLevel = 0               // 亮度档（±10，0=不调；仅 RAW 导入显示步进器）
     private var exposureLevel = 0             // 曝光档（±10，0=不调；仅 RAW 导入显示步进器）
     private var highlightLevel = 0            // 高光档（±10，0=不调；仅 RAW 导入显示步进器）
@@ -224,9 +237,10 @@ class MainActivity : AppCompatActivity() {
             DiagLog.recordCrash(prev)
             file.delete()
             com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
-                .setTitle("检测到上次异常退出")
-                .setMessage(prev.take(3500))
-                .setPositiveButton("确定", null)
+                .setTitle("上次异常退出")
+                .setMessage("已记录到诊断日志。若需要反馈问题，可在「查看日志」里复制全文发给开发者。")
+                .setPositiveButton("知道了", null)
+                .setNeutralButton("查看日志") { _, _ -> showLogDialog() }
                 .show()
         }
         val systemHandler = Thread.getDefaultUncaughtExceptionHandler()
@@ -324,9 +338,13 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         mainHandler.removeCallbacks(coachAutoHide)
         SuperResTask.removeListener(srListener)
+        // 全像素导出线程随 Activity 线程池关闭：让前台服务拿到结局通知并收尾（免得常驻 30 分钟）
+        if (exporting) ExportProgress.end(false, "已退出应用，导出中断")
         executor.shutdownNow()
         // 不在 onDestroy 回收位图：可能仍被 ImageView 持有，销毁到 detach 间的一帧绘制
         // 会触发 "Canvas: trying to use a recycled bitmap" 崩溃；交给 GC 兜底（预览尺寸无收益）
+        // 200MP 直通源是 cache 文件，进程退出不再需要，主动删掉不占用户存储
+        runCatching { fullResFile?.delete() }
     }
 
     private fun bindViews() {
@@ -1161,10 +1179,40 @@ class MainActivity : AppCompatActivity() {
                 val jpegDirect = trimmed != null && oriSize != null &&
                     ImageUtils.withinWorkLimit(oriSize[0], oriSize[1])
 
+                // C4：像素预算分档（单点判定 = 50MP/200MP 档 + 低端回落 + 用户开关）。
+                // 约束见 ImageUtils.decideFullRes（像素带 / Orientation=1 / 总内存 ≥6GB / 堆 ≥384MiB / 设置）。
+                val srcOri = if (trimmed != null) ImageUtils.readOrientation(bytes) else 1
+                val fullResDecision = if (trimmed != null && rawSize != null) {
+                    ImageUtils.decideFullRes(
+                        this, rawSize[0], rawSize[1], srcOri,
+                        SettingsStore.fullResEnabled(this)
+                    )
+                } else null
+                val fullResDirect = fullResDecision?.enabled == true
+                // 源落 cache 文件：50MB 级字节不驻留 Java 堆，条带解码直接从文件读
+                val fullResFileLocal = if (fullResDirect) {
+                    writeCacheBytes(trimmed!!, "leica_fullres_src")
+                } else null
+                // EXIF 只需容器头（SOI..SOS，几十 KB），尾部回填用它即可
+                val fullResHeadLocal = if (fullResFileLocal != null) {
+                    ImageUtils.extractExifHeader(trimmed!!)
+                } else null
+                if (fullResFileLocal != null && fullResDecision != null && rawSize != null) {
+                    DiagLog.i("Import",
+                        "全像素直通可用 ${fullResDecision.tier} ${rawSize[0]}x${rawSize[1]} " +
+                            "${fullResDecision.reason} " +
+                            "源文件 ${fullResFileLocal.length()}B exifHead=${fullResHeadLocal?.size ?: 0}B " +
+                            "堆 ${ImageUtils.heapUsageLabel()}")
+                } else if (fullResDecision != null) {
+                    // 分档未通过也留痕（门限/方向/低端/堆/设置各有一句原因），真机验收直接看这句
+                    DiagLog.i("Import", "全像素直通未启用：${fullResDecision.reason} · 堆 ${ImageUtils.heapUsageLabel()}")
+                }
+
                 // HDR 增益图提取：必须在任何重编码之前对最原始字节做；且只在「JPG 原字节直通」时可用
                 // ——工作字节一旦被缩放重编码，原尺寸的增益图无法与主图对应
-                val hdr = if (jpegDirect) HdrGainMap.extract(bytes) else null
-                if (isJpeg && rawSize != null && !jpegDirect) {
+                // 全像素直通的主图几何 = 原图几何，增益图天然对齐，可安全回嵌
+                val hdr = if (jpegDirect || fullResDirect) HdrGainMap.extract(bytes) else null
+                if (isJpeg && rawSize != null && !jpegDirect && !fullResDirect) {
                     DiagLog.i("Import",
                         "JPG 存储 ${rawSize[0]}x${rawSize[1]} 归一后 ${oriSize?.get(0)}x${oriSize?.get(1)} " +
                         "超引擎上限（横置口径 长≤4096 短≤3072）将缩放，跳过 HDR 增益图回嵌")
@@ -1239,7 +1287,14 @@ class MainActivity : AppCompatActivity() {
                     originalBytes = normalizedBytes
                     workWidth = workSize[0]
                     workHeight = workSize[1]
-                    pendingHdr = hdr
+                    pendingHdr = if (jpegDirect) hdr else null
+                    // C1：全像素直通源（仅「原图」档导出可用；滤镜仍走 normalizedBytes）
+                    clearFullRes()
+                    fullResFile = fullResFileLocal
+                    fullResExifHead = fullResHeadLocal
+                    fullResWidth = if (fullResFileLocal != null) rawSize!![0] else 0
+                    fullResHeight = if (fullResFileLocal != null) rawSize!![1] else 0
+                    fullResHdr = if (fullResFileLocal != null) hdr else null
                     srBakedStyle = null
                     brightLevel = 0
                     exposureLevel = 0
@@ -1276,17 +1331,26 @@ class MainActivity : AppCompatActivity() {
                         2 -> " · 强力提亮"
                         else -> ""
                     }
-                    toast(
-                        if (isRaw) "RAW 已解码：${preview.width}x${preview.height}$rawTag"
-                        else "已导入"
-                    )
+                    if (fullResFileLocal != null) {
+                        // C1：200MP 直通可用性显式告知（滤镜档仍按工作字节 3072 级导出）
+                        txtStyleHint.text = "原图 · 全像素直通"
+                        toast(
+                            "200MP 已导入 · 原图档可全像素导出 " +
+                                "${fullResWidth}x${fullResHeight}"
+                        )
+                    } else {
+                        toast(
+                            if (isRaw) "RAW 已解码：${preview.width}x${preview.height}$rawTag"
+                            else "已导入"
+                        )
+                    }
                     if (isRaw) showRawHintIfNeeded()
                 }
             } catch (e: Exception) {
                 DiagLog.e("Import", "导入异常", e)
                 mainHandler.post {
                     progress.gone()
-                    toast("读取图片失败：${e.message}")
+                    toast("读取图片失败，请换一张或重试（详情见日志）")
                 }
             }
         }
@@ -1471,7 +1535,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 } catch (t: Throwable) {
                     DiagLog.e("Engine", "缩略图生成失败 $style", t)
-                    Log.e("M9CPU", "thumb gen failed: $style", t)
                 }
             }
         }
@@ -1597,7 +1660,7 @@ class MainActivity : AppCompatActivity() {
                                 imgPreview.setImageBitmap(bmp)
                             }
                         }
-                        // M3 语义对齐其它风格：兜底接管/异常才 toast，monopan 正常保持安静（诊断全量在 logcat）
+                        // M3 语义对齐其它风格：兜底接管/异常才 toast，monopan 正常保持安静（诊断全量在诊断日志）
                         if (style == LeicaEngine.Style.M3) {
                             val info = M3Mono.lastInfo
                             if (info != null && (info.startsWith("converted") || info.startsWith("exception"))) {
@@ -1610,8 +1673,10 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (t: Throwable) {
                 DiagLog.e("Engine", "${style.label} 处理异常", t)
-                Log.e("M9CPU", "style process failed", t)
-                mainHandler.post { progress.gone(); toast("处理失败: ${t.message}") }
+                mainHandler.post {
+                    progress.gone()
+                    toast("处理失败，请重试（详情见日志）")
+                }
             }
         }
     }
@@ -1699,7 +1764,10 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (t: Throwable) {
                 DiagLog.e("Engine", "${def.name} 自定义色彩处理异常", t)
-                mainHandler.post { progress.gone(); toast("处理失败: ${t.message}") }
+                mainHandler.post {
+                    progress.gone()
+                    toast("处理失败，请重试（详情见日志）")
+                }
             }
         }
     }
@@ -2626,6 +2694,8 @@ class MainActivity : AppCompatActivity() {
                     perfectBytes = st.jpeg
                     perfectStyle = srStartedStyle
                     perfectApplied = true
+                    // 完美成片走 perfectBytes 导出：全像素直通源与之无关，作废防错配
+                    clearFullRes()
                     setPerfectButton(true)
                     resultBitmap?.recycle()
                     resultBitmap = decodePreview(st.jpeg, 2048)
@@ -2642,6 +2712,8 @@ class MainActivity : AppCompatActivity() {
                 } else if (originalBytes === srStartedBytes) {
                     // 用户未换图：预览/工作字节升级为高清版
                     originalBytes = st.jpeg
+                    // 工作字节已被超分成片替换：200MP 全像素直通源与之不再对应，作废
+                    clearFullRes()
                     // 图已被替换为超分成片，完美态随之失效（避免重复套色/高亮错位）
                     perfectApplied = false
                     perfectBytes = null
@@ -2686,8 +2758,8 @@ class MainActivity : AppCompatActivity() {
                 resetQualityButtons()
                 setPerfectButton(perfectApplied)
                 updateLumBarUi()
-                toast(if (srStartedPerfect) "完美处理失败：…${st.message.takeLast(120)}"
-                else "超分失败：…${st.message.takeLast(120)}")
+                toast(if (srStartedPerfect) "完美处理失败，请重试（详情见日志）"
+                else "超分失败，请重试（详情见日志）")
                 srStartedPerfect = false
                 SuperResTask.consume()
             }
@@ -2736,6 +2808,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onPerfectClicked() {
+        if (exporting) { toast("全像素导出进行中，请稍候"); return }
         if (srBusy) { toast("处理中，请稍候"); return }
         if (perfectApplied) { clearPerfectState(); return }   // 再按一下 = 关闭
         if (originalBytes == null) { toast("请先导入图片"); return }
@@ -2807,6 +2880,7 @@ class MainActivity : AppCompatActivity() {
         // 完美成片可直接继续超分：源用成片、超分阶段不再套色
         val src = (if (perfectApplied) perfectBytes else originalBytes)
             ?: run { toast("请先导入图片"); return }
+        if (exporting) { toast("全像素导出进行中，请稍候"); return }
         if (srBusy) return
         // 按工作字节真实尺寸估算：超分输入 = 工作字节（宽/高已受 4096/3072 逐轴封顶），输出 ×2
         val w = (if (workWidth > 0) workWidth else originalBitmap?.width ?: 0) * 2
@@ -2906,12 +2980,64 @@ class MainActivity : AppCompatActivity() {
     // ---- 导出 ----
 
     private fun export() {
+        if (exporting) { toast("全像素导出进行中，请稍候"); return }
         if (srBusy) { toast("处理中，请稍候"); return }
         val bytes = originalBytes ?: run { toast("请先导入图片"); return }
         // 完美态：成片自带色彩，直接落盘（跳过滤镜链，避免二次套色）
         if (perfectApplied && perfectBytes != null) { exportPerfect(); return }
         // 合成态：超分完成时已自动导出（带徽章），手动导出会产生重复文件
         if (srBakedStyle != null) { toast("超分完成后已自动导出至图库"); return }
+        // C1/C4：全像素导出。原图档直通；甲档（LUT 家族）与乙档（模型链 M9/M9+/M10R/M9D）
+        // 带滤镜逐带处理，同为全像素。SA 与 LP9（P9Post 依赖全图空间场）仍按工作字节导出。
+        val fullSrc = fullResFile
+        if (fullSrc != null) {
+            if (!hasColor()) { exportFullRes(fullSrc); return }
+            val fCustomDef = currentCustomId?.let { CustomStyleStore.byId(it) }
+            val fCustomVer = fCustomDef?.let { CustomStyleStore.currentVersion(it) }
+            if (currentCustomId != null && (fCustomDef == null || fCustomVer == null)) {
+                toast("该色彩的 LUT 不可用，请重新选择")
+                return
+            }
+            val lutRef = if (fCustomVer != null && !ModelColor.isParamVersion(fCustomVer)) {
+                AlexaLut.fileRef(fCustomVer.lutFile)
+            } else null
+            if (LutBandOps.supports(currentStyle, lutRef)) {
+                if (fCustomDef != null && fCustomVer != null &&
+                    !ModelColor.ensure(this, fCustomDef, fCustomVer)
+                ) {
+                    toast("「${fCustomDef.name}」色彩文件缺失，无法导出")
+                    return
+                }
+                val op = LutBandOps.create(
+                    this, currentStyle, lutRef,
+                    intArrayOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel)
+                )
+                if (op != null) {
+                    val tag = fCustomDef?.name?.let { sanitizeFileTag(it) }
+                        ?: (currentStyle?.id ?: "orig")
+                    val sid = fCustomDef?.id ?: currentStyle?.id ?: "orig"
+                    exportFullRes(fullSrc, op, tag, sid)
+                    return
+                }
+            }
+            // 乙档：模型链（M9 / M9+ / M10-R / M9D）在原生分辨率上逐带蒸馏
+            // （整图链会把画布 fit 到 4096x3072，200MP 只剩 6% 细节）
+            if (DistillBandOps.supports(currentStyle)) {
+                val op = DistillBandOps.create(
+                    this, currentStyle,
+                    intArrayOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel)
+                )
+                if (op != null) {
+                    val sid = currentStyle?.id ?: "orig"
+                    exportFullRes(fullSrc, op, sid, sid)
+                    return
+                }
+                DiagLog.i("FullRes", "模型链条带算子创建失败 → 按工作版导出")
+            }
+            if (lutRef != null) {
+                DiagLog.i("FullRes", "自定义 LUT 走 CustomLutPost 全图引导滤波，无法按带等价复现 → 按工作版导出")
+            }
+        }
         if (!hasColor()) { toast("请先选择一个滤镜"); return }
         val customDef = currentCustomId?.let { CustomStyleStore.byId(it) }
         val customVer = customDef?.let { CustomStyleStore.currentVersion(it) }
@@ -2977,9 +3103,266 @@ class MainActivity : AppCompatActivity() {
                 val diag = MarkDiagnostic.describe(marked) + " " + hdrChk.brief
                 val uri = saveNamed(finalBytes, "Leica_${nameTag}_${System.currentTimeMillis()}.jpg")
                 DiagLog.i("Export", "保存${if (uri != null) "成功" else "失败"} · $diag")
-                toast(if (uri != null) "已导出 · $diag" else "导出失败 · $diag")
+                toast(
+                    when {
+                        uri == null -> "导出失败，请重试（详情见日志）"
+                        hdrSrc != null && !hdrChk.ok -> "已保存到相册 · HDR 数据未完整保留"
+                        // 200MP 源选了滤镜：本次按引擎工作字节导出，提示全像素入口
+                        fullResFile != null ->
+                            "已保存到相册（${workWidth}×${workHeight}）· 原图档可全像素导出"
+                        else -> "已保存到相册"
+                    }
+                )
             }
         }
+    }
+
+    /**
+     * C1：200MP 全像素「原图直通」导出（**全链路文件化**）。
+     *
+     * 链路：cache 源文件 → 条带解码/编码（常驻一条带）→ EXIF 原地回填 → 相机徽章
+     *      （只重写容器头）→ UltraHDR 文件级回嵌（头改写 + 尾部流式搬运）→ 流式入库。
+     *
+     * 内存：全程不驻留整图；Java 堆里只有容器头（几百 KB）、增益图与 256KiB 拷贝缓冲。
+     *      200MP 的 50~80MB 源字节以 cache 文件形式存在磁盘，不参与堆分配。
+     *
+     * @param op 甲：逐带套色算子（LUT 家族）。null = 原图直通；非 null 时走 strict，
+     *           失败宁可报错也不产出「尺寸对但没套色」的图。
+     */
+    private fun exportFullRes(
+        srcFile: File,
+        op: ImageUtils.StripBandOp? = null,
+        nameTag: String = "orig",
+        styleId: String = "orig",
+        confirmed: Boolean = false
+    ) {
+        val w0 = fullResWidth
+        val h0 = fullResHeight
+        val px = w0.toLong() * h0
+        // 2 亿像素级（≥1 亿像素）：条带要跑数分钟，先讲清耗时与后台限制再开工
+        val big = px >= BIG_EXPORT_PIXELS
+        if (big && !confirmed) {
+            confirmBigExport(px, w0, h0, op != null) {
+                exportFullRes(srcFile, op, nameTag, styleId, confirmed = true)
+            }
+            return
+        }
+        progress.visible()
+        if (big) {
+            exporting = true
+            startExportForeground()
+        }
+        val gen = ++processingGeneration
+        val hdrSrc = fullResHdr
+        val exifHead = fullResExifHead
+        val w = fullResWidth
+        val h = fullResHeight
+        executor.execute {
+            val t0 = System.currentTimeMillis()
+            var succeeded = false
+            var exportSummary = ""
+            if (Build.VERSION.SDK_INT <= 28 && !hasWritePermission()) {
+                exporting = false
+                ExportProgress.end(false, "缺少存储权限")
+                mainHandler.post { progress.gone(); requestWritePermission { export() } }
+                return@execute
+            }
+            val tmp = File(cacheDir, "leica_fullres_${System.currentTimeMillis()}.jpg")
+            try {
+                DiagLog.i(
+                    "FullRes",
+                    "全像素导出开始 ${w}x$h 源 ${srcFile.length()}B op=${op?.javaClass?.simpleName ?: "none"} " +
+                        "style=$styleId 堆 ${ImageUtils.heapUsageLabel()}"
+                )
+                val res = ImageUtils.encodeStripFromFile(
+                    srcFile, tmp,
+                    quality = 95, maxBandRows = 512,
+                    onProgress = { done, total -> ExportProgress.update(done, total) },
+                    op = op, strict = op != null
+                )
+                DiagLog.i("FullRes",
+                    "条带编码 ok=${res.ok} fallback=${res.fallbackCopy} " +
+                        "${res.width}x${res.height} band=${res.bandRows}×${res.bandCount} " +
+                        "${res.outBytes}B 耗时 ${res.elapsedMs}ms 堆 ${ImageUtils.heapUsageLabel()}")
+                if (!res.ok && !res.fallbackCopy) {
+                    DiagLog.e("FullRes", "条带编码失败（strict，未写回落副本）")
+                    mainHandler.post {
+                        progress.gone()
+                        toast(
+                            if (op != null) "全像素滤镜导出失败，请重试（详情见日志）"
+                            else "全像素导出失败，请重试（详情见日志）"
+                        )
+                    }
+                    return@execute
+                }
+                // 全像素直通只接受 Orientation=1（见 ImageUtils.decideFullRes），故固定写 1
+                val exifOk = exifHead != null && ExifTransplant.copyInPlace(this, exifHead, tmp, "1")
+                DiagLog.i("FullRes", "EXIF 回填${if (exifOk) "完成" else "跳过"} 堆 ${ImageUtils.heapUsageLabel()}")
+                // §22 P1：源图 ICC 色彩档案随导出走（纯字节搬运，不改像素；读失败静默跳过）
+                val iccBlocks = IccProfile.readBlocks(srcFile)
+                val badgeOk = LeicaMark.markFile(tmp, iccBlocks)
+                DiagLog.i("FullRes",
+                    "徽章写入${if (badgeOk) "完成" else "失败（保留原样）"} · " +
+                        "ICC ${if (iccBlocks != null) "${iccBlocks.size}B" else "源图无"} " +
+                        "堆 ${ImageUtils.heapUsageLabel()}")
+                // HDR 回嵌：徽章链会移除 XMP/MPF，必须在其后；无增益图时裁掉残留二次图防错配
+                val hdrChk = if (hdrSrc != null) HdrGainMap.embedFile(tmp, hdrSrc)
+                    else HdrGainMap.truncateToPrimaryFile(tmp)
+                val diag = fileHeaderDiag(tmp) + " " + hdrChk.brief
+                val name = "Leica_${nameTag}_full_${System.currentTimeMillis()}.jpg"
+                val uri = saveNamedFile(tmp, name)
+                val elapsed = System.currentTimeMillis() - t0
+                DiagLog.i("FullRes",
+                    "保存${if (uri != null) "成功" else "失败"} ${tmp.length()}B " +
+                        "总耗时 ${elapsed}ms 堆 ${ImageUtils.heapUsageLabel()} · $diag")
+                succeeded = uri != null
+                exportSummary = "${w}×${h} · 用时 ${fmtDuration(elapsed)}"
+                mainHandler.post {
+                    progress.gone()
+                    if (gen != processingGeneration || isFinishing || isDestroyed) return@post
+                    val tail = if (op != null) "· ${nameTag} 已套色" else ""
+                    val hdrShort = hdrSrc != null && !hdrChk.ok
+                    when {
+                        uri == null -> toast("全像素导出失败，请重试（详情见日志）")
+                        big -> showBigExportDoneDialog(w, h, elapsed, hdrShort, tail)
+                        hdrShort -> toast("已保存到相册（${w}×$h）· HDR 数据未完整保留$tail")
+                        else -> toast("已保存到相册（${w}×$h）$tail")
+                    }
+                }
+            } catch (t: Throwable) {
+                DiagLog.e("FullRes", "全像素导出异常：${t.message}", t)
+                mainHandler.post {
+                    progress.gone()
+                    if (gen == processingGeneration && !isFinishing && !isDestroyed) {
+                        toast("全像素导出失败：${t.javaClass.simpleName}")
+                    }
+                }
+            } finally {
+                runCatching { tmp.delete() }
+                ExportProgress.end(succeeded, exportSummary)
+                exporting = false
+            }
+        }
+    }
+
+    // ---- 大图（≥1 亿像素）全像素导出：开工确认 / 用时弹窗 ----
+
+    /** 开工前确认：耗时与「后台无限制」都要讲清楚，确认后才真正起前台服务 */
+    private fun confirmBigExport(px: Long, w: Int, h: Int, withColor: Boolean, onStart: () -> Unit) {
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("全像素导出")
+            .setMessage(buildBigExportMessage(px, w, h, withColor))
+            .setPositiveButton("开始导出") { _, _ -> onStart() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 确认文案：首行红字耗时 + 末段红字「后台无限制」指引 */
+    private fun buildBigExportMessage(px: Long, w: Int, h: Int, withColor: Boolean): CharSequence {
+        val red = "预计 ${estimateBandExportText(px, withColor)}，期间手机会持续发热\n"
+        val rest = "全像素导出 ${w}×$h（${fmtPixels(px)}）：逐条带重编码，内存占用很低，但需要时间。\n" +
+            "已挂前台服务并从通知栏显示进度，可以退回桌面等待；请勿在多任务里划掉本应用。\n" +
+            "锁屏会降低系统调度、明显变慢，建议保持亮屏或直接切到桌面。\n\n"
+        val warn = "若系统限制后台，长任务可能被冻结或中断 —— 请到 系统设置 → 应用管理 → L-Moment → 省电策略，改为「无限制」。"
+        val ss = android.text.SpannableString(red + rest + warn)
+        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+            0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        val warnStart = (red + rest).length
+        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+            warnStart, ss.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return ss
+    }
+
+    /** 完成弹窗：数分钟的等待必须被明确交代，而不是一条会自己消失的 toast */
+    private fun showBigExportDoneDialog(w: Int, h: Int, elapsedMs: Long, hdrShort: Boolean, tail: String) {
+        if (isFinishing || isDestroyed) return
+        val red = "用时 ${fmtDuration(elapsedMs)}\n"
+        val rest = "已保存全像素成片 ${w}×$h 到相册$tail。\n" +
+            (if (hdrShort) "本次 HDR 增益图未完整保留（成片可用）。\n" else "") + "\n"
+        val warn = "若等待期间系统提示过「应用在后台耗电」或任务被打断过，请把 L-Moment 的后台权限设为「无限制」，下次导出更稳。"
+        val ss = android.text.SpannableString(red + rest + warn)
+        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+            0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        val warnStart = (red + rest).length
+        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+            warnStart, ss.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("全像素导出完成")
+            .setMessage(ss)
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
+    /** 条带耗时估算：200MP 直通实测约 256s（≈1.28 s/MP），套色算子再乘 1.6，给区间更诚实 */
+    private fun estimateBandExportText(px: Long, withColor: Boolean): String {
+        var sec = (px / 1_000_000.0 * 1.28).toInt()
+        if (withColor) sec = (sec * 1.6).toInt()
+        if (sec < 30) sec = 30
+        val lo = (sec * 0.8 / 60.0).toInt().coerceAtLeast(1)
+        val hi = (sec * 1.6 / 60.0).toInt().coerceAtLeast(lo + 1)
+        return "约 $lo~$hi 分钟"
+    }
+
+    private fun fmtPixels(px: Long): String {
+        if (px >= 100_000_000L) {
+            val yi = (px / 10_000_000L) / 10.0
+            return "$yi 亿像素"
+        }
+        return "${px / 10_000} 万像素"
+    }
+
+    private fun fmtDuration(ms: Long): String {
+        val total = (ms / 1000).toInt().coerceAtLeast(0)
+        val m = total / 60
+        val s = total % 60
+        return if (m > 0) "$m 分 $s 秒" else "$s 秒"
+    }
+
+    /** 大图导出起前台服务（+通知权限）：切后台/息屏后条带编码继续跑 */
+    private fun startExportForeground() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1002)
+        }
+        ExportProgress.begin()
+        try {
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, SuperResService::class.java).setAction(SuperResService.ACTION_EXPORT)
+            )
+        } catch (t: Throwable) {
+            DiagLog.w("FullRes", "前台服务启动失败（转无保护导出）：${t.message}")
+        }
+    }
+
+    /** 容器头诊断（只读 SOI..SOS 段，不碰熵编码数据） */
+    private fun fileHeaderDiag(file: File): String = try {
+        val head = ImageUtils.readFileHeader(file)
+        if (head == null) "头=不可解析" else MarkDiagnostic.describe(head)
+    } catch (t: Throwable) {
+        "头=解析异常"
+    }
+
+    /** 把源字节落到 cache 文件（200MP 源不进 Java 堆常驻） */
+    private fun writeCacheBytes(bytes: ByteArray, prefix: String): File? = try {
+        val f = File(cacheDir, "${prefix}_${System.currentTimeMillis()}.jpg")
+        f.outputStream().use { it.write(bytes) }
+        f
+    } catch (t: Throwable) {
+        DiagLog.w("FullRes", "写 cache 源失败：${t.message}")
+        null
+    }
+
+    /** 作废 200MP 全像素直通源（删 cache 文件 + 清字段） */
+    private fun clearFullRes() {
+        runCatching { fullResFile?.delete() }
+        fullResFile = null
+        fullResExifHead = null
+        fullResWidth = 0
+        fullResHeight = 0
+        fullResHdr = null
     }
 
     /** 文件名片段净化：去掉文件系统不接受的分隔符，空白压成下划线 */
@@ -3024,7 +3407,13 @@ class MainActivity : AppCompatActivity() {
                 val uri = saveNamed(finalBytes,
                     "Leica_${styleId}_perfect_${System.currentTimeMillis()}.jpg")
                 DiagLog.i("Export", "完美成片保存${if (uri != null) "成功" else "失败"} · ${hdrChk.brief}")
-                toast(if (uri != null) "完美成片已导出 · ${hdrChk.brief}" else "导出失败")
+                toast(
+                    when {
+                        uri == null -> "导出失败，请重试（详情见日志）"
+                        hdrSrc != null && !hdrChk.ok -> "完美成片已保存 · HDR 数据未完整保留"
+                        else -> "完美成片已保存"
+                    }
+                )
             }
         }
     }
@@ -3091,6 +3480,38 @@ class MainActivity : AppCompatActivity() {
 
     // ---- 工具 ----
 
+    /** 文件版入库：流式拷贝，不把整幅字节读进堆（200MP 直通导出用）。 */
+    private fun saveNamedFile(file: File, name: String): Uri? {
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                if (Build.VERSION.SDK_INT >= 29) {
+                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/LeicaMoments")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
+            val resolver = contentResolver
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) {
+                DiagLog.w("FullRes", "MediaStore insert 返回 null（无相册权限？）")
+                return null
+            }
+            resolver.openOutputStream(uri)?.use { os ->
+                file.inputStream().use { ins -> ins.copyTo(os, 256 * 1024) }
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            }
+            uri
+        } catch (e: Exception) {
+            DiagLog.w("FullRes", "入库异常：${e.message}")
+            null
+        }
+    }
+
     private fun scaleBitmap(src: Bitmap, maxDim: Int): Bitmap {
         val w = src.width
         val h = src.height
@@ -3113,7 +3534,7 @@ class MainActivity : AppCompatActivity() {
     private fun fallbackMsg(style: LeicaEngine.Style): String =
         if (style == LeicaEngine.Style.LM9) "「${style.label}」模型不可用，已切换为 M9"
         else if (LeicaEngine.Style.isLutOnly(style)) "「${style.label}」LUT 加载失败，已输出原图"
-        else if (LeicaEngine.Style.isCcd(style)) "「${style.label}」模型失败(${PortraitFilm.lastError})，已降级为 LUT 模拟"
+        else if (LeicaEngine.Style.isCcd(style)) "「${style.label}」模型不可用，已降级为 LUT 模拟（详情见日志）"
         else "「${style.label}」完整链路不可用，已降级为 LUT 模拟"
 
     private fun toast(msg: String) {

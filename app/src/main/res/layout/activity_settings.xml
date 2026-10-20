@@ -41,6 +41,21 @@
             android:layout_height="1dp" />
     </LinearLayout>
 
+    <!-- C4：内容区可滚动（新增「导出」区块后总高超过矮屏可视高度，顶栏固定不滚） -->
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#000000"
+        android:fillViewport="true"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#000000"
+            android:orientation="vertical">
+
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -170,6 +185,73 @@
         android:paddingStart="32dp"
         android:paddingEnd="32dp"
         android:text="仅影响 RAW 照片，对之后导入的生效。白天大光比偏暗时选「提亮」"
+        android:textColor="#5A5A5E"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="28dp"
+        android:paddingStart="24dp"
+        android:paddingEnd="24dp"
+        android:text="导出"
+        android:textColor="#8E8E93"
+        android:textSize="13sp" />
+
+    <LinearLayout
+        android:id="@+id/rowFullRes"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_settings_row"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="全像素导出（慢）"
+            android:textColor="#E8E8EA"
+            android:textSize="15sp" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/txtFullResValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="开"
+            android:textColor="#8E8E93"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="›"
+            android:textColor="#5A5A5E"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/txtFullResHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:paddingStart="32dp"
+        android:paddingEnd="32dp"
+        android:text="50MP / 200MP 的「原图」档按原始像素导出，耗时与内存更高；仅对之后导入的图片生效"
         android:textColor="#5A5A5E"
         android:textSize="12sp" />
 
@@ -324,5 +406,8 @@
         android:text="从剪贴板读取朋友发来的分享指令，还原成同一条色彩（含版本链）"
         android:textColor="#5A5A5E"
         android:textSize="12sp" />
+
+        </LinearLayout>
+    </ScrollView>
 
 </LinearLayout>

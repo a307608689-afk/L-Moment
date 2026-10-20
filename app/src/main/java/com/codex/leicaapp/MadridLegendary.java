@@ -52,6 +52,7 @@ public final class MadridLegendary {
             bos.write(outJpeg, 0, 2); // SOI
             int pos = 2;
             boolean copied = false;
+            ByteArrayOutputStream icc = null;
             while (true) {
                 if (pos + 4 > srcJpeg.length || (srcJpeg[pos] & 255) != 255) break;
                 int marker = srcJpeg[pos + 1] & 255;
@@ -64,10 +65,23 @@ public final class MadridLegendary {
                         && srcJpeg[pos + 8] == 0 && srcJpeg[pos + 9] == 0) {
                     bos.write(srcJpeg, pos, len + 2); // 只回填第一个 Exif（动态照片 MVIMG 会有第二个空壳帧 EXIF，相册读到它会导致标记失效）
                     copied = true;
+                } else if (marker == 226 && IccProfile.isIccPayload(srcJpeg, pos + 4, len - 2)) {
+                    // §22 P1：源图的 ICC 色彩档案（Display P3 等）必须跟着走，否则查看器按
+                    // sRGB 解释 P3 数值 → 红/绿方向过饱和。纯字节搬运，不改像素。
+                    if (icc == null) icc = new ByteArrayOutputStream(4096);
+                    icc.write(srcJpeg, pos, len + 2);
                 }
                 pos += len + 2;
             }
-            bos.write(outJpeg, 2, outJpeg.length - 2);
+            if (icc != null) {
+                bos.write(icc.toByteArray(), 0, icc.size());
+                // 替换语义：outJpeg 里 Skia 自带的 456 B sRGB profile 必须剔除，否则两段 ICC
+                // 并存（seq 都是 1/1）会让解码器整体放弃色彩档案。源图无 ICC 时保持原样
+                // （Skia 的 sRGB 标签对 sRGB 内容是对的）。
+                IccProfile.copyWithoutIcc(bos, outJpeg);
+            } else {
+                bos.write(outJpeg, 2, outJpeg.length - 2);
+            }
             return bos.toByteArray();
         }
         return outJpeg;
@@ -155,6 +169,25 @@ public final class MadridLegendary {
         in.close();
         if (!tmp.renameTo(f)) throw new IOException("Cannot publish parameters");
         return f;
+    }
+
+    /**
+     * 条带版：对一张 {@link Bitmap} 原地套 M10R 的 LUT（lux=200 / cct=5500 / zoom=1，
+     * 与 {@link #process} 内部同口径）。该算子只做逐像素查表，无空间滤波，可安全逐带调用。
+     *
+     * @param bin 资产名，如 "leica_filter_param_m10r_snapshot.bin"
+     * @return 成功 true；native 不可用 / 参数缺失 / 位图不可写 时 false
+     */
+    public static boolean filterBitmap(Context ctx, Bitmap bmp, String bin) {
+        if (bmp == null || bmp.isRecycled() || !bmp.isMutable()) return false;
+        try {
+            load(ctx.getApplicationInfo().nativeLibraryDir);
+            File binFile = parameters(ctx, bin);
+            if (binFile == null || !binFile.isFile()) return false;
+            return filter(bmp, binFile.getAbsolutePath(), 200f, 5500f, 1f, 0f);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**

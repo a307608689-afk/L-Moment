@@ -371,8 +371,205 @@ object PortraitFilm {
             MadridLegendary.copyExif(jpeg, bos.toByteArray())
         } catch (t: Throwable) {
             lastError = "${t.javaClass.simpleName}: ${t.message}"
-            android.util.Log.w("PortraitFilm", "M13 failed", t)
+            DiagLog.e("PortraitFilm", "M13 failed", t)
             null
+        }
+    }
+
+    /**
+     * 全图共享的 LUT 参数包（SepLUT 1D 表 + 3D 表）。
+     *
+     * <p>关键事实：SepLUT 的 256×256 采样与 ONNX 推理是**整图级**的，输出 LUT 全图共享。
+     * 所以全像素条带化必须「先算一次 bundle，再逐带 apply」——按带独立跑推理会得到
+     * 51 套不同 LUT，带间色调跳变，且 51 次推理不可接受。</p>
+     */
+    class LutBundle(
+        val t1d: Array<FloatArray>,
+        val lut3d: Array<Array<Array<FloatArray>>>
+    )
+
+    /**
+     * 用一张采样图算出全图共享 LUT。条带路径的 prepare 阶段调用一次。
+     * 采样图无需是原尺寸，内部固定缩到 [INFER_EDGE]²。
+     */
+    fun computeBundle(context: Context, sample: Bitmap): LutBundle? {
+        return try {
+            val small = Bitmap.createScaledBitmap(sample, INFER_EDGE, INFER_EDGE, true)
+            val sp = IntArray(INFER_EDGE * INFER_EDGE)
+            small.getPixels(sp, 0, INFER_EDGE, 0, 0, INFER_EDGE, INFER_EDGE)
+            val input = FloatArray(3 * INFER_EDGE * INFER_EDGE)
+            val n = INFER_EDGE * INFER_EDGE
+            for (i in 0 until n) {
+                val p = sp[i]
+                input[i] = ((p shr 16) and 0xFF) / 255f          // R
+                input[n + i] = ((p shr 8) and 0xFF) / 255f       // G
+                input[2 * n + i] = (p and 0xFF) / 255f           // B
+            }
+            if (small !== sample) small.recycle()
+
+            val e = env ?: OrtEnvironment.getEnvironment()
+            val tensor = OnnxTensor.createTensor(
+                e, FloatBuffer.wrap(input),
+                longArrayOf(1, 3, INFER_EDGE.toLong(), INFER_EDGE.toLong()))
+            val out = obtainSession(context).run(mapOf("img" to tensor))
+            val lut1d = (out[0].value as Array<FloatArray>)      // (3,17)
+            val lut3dFlat = out[1].value as FloatArray           // 3*17³
+            out.close()
+            tensor.close()
+            val lut3d = Array(3) { c ->
+                Array(D) { b -> Array(D) { g -> FloatArray(D) { r ->
+                    lut3dFlat[c * D * D * D + b * D * D + g * D + r]  // 轴序 (B,G,R)
+                } } }
+            }
+            val t1d = Array(3) { c -> buildTable17(lut1d[c]) }
+            LutBundle(t1d, lut3d)
+        } catch (t: Throwable) {
+            lastError = "bundle ${t.javaClass.simpleName}: ${t.message}"
+            DiagLog.e("PortraitFilm", "computeBundle failed", t)
+            null
+        }
+    }
+
+    /**
+     * 把全图共享 LUT 应用到任意尺寸 Bitmap（原地改）。条带路径逐带调用。
+     *
+     * <p>注意：本函数与 [process] 内的逐像素段同源，改一处必须同步改另一处。</p>
+     */
+    fun applyBundle(bmp: Bitmap, profile: Profile, bundle: LutBundle): Boolean {
+        return try {
+            val t1d = bundle.t1d
+            val lut3d = bundle.lut3d
+            val prm = paramsOf(profile)
+            val w = bmp.width
+            val h = bmp.height
+            val pixels = IntArray(w * h)
+            bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+            val m = prm.matrix
+            val cR = prm.curveR; val cG = prm.curveG; val cB = prm.curveB
+            val gl = prm.gammaLut
+            val useGamma = profile.gamma > 0f
+            val warmMid = profile.warmMid
+            val skinSat = profile.skinSat
+            val skinLumLift = profile.skinLumLift
+            val skinBLift = profile.skinBLift
+            val skinHueC = profile.skinHueC
+            val skinHueHalf = profile.skinHueHalf
+            val sR = profile.shadowTint[0]; val sG = profile.shadowTint[1]; val sB = profile.shadowTint[2]
+            val d1 = D - 1
+            for (i in pixels.indices) {
+                val p = pixels[i]
+                // --- SepLUT 1D（精确查表）---
+                var r = t1d[0][(p shr 16) and 0xFF]
+                var g = t1d[1][(p shr 8) and 0xFF]
+                var b = t1d[2][p and 0xFF]
+                // --- SepLUT 3D 三线性：x(R)→轴2, y(G)→轴1, z(B)→轴0 ---
+                val fx = r * d1; val fy = g * d1; val fz = b * d1
+                var x0 = fx.toInt(); if (x0 > d1 - 1) x0 = d1 - 1; if (x0 < 0) x0 = 0
+                var y0 = fy.toInt(); if (y0 > d1 - 1) y0 = d1 - 1; if (y0 < 0) y0 = 0
+                var z0 = fz.toInt(); if (z0 > d1 - 1) z0 = d1 - 1; if (z0 < 0) z0 = 0
+                val dx = fx - x0; val dy = fy - y0; val dz = fz - z0
+                val x1 = if (dx > 0f) x0 + 1 else x0
+                val y1 = if (dy > 0f) y0 + 1 else y0
+                val z1 = if (dz > 0f) z0 + 1 else z0
+                val w000 = (1 - dx) * (1 - dy) * (1 - dz)
+                val w100 = dx * (1 - dy) * (1 - dz)
+                val w010 = (1 - dx) * dy * (1 - dz)
+                val w110 = dx * dy * (1 - dz)
+                val w001 = (1 - dx) * (1 - dy) * dz
+                val w101 = dx * (1 - dy) * dz
+                val w011 = (1 - dx) * dy * dz
+                val w111 = dx * dy * dz
+                var nr = 0f; var ng = 0f; var nb = 0f
+                for (c in 0..2) {
+                    val plane = lut3d[c]
+                    val v = plane[z0][y0][x0] * w000 + plane[z0][y0][x1] * w100 +
+                            plane[z0][y1][x0] * w010 + plane[z0][y1][x1] * w110 +
+                            plane[z1][y0][x0] * w001 + plane[z1][y0][x1] * w101 +
+                            plane[z1][y1][x0] * w011 + plane[z1][y1][x1] * w111
+                    when (c) { 0 -> nr = v; 1 -> ng = v; else -> nb = v }
+                }
+                r = nr; g = ng; b = nb
+                // --- Portra 矩阵 ---
+                val mr = m[0] * r + m[1] * g + m[2] * b
+                val mg = m[3] * r + m[4] * g + m[5] * b
+                val mb = m[6] * r + m[7] * g + m[8] * b
+                r = mr; g = mg; b = mb
+                // --- 中间调冷暖偏（负值 = 转冷） ---
+                val lum2 = 0.299f * r + 0.587f * g + 0.114f * b
+                val wt = 4f * lum2 * (1f - lum2)
+                r = (r + warmMid * wt).coerceIn(0f, 1f)
+                b = (b - warmMid * wt).coerceIn(0f, 1f)
+                // --- 肤色定向：暖色相区去饱和+提亮+B 微升（冷白奶肤） ---
+                var skinW = 0f
+                run {
+                    val mx = maxOf(r, g, b)
+                    val mn = minOf(r, g, b)
+                    val delta = mx - mn
+                    var wgt = 0f
+                    if (delta > 1e-5f) {
+                        val hue = when {
+                            mx == r -> { val hh = 60f * (g - b) / delta; if (hh < 0f) hh + 360f else hh }
+                            mx == g -> 60f * (b - r) / delta + 120f
+                            else -> 60f * (r - g) / delta + 240f
+                        }
+                        var dh = Math.abs(hue - skinHueC)
+                        if (dh > 180f) dh = 360f - dh
+                        var hw = 1f - dh / skinHueHalf
+                        if (hw > 0f) {
+                            hw = hw * hw * (3f - 2f * hw)
+                            val sat = delta / maxOf(mx, 1e-6f)
+                            val sw = ((sat - SKIN_SAT_LO) / SKIN_SAT_SPAN).coerceIn(0f, 1f)
+                            val lw = ((mx - SKIN_LUM_LO) / SKIN_LUM_SPAN).coerceIn(0f, 1f)
+                            wgt = hw * sw * lw
+                        }
+                    }
+                    if (wgt > 0f) {
+                        val keep = 1f - wgt * (1f - skinSat)
+                        val ls = 0.299f * r + 0.587f * g + 0.114f * b
+                        r = (ls + (r - ls) * keep).coerceIn(0f, 1f)
+                        g = (ls + (g - ls) * keep).coerceIn(0f, 1f)
+                        b = (ls + (b - ls) * keep).coerceIn(0f, 1f)
+                        val lift = 1f + skinLumLift * wgt
+                        r = (r * lift - SKIN_R_DROP * wgt).coerceIn(0f, 1f)
+                        g = (g * lift).coerceIn(0f, 1f)
+                        b = (b * lift + skinBLift * wgt).coerceIn(0f, 1f)
+                        skinW = wgt
+                    }
+                }
+                // --- 亮度域 gamma：out_lum = lum^(1+g)，压中间调保黑白点（查表线性插值） ---
+                if (useGamma) {
+                    val li = (lum2 * 512f)
+                    val gi = li.toInt().coerceIn(0, 511)
+                    val gf = (li - gi).coerceIn(0f, 1f)
+                    val factor = gl[gi] + (gl[gi + 1] - gl[gi]) * gf
+                    r = (r * factor).coerceIn(0f, 1f)
+                    g = (g * factor).coerceIn(0f, 1f)
+                    b = (b * factor).coerceIn(0f, 1f)
+                }
+                // --- 阴影偏移：越暗越强；肤区内自动减弱防脸灰；三通道各自独立符号 ---
+                if (sR != 0f || sG != 0f || sB != 0f) {
+                    val l3 = 0.299f * r + 0.587f * g + 0.114f * b
+                    val ws = (1f - l3) * (1f - l3) * (1f - skinW * SHADOW_SKIN_CUT)
+                    r = (r + sR * ws).coerceIn(0f, 1f)
+                    g = (g + sG * ws).coerceIn(0f, 1f)
+                    b = (b + sB * ws).coerceIn(0f, 1f)
+                }
+                // --- 曲线 ---
+                r = cR[(r * 255f + 0.5f).toInt().coerceIn(0, 255)]
+                g = cG[(g * 255f + 0.5f).toInt().coerceIn(0, 255)]
+                b = cB[(b * 255f + 0.5f).toInt().coerceIn(0, 255)]
+                // --- 写回 ---
+                val ir = (r * 255f + 0.5f).toInt().coerceIn(0, 255)
+                val ig = (g * 255f + 0.5f).toInt().coerceIn(0, 255)
+                val ib = (b * 255f + 0.5f).toInt().coerceIn(0, 255)
+                pixels[i] = ib or (ig shl 8) or (ir shl 16) or -0x1000000
+            }
+            bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+            true
+        } catch (t: Throwable) {
+            lastError = "apply ${t.javaClass.simpleName}: ${t.message}"
+            DiagLog.e("PortraitFilm", "applyBundle failed", t)
+            false
         }
     }
 

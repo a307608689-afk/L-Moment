@@ -2,6 +2,7 @@ package com.leicamoments.app
 
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -88,6 +89,9 @@ object CategoryPopup {
                 text = item.subtitle
                 textSize = 12f
                 isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
+                // 副标题过长会把标题挤没（曾出现「开启（推荐）原图档保留全像素」叠在一起）
+                maxWidth = dp(104)
                 setTextColor(Color.parseColor("#8E8E93"))
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT

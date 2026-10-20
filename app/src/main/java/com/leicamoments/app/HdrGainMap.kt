@@ -6,6 +6,10 @@ import android.graphics.Matrix
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -227,6 +231,203 @@ object HdrGainMap {
         }
     } catch (t: Throwable) {
         jpeg
+    }
+
+    /** 文件级装配结果（[ok] + 一行诊断，供导出日志与提示复用）。 */
+    class FileOpResult(val ok: Boolean, val brief: String)
+
+    /**
+     * 文件级 UltraHDR 回嵌：**不把主图整幅读进 Java 堆**。
+     *
+     * 容器头（SOI..SOS 段）在内存里改写——剥旧 XMP/MPF/ISO、插新 XMP 与 MPF；
+     * 主图熵编码数据与增益图按 256KiB 缓冲流式搬运，尾部残留二次图按主图 EOI 裁掉。
+     * 原地替换 [primary]，任何异常保持原文件（SDR 兜底）。
+     */
+    fun embedFile(primary: File, data: HdrData): FileOpResult {
+        try {
+            if (!isJpeg(data.gainmapJpeg)) return FileOpResult(false, "HDR=增益图非法")
+            val head = ImageUtils.readFileHeader(primary) ?: return FileOpResult(false, "HDR=主图头读取失败")
+            if (!isJpeg(head)) return FileOpResult(false, "HDR=非JPEG")
+
+            val base = stripHdrSegments(head) // 头部内剥离（幂等）
+            val sec = ensureSecondaryXmp(data.gainmapJpeg, data)
+
+            // 1) 主图 XMP APP1，插在前部 APPn 链之后（与字节版 embed 同一插入点语义）
+            val xmpBlock = buildApp1(primaryXmp(sec.size, data))
+            var ins = 2
+            var pos = 2
+            while (pos + 4 <= base.size && (base[pos].toInt() and 0xFF) == 0xFF) {
+                val m = base[pos + 1].toInt() and 0xFF
+                if (m in 0xE0..0xEF) {
+                    val len = ((base[pos + 2].toInt() and 0xFF) shl 8) or (base[pos + 3].toInt() and 0xFF)
+                    if (len < 2 || pos + 2 + len > base.size) break
+                    pos += 2 + len
+                    ins = pos
+                } else break
+            }
+            val withXmp = ByteArray(base.size + xmpBlock.size)
+            System.arraycopy(base, 0, withXmp, 0, ins)
+            System.arraycopy(xmpBlock, 0, withXmp, ins, xmpBlock.size)
+            System.arraycopy(base, ins, withXmp, ins + xmpBlock.size, base.size - ins)
+
+            val sos = findSos(withXmp)
+            if (sos <= 0) return FileOpResult(false, "HDR=无 SOS")
+
+            // 2) 主图 = 改写后的头 + 原文件熵编码数据（截到主图 EOI）
+            val headEnd = head.size.toLong()
+            val mainEnd = findMainEoiOffset(primary, headEnd) ?: primary.length()
+            val entropyLen = (mainEnd - headEnd).coerceAtLeast(0L)
+            val primaryTotal = withXmp.size.toLong() + entropyLen + 90L
+            if (primaryTotal > Int.MAX_VALUE - 16L) return FileOpResult(false, "HDR=主图超限")
+            val secondaryOffset = (primaryTotal - sos - 8L).toInt() // 相对 MP Endian 字段
+            val mpfBlock = ByteArray(90)
+            mpfBlock[0] = 0xFF.toByte(); mpfBlock[1] = 0xE2.toByte()
+            mpfBlock[2] = 0x00; mpfBlock[3] = 0x58 // 段长 88 = 2 + 86
+            System.arraycopy(buildMpfPayload(primaryTotal.toInt(), sec.size, secondaryOffset), 0, mpfBlock, 4, 86)
+
+            // 3) 落盘：头[..sos) + MPF + 头[sos..) + 熵数据 + 增益图
+            val dir = primary.absoluteFile.parentFile
+            val tmp = File(dir, primary.name + ".hdr" + System.nanoTime())
+            try {
+                FileOutputStream(tmp).use { os ->
+                    os.write(withXmp, 0, sos)
+                    os.write(mpfBlock)
+                    if (withXmp.size > sos) os.write(withXmp, sos, withXmp.size - sos)
+                    copyRange(primary, headEnd, entropyLen, os)
+                    os.write(sec)
+                }
+                if (!tmp.renameTo(primary)) {
+                    copyFileOver(tmp, primary)
+                    tmp.delete()
+                }
+            } finally {
+                if (tmp.exists()) tmp.delete()
+            }
+
+            DiagLog.i("HdrGainMap", "文件级回嵌完成 主图 ${primaryTotal}B（头 ${withXmp.size}B + 熵 ${entropyLen}B）" +
+                    " + 增益图 ${sec.size}B")
+            return verifyFile(primary, primaryTotal.toInt(), sec.size)
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "文件级回嵌异常: ${t.message}")
+            return FileOpResult(false, "HDR=回嵌异常")
+        }
+    }
+
+    /** 文件级「只保留主图」：截到主图 EOI，丢弃 EOI 之后残留的二次图（无 UltraHDR 装配时用）。 */
+    fun truncateToPrimaryFile(primary: File): FileOpResult {
+        return try {
+            val head = ImageUtils.readFileHeader(primary) ?: return FileOpResult(true, "HDR=无")
+            val mainEnd = findMainEoiOffset(primary, head.size.toLong()) ?: return FileOpResult(true, "HDR=无")
+            val len = primary.length()
+            if (mainEnd >= len) {
+                FileOpResult(true, "HDR=无")
+            } else {
+                RandomAccessFile(primary, "rw").use { it.setLength(mainEnd) }
+                DiagLog.i("HdrGainMap", "文件级剥离残留二次图 ${len - mainEnd}B")
+                FileOpResult(true, "HDR=已剥离残留")
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "文件级剥离异常: ${t.message}")
+            FileOpResult(true, "HDR=剥离异常")
+        }
+    }
+
+    /** 回读文件检查装配结构：XMP/MPF 存在、长度吻合、增益图起点是合法 SOI。 */
+    private fun verifyFile(file: File, expectedPrimary: Int, gainBytes: Int): FileOpResult {
+        val head = ImageUtils.readFileHeader(file) ?: return FileOpResult(false, "HDR=回读失败")
+        var hasXmp = false
+        var hasMpf = false
+        forEachSegment(head) { s ->
+            when {
+                s.marker == 0xE1 && startsWith(s, XMP_NS.toByteArray()) -> hasXmp = true
+                s.marker == 0xE2 && startsWith(s, "MPF\u0000".toByteArray()) -> hasMpf = true
+            }
+            false
+        }
+        val len = file.length()
+        val expected = expectedPrimary.toLong() + gainBytes
+        val secSoi = readSoiAt(file, expectedPrimary.toLong())
+        val ok = hasXmp && hasMpf && len == expected && secSoi
+        val brief = if (ok) "HDR=增益图 ok" else "HDR=增益图 有疑问"
+        DiagLog.i("HdrGainMap", "文件级回嵌自检 $brief | 主图 ${expectedPrimary}B 增益图 ${gainBytes}B " +
+                "文件 ${len}B XMP=$hasXmp MPF=$hasMpf 二次图SOI=$secSoi")
+        return FileOpResult(ok, brief)
+    }
+
+    private fun readSoiAt(file: File, from: Long): Boolean {
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                if (from <= 0 || from + 2 > raf.length()) return false
+                raf.seek(from)
+                val b = ByteArray(2)
+                raf.readFully(b)
+                b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte()
+            }
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * 主图 EOI 之后的绝对偏移；从 [from]（熵编码起点）起逐块扫描 `FF D9`。
+     * 熵数据里 0xFF 只会跟 `00` 或 RST 标记，`FF D9` 不会出现在扫描数据内部，故首个命中即主图 EOI。
+     */
+    private fun findMainEoiOffset(file: File, from: Long): Long? {
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                if (from >= raf.length()) return@use null
+                raf.seek(from)
+                val buf = ByteArray(256 * 1024)
+                var pos = from
+                var prevFF = false
+                var found: Long? = null
+                scan@ while (found == null) {
+                    val n = raf.read(buf)
+                    if (n <= 0) break@scan
+                    for (i in 0 until n) {
+                        val b = buf[i].toInt() and 0xFF
+                        if (prevFF && b == 0xD9) {
+                            found = pos + i + 1
+                            break@scan
+                        }
+                        prevFF = b == 0xFF
+                    }
+                    pos += n
+                }
+                found
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    private fun copyRange(src: File, from: Long, count: Long, os: java.io.OutputStream) {
+        if (count <= 0L) return
+        RandomAccessFile(src, "r").use { raf ->
+            raf.seek(from)
+            val buf = ByteArray(256 * 1024)
+            var left = count
+            while (left > 0) {
+                val n = raf.read(buf, 0, minOf(left, buf.size.toLong()).toInt())
+                if (n <= 0) break
+                os.write(buf, 0, n)
+                left -= n
+            }
+        }
+    }
+
+    private fun copyFileOver(src: File, dst: File) {
+        FileInputStream(src).use { ins ->
+            FileOutputStream(dst).use { os ->
+                val buf = ByteArray(256 * 1024)
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n <= 0) break
+                    os.write(buf, 0, n)
+                }
+                os.flush()
+            }
+        }
     }
 
     // ---- 装配结果自检（纯字节回读，不依赖平台解码器/相册）----

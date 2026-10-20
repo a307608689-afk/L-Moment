@@ -176,15 +176,34 @@ object LeicaEngine {
             return it
         }
         // 降级 1.5：ORT 神经网络降级链（全机型真 M9，约 10~25s）
-        M9OrtFallback.run(app, jpeg)?.let {
-            DiagLog.w("Engine", "M9 ORT 降级链接管")
-            return it
+        // B1：蒸馏链因 OOM/时间预算/像素预算退场时跳过重链——重链内存峰值更高、耗时 2~5 倍，
+        // 此时代价是用户多等 20s 甚至进程被杀，直落纯 LUT 才是正确降级。
+        if (distillSkipHeavy()) {
+            DiagLog.w("Engine", "M9 蒸馏链 ${M9Distill.lastFail}，跳过 ORT 重链")
+        } else {
+            M9OrtFallback.run(app, jpeg)?.let {
+                DiagLog.w("Engine", "M9 ORT 降级链接管")
+                return it
+            }
         }
         // 降级 2：纯 LUT
-        DiagLog.w("Engine", "M9 降级纯 LUT (allowCpuFallback=$allowCpuFallback)")
-        diagNative()
+        DiagLog.w("Engine", "M9 降级纯 LUT (allowCpuFallback=$allowCpuFallback)${cpuNote()}")
         onFallback?.invoke(Style.M9)
         return MadridLegendary.process(app, jpeg, "M9")
+    }
+
+    /**
+     * B1 分发保障：蒸馏链退场后，是否应该跳过更重的 ORT 重链。
+     *
+     * OOM / TIMEOUT / BUDGET 说明「这台机器吃不下这一档」——重链的模型更大、内存峰值更高、
+     * 耗时是蒸馏链的 2~5 倍，再往上试只会把用户等待从 ~5s 拉到 25s，中低端机上还会直接
+     * OOM 掉进程。这类失败一律直落纯 LUT。
+     *
+     * OTHER（资产缺失、图结构异常等）与机器能力无关，仍按原链继续尝试。
+     */
+    private fun distillSkipHeavy(): Boolean = when (M9Distill.lastFail) {
+        M9Distill.Fail.OOM, M9Distill.Fail.TIMEOUT, M9Distill.Fail.BUDGET -> true
+        else -> false
     }
 
     /**
@@ -196,8 +215,12 @@ object LeicaEngine {
             DiagLog.w("Engine", "M9D 蒸馏微网链完成")
             return it
         }
-        DiagLog.w("Engine", "M9D 蒸馏链不可用，回落 ORT 重链")
-        M9OrtFallback.run(app, jpeg)?.let { return it }
+        if (distillSkipHeavy()) {
+            DiagLog.w("Engine", "M9D 蒸馏链 ${M9Distill.lastFail}，跳过 ORT 重链")
+        } else {
+            DiagLog.w("Engine", "M9D 蒸馏链不可用，回落 ORT 重链")
+            M9OrtFallback.run(app, jpeg)?.let { return it }
+        }
         DiagLog.w("Engine", "M9D 降级纯 LUT")
         onFallback?.invoke(Style.M9D)
         return MadridLegendary.process(app, jpeg, "M9")
@@ -278,14 +301,17 @@ object LeicaEngine {
             return boostSaturationContrast(it, M9P_BOOST_SATURATION, M9P_BOOST_CONTRAST, M9P_BOOST_WARM)
         }
         // 降级 1.5：ORT 神经网络降级链 + M9P 暖调参数 + 同款色彩后推（保持激进语义）
-        M9OrtFallback.run(app, jpeg, LegendaryPostProcessor.M9P_DENOISE,
-            LegendaryPostProcessor.M9P_EV, LegendaryPostProcessor.M9P_WARMTH)?.let {
-            DiagLog.w("Engine", "M9P ORT 降级链接管")
-            return boostSaturationContrast(it, M9P_BOOST_SATURATION, M9P_BOOST_CONTRAST, M9P_BOOST_WARM)
+        if (distillSkipHeavy()) {
+            DiagLog.w("Engine", "M9P 蒸馏链 ${M9Distill.lastFail}，跳过 ORT 重链")
+        } else {
+            M9OrtFallback.run(app, jpeg, LegendaryPostProcessor.M9P_DENOISE,
+                LegendaryPostProcessor.M9P_EV, LegendaryPostProcessor.M9P_WARMTH)?.let {
+                DiagLog.w("Engine", "M9P ORT 降级链接管")
+                return boostSaturationContrast(it, M9P_BOOST_SATURATION, M9P_BOOST_CONTRAST, M9P_BOOST_WARM)
+            }
         }
         // 降级 2：纯 M9 LUT + 同款色彩后推
-        DiagLog.w("Engine", "M9P 降级纯 LUT (allowCpuFallback=$allowCpuFallback)")
-        diagNative()
+        DiagLog.w("Engine", "M9P 降级纯 LUT (allowCpuFallback=$allowCpuFallback)${cpuNote()}")
         onFallback?.invoke(Style.M9P)
         val lut = MadridLegendary.process(app, jpeg, "M9")
         return boostSaturationContrast(lut, M9P_BOOST_SATURATION, M9P_BOOST_CONTRAST, M9P_BOOST_WARM)
@@ -351,14 +377,17 @@ object LeicaEngine {
                 return MadridShader.applyToJpeg(it, 0.3f)
             }
             // 降级 1.5：ORT 神经网络降级链（m10r 暖调 bin）+ 暗角
-            M9OrtFallback.run(app, lut, 0.6f, -0.95f, 0.3f,
-                warmBin = "leica_filter_param_m10r_snapshot.bin")?.let {
-                DiagLog.w("Engine", "M10R ORT 降级链接管")
-                return MadridShader.applyToJpeg(it, 0.3f)
+            if (distillSkipHeavy()) {
+                DiagLog.w("Engine", "M10R 蒸馏链 ${M9Distill.lastFail}，跳过 ORT 重链")
+            } else {
+                M9OrtFallback.run(app, lut, 0.6f, -0.95f, 0.3f,
+                    warmBin = "leica_filter_param_m10r_snapshot.bin")?.let {
+                    DiagLog.w("Engine", "M10R ORT 降级链接管")
+                    return MadridShader.applyToJpeg(it, 0.3f)
+                }
             }
             // 降级 2：纯 LUT + 暗角
-            DiagLog.w("Engine", "M10R 降级纯 LUT+暗角 (allowCpuFallback=$allowCpuFallback)")
-            diagNative()
+            DiagLog.w("Engine", "M10R 降级纯 LUT+暗角 (allowCpuFallback=$allowCpuFallback)${cpuNote()}")
             onFallback?.invoke(Style.M10R)
         }
         // 3. 暗角 + 颗粒
@@ -366,33 +395,13 @@ object LeicaEngine {
     }
 
     /**
-     * 降级死因自动取证：抓系统 logcat 里 native 引擎（mage/Styletrans/Qnn/MIALGO）与
-     * CPU 链（M9CPU exit=…）的最近报错，收进 DiagLog 环形缓冲——用户长按标题导出的
-     * 常规日志即自带死因，无需任何额外操作。异常静默（取证失败不影响降级输出）。
+     * 降级附注：CPU 补丁链最近一次的状态首行（exit=… / decode fail / 空）。
+     * 原先由 diagNative() 去抓系统 logcat（需 READ_LOGS，分享版不申请该权限），
+     * 现改为直接取进程内 M9CpuFallback.lastStatus，信息等价且零权限、零开销。
      */
-    private fun diagNative() {
-        try {
-            val lc = ProcessBuilder("logcat", "-d", "-t", "1200").start()
-            val text = lc.inputStream.bufferedReader().use { it.readText() }
-            lc.waitFor()
-            val excerpt = text.lineSequence()
-                .filter {
-                    // "mage" 必须大小写敏感：不敏感会命中所有 "Image"（Skia/HWUI 噪声），
-                    // 挤占 takeLast(40) 配额，把 Qnn/MAGE 真死因挤出摘录
-                    it.contains("Mage") || it.contains("MAGE") ||
-                            it.contains("Styletrans", true) ||
-                            it.contains("DIPS") || it.contains("Qnn", true) ||
-                            it.contains("MIALGO", true) || it.contains("M9CPU")
-                }
-                .filter { !it.contains("Image decoding logging dropped") }
-                .toList()
-                .takeLast(40)
-                .joinToString("\n")
-                .take(2000)
-            if (excerpt.isNotBlank()) DiagLog.w("M9CPU", excerpt)
-        } catch (t: Throwable) {
-            DiagLog.e("M9CPU", "logcat 取证失败: ${t.message}", null)
-        }
+    private fun cpuNote(): String {
+        val st = M9CpuFallback.lastStatus?.lineSequence()?.firstOrNull()?.trim()
+        return if (st.isNullOrEmpty()) "" else " cpu=$st"
     }
 
     private fun processM4(app: Context, jpeg: ByteArray, onFallback: ((Style) -> Unit)?): ByteArray {

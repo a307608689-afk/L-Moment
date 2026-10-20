@@ -2,7 +2,6 @@ package com.leicamoments.app
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.util.Log
 import java.io.ByteArrayOutputStream
 
 /**
@@ -43,7 +42,7 @@ object M3Mono {
         const val GRAY_MEAN_CHROMA = 2.5f
     }
 
-    /** 最近一次运行的诊断信息（logcat/黑匣子用） */
+    /** 最近一次运行的诊断信息（诊断日志/黑匣子用） */
     @Volatile
     var lastInfo: String? = null
         private set
@@ -84,7 +83,7 @@ object M3Mono {
 
                 if (mean <= Params.GRAY_MEAN_CHROMA) {
                     lastInfo = "sample=$sample ${w}x$h meanChroma=$mean -> 已灰度跳过"
-                    Log.d(TAG, lastInfo!!)
+                    DiagLog.i(TAG, lastInfo!!)
                     b.recycle()
                     return jpeg   // 已是黑白（monopan 成功），原样返回
                 }
@@ -107,7 +106,7 @@ object M3Mono {
                     .take(3)
                     .joinToString(" | ")
                 val info = "exception ${t.javaClass.simpleName}: ${t.message} @ $stackTop (sample=$sample)"
-                Log.w(TAG, info)
+                DiagLog.w(TAG, info)
                 if (sample >= 4) {
                     lastInfo = info
                     return jpeg

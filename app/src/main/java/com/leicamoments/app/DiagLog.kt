@@ -44,8 +44,16 @@ object DiagLog {
         }
     }
 
+    // @JvmStatic：Java 侧（AlexaLut / StyleA 等 native 助手类）可直接 DiagLog.i(...)
+    @JvmStatic
     fun i(tag: String, msg: String) = write("I", tag, msg, null)
-    fun w(tag: String, msg: String) = write("W", tag, msg, null)
+
+    @JvmStatic
+    @JvmOverloads
+    fun w(tag: String, msg: String, tr: Throwable? = null) = write("W", tag, msg, tr)
+
+    @JvmStatic
+    @JvmOverloads
     fun e(tag: String, msg: String, tr: Throwable? = null) = write("E", tag, msg, tr)
 
     private fun write(level: String, tag: String, msg: String, tr: Throwable?) {

@@ -273,6 +273,17 @@ public final class LegendaryPostProcessor {
      */
     public static Bitmap applyWarmLutBitmapBin(Context ctx, Bitmap in, String binAsset,
                                                float denoise, float ev, float warmth) {
+        return applyWarmLutBitmapBinAt(ctx, in, binAsset, denoise, ev, warmth,
+                SystemClock.uptimeMillis() % 60000L);
+    }
+
+    /**
+     * 同 {@link #applyWarmLutBitmapBin(Context, Bitmap, String, float, float, float)}，
+     * 但由调用方固定 native 的 time 参数。条带导出必须逐带传同一个 time（整图链只调用一次），
+     * 否则带间可能因 time 不同产生色调跳变。
+     */
+    public static Bitmap applyWarmLutBitmapBinAt(Context ctx, Bitmap in, String binAsset,
+                                                 float denoise, float ev, float warmth, float time) {
         ensureModels(ctx);
         if (!modelsReady) return null;
         Bitmap bmp = null;
@@ -282,7 +293,6 @@ public final class LegendaryPostProcessor {
             bmp = in.isMutable() ? in : in.copy(Bitmap.Config.ARGB_8888, true);
 
             float lux = 200f, cct = 5500f, zoom = 1f;
-            float time = SystemClock.uptimeMillis() % 60000L;
             boolean ok = applyWarmOriginalFilter(bmp, bin, lux, cct, zoom, time,
                     denoise, ev, warmth);
             if (!ok) {

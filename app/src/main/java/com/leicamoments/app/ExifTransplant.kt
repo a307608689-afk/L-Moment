@@ -145,15 +145,9 @@ object ExifTransplant {
         ExifInterface.TAG_GPS_DEST_DISTANCE,
     )
 
-    /**
-     * 把 [srcBytes]（HEIF/JPEG 等 ExifInterface 可解析的容器）的 EXIF 写进 [dstJpeg]。
-     *
-     * @param orientation 写入的 Orientation 值。调用方经 [ImageUtils.resolveWorkOrientation]
-     *   判定：像素已被摆正时写 "1"（否则查看器二次旋转），方向未被应用时沿用源值。
-     * @return 带 EXIF 的新 JPEG 字节；源无 EXIF 或任何失败时返回 [dstJpeg] 原样。
-     */
-    fun copy(context: Context, srcBytes: ByteArray, dstJpeg: ByteArray, orientation: String = "1"): ByteArray {
-        val picked = try {
+    /** 读取源容器的可抄 EXIF 字段；读不到返回 null（区别于「读到了但没有字段」的空表）。 */
+    private fun pick(srcBytes: ByteArray): Map<String, String>? {
+        return try {
             val src = ExifInterface(ByteArrayInputStream(srcBytes))
             val m = LinkedHashMap<String, String>()
             for (tag in TAGS) {
@@ -166,7 +160,54 @@ object ExifTransplant {
             }
             m
         } catch (t: Throwable) {
-            DiagLog.i("Exif", "源 EXIF 不可读（${t.javaClass.simpleName}），跳过抄写")
+            DiagLog.i("Exif", "源 EXIF 不可读（${t.javaClass.simpleName}）")
+            null
+        }
+    }
+
+    /**
+     * 原地回填：把 [srcHeader]（源容器头部字节，仅需含 APP1）的 EXIF 写进 [jpegFile]。
+     *
+     * 用于 200MP 全像素直通导出——此时主图 60MB 级字节已在磁盘上，
+     * 走 [copy] 的「读进内存 + 写临时文件 + 读回」会多付两次整幅拷贝。
+     *
+     * @return 是否完成回填（失败时文件保持原样）。
+     */
+    fun copyInPlace(
+        context: Context,
+        srcHeader: ByteArray,
+        jpegFile: File,
+        orientation: String = "1"
+    ): Boolean {
+        val picked = pick(srcHeader) ?: return false
+        if (picked.isEmpty()) {
+            DiagLog.i("Exif", "源容器无可抄 EXIF 字段（原地），跳过抄写")
+            return false
+        }
+        return try {
+            val dst = ExifInterface(jpegFile.absolutePath)
+            for ((tag, value) in picked) dst.setAttribute(tag, value)
+            dst.setAttribute(ExifInterface.TAG_ORIENTATION, orientation)
+            dst.saveAttributes()
+            DiagLog.i("Exif", "原地抄写 ${picked.size} 项 ori=$orientation " +
+                "model=${picked[ExifInterface.TAG_MODEL] ?: "-"}")
+            true
+        } catch (t: Throwable) {
+            DiagLog.w("Exif", "EXIF 原地抄写失败，保留原文件：${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 把 [srcBytes]（HEIF/JPEG 等 ExifInterface 可解析的容器）的 EXIF 写进 [dstJpeg]。
+     *
+     * @param orientation 写入的 Orientation 值。调用方经 [ImageUtils.resolveWorkOrientation]
+     *   判定：像素已被摆正时写 "1"（否则查看器二次旋转），方向未被应用时沿用源值。
+     * @return 带 EXIF 的新 JPEG 字节；源无 EXIF 或任何失败时返回 [dstJpeg] 原样。
+     */
+    fun copy(context: Context, srcBytes: ByteArray, dstJpeg: ByteArray, orientation: String = "1"): ByteArray {
+        val picked = pick(srcBytes) ?: run {
+            DiagLog.i("Exif", "源 EXIF 不可读，跳过抄写")
             return dstJpeg
         }
         if (picked.isEmpty()) {

@@ -4,7 +4,8 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ColorSpace;
-import android.util.Log;
+
+import com.leicamoments.app.DiagLog;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -108,10 +109,10 @@ public final class StyleA {
             StyleA p = decode(bytes);
             if (p == null) return null;
             CACHE.put(ref, p);
-            Log.i(TAG, "loaded " + ref + " nodes=" + p.nodes + " " + bytes.length + "B");
+            DiagLog.i(TAG, "loaded " + ref + " nodes=" + p.nodes + " " + bytes.length + "B");
             return p;
         } catch (Throwable t) {
-            Log.w(TAG, "load failed " + ref, t);
+            DiagLog.e(TAG, "load failed " + ref, t);
             return null;
         }
     }
@@ -185,7 +186,7 @@ public final class StyleA {
         if (ver != VER || nodes < 2 || nodes > 4096) return null;
         int need = 12 + 36 + 12 + 12 * nodes * 2;
         if (s.length != need) {
-            Log.w(TAG, "bad length " + s.length + " != " + need);
+            DiagLog.w(TAG, "bad length " + s.length + " != " + need);
             return null;
         }
         StyleA p = new StyleA(nodes);
@@ -343,7 +344,7 @@ public final class StyleA {
     public static byte[] process(Context ctx, byte[] jpeg, String ref) {
         StyleA p = ensureLoaded(ctx, ref);
         if (p == null) {
-            Log.w(TAG, "params unavailable ref=" + ref + "（降级为原图）");
+            DiagLog.w(TAG, "params unavailable ref=" + ref + "（降级为原图）");
             return jpeg;
         }
         long t0 = System.currentTimeMillis();
@@ -358,20 +359,16 @@ public final class StyleA {
             int w = bmp.getWidth(), h = bmp.getHeight();
             int[] px = new int[w * h];
             bmp.getPixels(px, 0, w, 0, 0, w, h);
-            int mid = (h / 2) * w + (w / 2);
-            int probeIn = px[mid];
             p.applyPx(px, w, h);
-            Log.i(TAG, "probe " + Integer.toHexString(probeIn) + " -> "
-                    + Integer.toHexString(px[mid]) + " @mid " + w + "x" + h);
             bmp.setPixels(px, 0, w, 0, 0, w, h);
             ByteArrayOutputStream bos = new ByteArrayOutputStream(jpeg.length);
             bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos);
             byte[] ret = MadridLegendary.copyExif(jpeg, bos.toByteArray());
-            Log.i(TAG, "ok ref=" + ref + " " + w + "x" + h + " "
+            DiagLog.i(TAG, "ok ref=" + ref + " " + w + "x" + h + " "
                     + (System.currentTimeMillis() - t0) + "ms out=" + ret.length + "B");
             return ret;
         } catch (Throwable t) {
-            Log.w(TAG, "process failed ref=" + ref + "（降级为原图）", t);
+            DiagLog.e(TAG, "process failed ref=" + ref + "（降级为原图）", t);
             return jpeg;
         } finally {
             if (bmp != null) bmp.recycle();

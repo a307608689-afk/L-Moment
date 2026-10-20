@@ -19,6 +19,6 @@ object SuperResConfig {
     /** 推理线程数（0=ORT 默认全核；ARM 大小核建议试 4） */
     const val INTRA_OP_THREADS = 4
 
-    /** 逐 tile 耗时打点（LogCat: SuperRes） */
+    /** 逐 tile 耗时打点（诊断日志: SuperRes） */
     const val LOG_TILE_TIMING = true
 }

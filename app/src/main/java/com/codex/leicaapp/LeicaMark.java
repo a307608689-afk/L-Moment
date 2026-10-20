@@ -1,6 +1,10 @@
 package com.codex.leicaapp;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
@@ -646,5 +650,144 @@ public final class LeicaMark {
             int k = le ? i : len - 1 - i;
             b[k + off] = (byte) (v >>> (i * 8));
         }
+    }
+
+    // ---- 文件级写入（200MP 全像素直通导出用）----
+
+    /**
+     * 对落盘 JPEG 原地写入相机标记，**不把整幅图像读进 Java 堆**。
+     *
+     * <p>本类的所有段改写（删 XMP/MPF/ISO、替换 EXIF APP1、追加 FFE4）都只在容器头
+     * （SOI..SOS 段）里发生，熵编码数据只是原样后移。因此这里把容器头读成小数组走
+     * {@link #mark(byte[])}，再把原文件 SOS 之后的字节流搬运到新文件，最后替换原文件。</p>
+     *
+     * @return 是否写成功（失败时原文件保持不变）
+     */
+    public static boolean markFile(File file) {
+        return markFile(file, null);
+    }
+
+    /**
+     * 同上，附带 ICC 色彩档案段（§22 P1）。
+     *
+     * <p>ICC 注入与徽章改写合并成<b>同一次</b>文件重写，不额外搬运一遍熵编码数据。</p>
+     *
+     * @param iccBlocks 源图的 APP2/ICC_PROFILE 段（含段头，可能多段）；null/空 = 不处理
+     */
+    public static boolean markFile(File file, byte[] iccBlocks) {
+        if (file == null || !file.isFile() || file.length() < 4) return false;
+        File tmp = null;
+        RandomAccessFile in = null;
+        FileOutputStream out = null;
+        try {
+            byte[] header = readHeader(file);
+            if (header == null) return false;
+            byte[] marked = mark(header);
+            if (marked == null || marked.length < 4) return false;
+            if (iccBlocks != null && iccBlocks.length > 0) {
+                marked = IccProfile.embed(marked, iccBlocks);
+            }
+            if (marked == header) return true; // 无需改写
+
+            tmp = new File(file.getAbsoluteFile().getParentFile(),
+                    file.getName() + ".mk" + System.nanoTime());
+            in = new RandomAccessFile(file, "r");
+            in.seek(header.length); // 容器头之后 = 熵编码起点
+            out = new FileOutputStream(tmp);
+            out.write(marked, 0, marked.length);
+            byte[] buf = new byte[256 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.flush();
+            out.close();
+            out = null;
+            in.close();
+            in = null;
+
+            if (tmp.renameTo(file)) {
+                tmp = null;
+                return true;
+            }
+            // 同目录 rename 失败（极少见）：流式覆盖原文件
+            FileInputStream fis = new FileInputStream(tmp);
+            try {
+                FileOutputStream fos = new FileOutputStream(file);
+                try {
+                    while ((n = fis.read(buf)) > 0) fos.write(buf, 0, n);
+                    fos.flush();
+                } finally {
+                    fos.close();
+                }
+            } finally {
+                fis.close();
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            if (out != null) {
+                try {
+                    out.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (tmp != null) {
+                try {
+                    tmp.delete();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    /** 读容器头：SOI 起至 SOS 段末（含 SOS 段头，不含熵编码数据）。失败返回 null。 */
+    private static byte[] readHeader(File file) {
+        long total = file.length();
+        if (total < 4) return null;
+        int cap = (int) Math.min(total, 4L * 1024 * 1024);
+        byte[] buf = new byte[cap];
+        int read = 0;
+        try {
+            FileInputStream ins = new FileInputStream(file);
+            try {
+                while (read < cap) {
+                    int n = ins.read(buf, read, cap - read);
+                    if (n <= 0) break;
+                    read += n;
+                }
+            } finally {
+                ins.close();
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        if (read < 4 || (buf[0] & 0xFF) != 0xFF || (buf[1] & 0xFF) != 0xD8) return null;
+        int p = 2;
+        while (p + 3 < read) {
+            if ((buf[p] & 0xFF) != 0xFF) return null;
+            int m = p + 1;
+            while (m < read && (buf[m] & 0xFF) == 0xFF) m++;
+            if (m >= read) return null;
+            int marker = buf[m] & 0xFF;
+            if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+                p = m + 1;
+                continue;
+            }
+            if (marker == 0xD9) return Arrays.copyOf(buf, m + 1);
+            if (m + 2 >= read) return null;
+            int segLen = ((buf[m + 1] & 0xFF) << 8) | (buf[m + 2] & 0xFF);
+            if (segLen < 2) return null;
+            int end = m + 1 + segLen;
+            if (end > read) return null;
+            if (marker == 0xDA) return Arrays.copyOf(buf, end);
+            p = end;
+        }
+        return null;
     }
 }
