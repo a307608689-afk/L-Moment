@@ -15,6 +15,9 @@ hs_err_pid*
 # ---- 私有工作区（不公开）----
 /OPEN_SOURCE_SAFETY.md
 /*_work/
+/_acceptance/
+/_flat_report.txt
+/fullres_check/
 /backup/
 /design/
 /docs/
@@ -61,7 +64,7 @@ hs_err_pid*
 *.gif
 *.webp
 
-# ---- 自产资产白名单（15 个，全部可再分发）----
+# ---- 自产资产白名单（22 个，全部可再分发）----
 !app/src/main/assets/lut_alexa.bin
 !app/src/main/assets/lut_p9vibrant.bin
 !app/src/main/assets/lut_arri709.bin
@@ -69,6 +72,11 @@ hs_err_pid*
 !app/src/main/assets/lut_arridune.bin
 !app/src/main/assets/lut_arrilala.bin
 !app/src/main/assets/lut_arrijoker.bin
+!app/src/main/assets/lut_fuji_acros.bin
+!app/src/main/assets/lut_fuji_chrome.bin
+!app/src/main/assets/lut_fuji_cneg.bin
+!app/src/main/assets/lut_fuji_nn.bin
+!app/src/main/assets/lut_fuji_pnh.bin
 !app/src/main/assets/styleA_s0.bin
 !app/src/main/assets/styleA_s1.bin
 !app/src/main/assets/styleA_s2.bin
@@ -77,3 +85,5 @@ hs_err_pid*
 !app/src/main/assets/styleA_s5.bin
 !app/src/main/assets/m9_distill.onnx
 !app/src/main/assets/lm9_net.onnx
+!app/src/main/assets/m7_stage1.onnx
+!app/src/main/assets/m7_stage2.onnx

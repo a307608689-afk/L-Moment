@@ -118,20 +118,21 @@ object HdrGainMap {
             }
             probe.recycle()
 
-            // ---- 元数据：优先主图 XMP hdrgm（log2 域），缺失时回退增益图自身 XMP，再缺失用规范缺省 ----
-            if (xmpXml == null) {
-                forEachSegment(sec) { s ->
-                    if (s.marker == 0xE1 && startsWith(s, XMP_NS.toByteArray())) {
-                        xmpXml = String(s.src, s.dataStart, s.dataLength, Charsets.UTF_8)
-                        true
-                    } else false
-                }
+            // ---- 元数据：主图 XMP 优先、增益图自身 XMP 兜底；**逐个属性回退** ----
+            // 平台编码器（Android 14+ / 厂商相机）常只在增益图的 XMP 里写 Min/Max/Gamma/Offset，
+            // 主图 XMP 仅有 Container 目录 + hdrgm:Version，逐属性回退才能拿到真实区间。
+            var secXmp: String? = null
+            forEachSegment(sec) { s ->
+                if (s.marker == 0xE1 && startsWith(s, XMP_NS.toByteArray())) {
+                    secXmp = String(s.src, s.dataStart, s.dataLength, Charsets.UTF_8)
+                    true
+                } else false
             }
+            if (xmpXml == null) xmpXml = secXmp
             val xml = xmpXml
-            fun attr(name: String): String? = xml?.let { s ->
-                Regex("$name\\s*=\\s*[\"']([^\"']*)[\"']").find(s)?.groupValues?.get(1)?.trim()
-                    ?.takeIf { it.isNotEmpty() }
-            }
+            val secXml = secXmp
+            fun attr(name: String): String? =
+                matchXmpAttr(xml, name) ?: matchXmpAttr(secXml, name)
             val maxL2 = sanitizeLog2(attr("hdrgm:GainMapMax") ?: attr("hdrgm:GainMapMAX"), "1.0")
             val minL2 = sanitizeLog2(attr("hdrgm:GainMapMin"), "0.0")
             val capMax = sanitizeLog2(attr("hdrgm:HDRCapacityMax"), maxL2)
@@ -689,6 +690,13 @@ object HdrGainMap {
         return -1
     }
 
+    /** 从 XMP 字符串里取某个属性（如 hdrgm:GainMapMax）的引号内容 */
+    private fun matchXmpAttr(xml: String?, name: String): String? {
+        if (xml == null) return null
+        return Regex("$name\\s*=\\s*[\"']([^\"']*)[\"']").find(xml)?.groupValues?.get(1)?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
     /** XMP 命名空间与属性名清单（容器路径徽章取证：看原图 XMP 里有哪些字段会被我们丢弃） */
     private fun xmpFieldSummary(xml: String?): String {
         if (xml.isNullOrEmpty()) return "无"
@@ -786,5 +794,303 @@ object HdrGainMap {
     private fun sanitizeLinear(v: String?, fallback: String): String {
         val f = v?.toFloatOrNull() ?: return fallback
         return if (f.isNaN() || f < 0f || f > 1f) fallback else v!!
+    }
+
+    // ================= C3：增益图重标定（色调变更后重新标定 HDR 增益） =================
+
+    /**
+     * 总开关。false 时三个 rebake* 一律返回 null，调用方沿用源增益图 = C1（原图直通）语义，
+     * 用于 A/B 对照与线上回退。
+     */
+    const val REBAKE_ENABLED = true
+
+    /** sRGB 编码值 → 线性光（256 级查表；逐像素 pow 太贵） */
+    private val SRGB_TO_LINEAR = FloatArray(256) { i ->
+        val v = i / 255f
+        if (v <= 0.04045f) v / 12.92f
+        else Math.pow(((v + 0.055f) / 1.055f).toDouble(), 2.4).toFloat()
+    }
+
+    /** 增益图解码后的（log2）取值范围下限，低于它就认为元数据退化、不值得重标定 */
+    private const val MIN_LOG2_SPAN = 0.02f
+
+    /** 区间重估上限：最多把增益上限再抬 3 EV（相对原区间），避免风格压黑过度时比值失控 */
+    private const val MAX_EXPAND_LOG2 = 3.0f
+
+    /** 区间重估下限：最多把增益下限再降 2 EV（提亮型风格 HDR 相对更暗时用得上） */
+    private const val MAX_SHRINK_LOG2 = 2.0f
+
+    /**
+     * 区间总跨度护栏：[outMin, outMax] 的绝对跨度不超过 5 EV（ratioMax ≤ 32）。
+     * 源区间本身更宽时以源区间为准（不压缩，避免削顶）。实测样张最大 4.31 EV，
+     * 护栏只防极端风格（大面积压黑）把 ratioMax 推到平台 gainmap 不合理区间。
+     */
+    private const val MAX_TOTAL_SPAN_LOG2 = 5.0f
+
+    /** 需求增益直方图：[-2, +10] EV，步长 0.02 EV */
+    private const val HIST_LO = -2.0f
+    private const val HIST_STEP = 0.02f
+    private const val HIST_BINS = 600
+
+    /**
+     * C3 重标定（字节版）。[oldSdrJpeg] = 导入时的原始 SDR 主图（增益图的分母来源），
+     * [newSdrJpeg] = 套过色调的成品 SDR。返回新的 [HdrData]：几何不变，增益区间按
+     * 实测需求重估（原区间不够时向外扩，见 [MAX_EXPAND_LOG2]/[MAX_SHRINK_LOG2]）；
+     * 输入不可解、无增益图、范围退化或异常时返回 null，调用方应回落到旧增益图。
+     */
+    fun rebakeJpeg(oldSdrJpeg: ByteArray, newSdrJpeg: ByteArray, data: HdrData): HdrData? {
+        if (!REBAKE_ENABLED) return null
+        return try {
+            val gm = decodeGainBitmap(data.gainmapJpeg) ?: return null
+            val gw = gm.width
+            val gh = gm.height
+            val oldBmp = decodeScaledBytes(oldSdrJpeg, gw, gh)
+            val newBmp = decodeScaledBytes(newSdrJpeg, gw, gh)
+            if (oldBmp == null || newBmp == null) {
+                DiagLog.w("HdrGainMap", "重标定跳过：SDR 解码失败 old=${oldBmp != null} new=${newBmp != null}")
+                gm.recycle(); oldBmp?.recycle(); newBmp?.recycle()
+                return null
+            }
+            val out = rebakeCore(gm, oldBmp, newBmp, data)
+            gm.recycle(); oldBmp.recycle(); newBmp.recycle()
+            out
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "重标定异常：${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * C3 重标定（文件版）。用于全像素直通导出（源与成品都是磁盘上的大图）：
+     * [srcW]/[srcH] 是源主图尺寸，用来一次算出解码降采样倍率（避免对大图解码两遍取 bounds）。
+     */
+    fun rebakeFiles(srcFile: File, newFile: File, data: HdrData, srcW: Int, srcH: Int): HdrData? {
+        if (!REBAKE_ENABLED) return null
+        return try {
+            val gm = decodeGainBitmap(data.gainmapJpeg) ?: return null
+            val gw = gm.width
+            val gh = gm.height
+            val sample = sampleSizeFor(srcW, srcH, gw, gh)
+            val oldBmp = decodeScaledFile(srcFile, gw, gh, sample)
+            val newBmp = decodeScaledFile(newFile, gw, gh, sample)
+            if (oldBmp == null || newBmp == null) {
+                DiagLog.w("HdrGainMap", "重标定跳过：文件解码失败 sample=$sample")
+                gm.recycle(); oldBmp?.recycle(); newBmp?.recycle()
+                return null
+            }
+            val out = rebakeCore(gm, oldBmp, newBmp, data)
+            gm.recycle(); oldBmp.recycle(); newBmp.recycle()
+            out
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "重标定异常：${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 逐行重算增益图。规范模型（ISO 21496-1 / Adobe hdrgm 同构）：
+     *   L_hdr = (L_sdr + offSdr) * 2^g - offHdr
+     * 反解新 SDR 需要的增益：g' = log2((L_hdr + offHdr) / (L_sdr_new + offSdr))，
+     * 再按原 min/max 区间钳位并反算回 [0,255] 的像素值（gamma 逆变换）。
+     */
+    private fun rebakeCore(gain: Bitmap, oldSdr: Bitmap, newSdr: Bitmap, data: HdrData): HdrData? {
+        val t0 = System.currentTimeMillis()
+        val gw = gain.width
+        val gh = gain.height
+        val minL2 = data.minLog2.toFloatOrNull() ?: 0f
+        val maxL2 = data.maxLog2.toFloatOrNull() ?: 1f
+        val gamma = (data.gamma.toFloatOrNull() ?: 1f).coerceIn(0.2f, 5f)
+        val offSdr = data.offsetSdr.toFloatOrNull() ?: 0.015625f
+        val offHdr = data.offsetHdr.toFloatOrNull() ?: 0.015625f
+        val span = maxL2 - minL2
+        if (span < MIN_LOG2_SPAN) {
+            DiagLog.w("HdrGainMap", "重标定跳过：区间退化 min=$minL2 max=$maxL2")
+            return null
+        }
+        val gammaNeutral = Math.abs(gamma - 1f) < 1e-3f
+        val gRow = IntArray(gw)
+        val oRow = IntArray(gw)
+        val nRow = IntArray(gw)
+        val pRow = IntArray(gw)
+
+        // 第一遍：统计「还原原图 HDR 所需的增益 g2」分布，用于区间重估。
+        // 原图区间是为原 SDR 标定的，风格改变 SDR 影调后需求可能超出，
+        // 直接沿用旧区间会把大量像素钳在上下限（信息损失，HDR 还原不到位）。
+        val hist = IntArray(HIST_BINS)
+        var counted = 0L
+        for (y in 0 until gh) {
+            gain.getPixels(gRow, 0, gw, 0, y, gw, 1)
+            oldSdr.getPixels(oRow, 0, gw, 0, y, gw, 1)
+            newSdr.getPixels(nRow, 0, gw, 0, y, gw, 1)
+            for (x in 0 until gw) {
+                val lNew = SRGB_TO_LINEAR[lumaIndex(nRow[x])]
+                if (lNew <= 1e-6f) continue
+                val g2 = needGainLog2(gRow[x], oRow[x], lNew, minL2, span, gamma, offSdr, offHdr, gammaNeutral)
+                hist[histBin(g2)]++
+                counted++
+            }
+        }
+
+        var outMin = minL2
+        var outMax = maxL2
+        if (counted > 0) {
+            val needHigh = histQuantile(hist, counted, 0.995)
+            val needLow = histQuantile(hist, counted, 0.005)
+            outMax = Math.max(maxL2, needHigh).coerceAtMost(maxL2 + MAX_EXPAND_LOG2)
+            outMin = Math.min(minL2, needLow).coerceAtLeast(minL2 - MAX_SHRINK_LOG2)
+            // 总跨度护栏：至少保留源区间，再限制额外扩张后的绝对跨度
+            outMax = Math.min(outMax, Math.max(maxL2, outMin + MAX_TOTAL_SPAN_LOG2))
+            if (outMax - outMin < MIN_LOG2_SPAN) {
+                outMin = minL2
+                outMax = maxL2
+            }
+        }
+        val outSpan = outMax - outMin
+
+        // 第二遍：按重估后的区间编码
+        val out = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
+        var clippedHigh = 0L
+        var clippedLow = 0L
+        var dead = 0L
+        for (y in 0 until gh) {
+            gain.getPixels(gRow, 0, gw, 0, y, gw, 1)
+            oldSdr.getPixels(oRow, 0, gw, 0, y, gw, 1)
+            newSdr.getPixels(nRow, 0, gw, 0, y, gw, 1)
+            for (x in 0 until gw) {
+                val lNew = SRGB_TO_LINEAR[lumaIndex(nRow[x])]
+                val c: Float
+                if (lNew <= 1e-6f) {
+                    // 新 SDR 已压成纯黑：反解无解（分母为 0）。保留原增益（比值语义），
+                    // 此时还原值 ≈ offSdr*2^g-offHdr，既不会像取上限那样把 HDR 抬亮，
+                    // 也不会像取最小增益那样丢掉原图暗部残留。
+                    c = decodeGainLog2(gRow[x], minL2, span, gamma, gammaNeutral)
+                        .coerceIn(outMin, outMax)
+                    dead++
+                } else {
+                    val g2 = needGainLog2(gRow[x], oRow[x], lNew, minL2, span, gamma, offSdr, offHdr, gammaNeutral)
+                    if (g2 > outMax) {
+                        c = outMax
+                        clippedHigh++
+                    } else if (g2 < outMin) {
+                        c = outMin
+                        clippedLow++
+                    } else {
+                        c = g2
+                    }
+                }
+                val norm = ((c - outMin) / outSpan).coerceIn(0f, 1f)
+                val q = if (gammaNeutral) norm
+                else Math.pow(norm.toDouble(), gamma.toDouble()).toFloat()
+                val v = (q * 255f + 0.5f).toInt().coerceIn(0, 255)
+                pRow[x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            }
+            out.setPixels(pRow, 0, gw, 0, y, gw, 1)
+        }
+        val bos = ByteArrayOutputStream()
+        out.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+        out.recycle()
+        val bytes = bos.toByteArray()
+        val total = (gw.toLong() * gh).coerceAtLeast(1L)
+        val fMin = fmtLog2(outMin)
+        val fMax = fmtLog2(outMax)
+        DiagLog.i(
+            "HdrGainMap",
+            "增益图重标定 ${gw}x${gh} ${data.gainmapJpeg.size}B→${bytes.size}B " +
+                "区间[$minL2,$maxL2]→[$fMin,$fMax] 削顶 ${pct(clippedHigh, total)} " +
+                "负增益钳位 ${pct(clippedLow, total)} 压黑 ${pct(dead, total)} " +
+                "用时 ${System.currentTimeMillis() - t0}ms"
+        )
+        // 区间重估后必须同步写回 GainMapMin/Max 与 HDRCapacity，否则解码端仍按旧区间换算
+        return HdrData(
+            bytes, fMin, fMax, data.gamma,
+            data.offsetSdr, data.offsetHdr, data.capMinLog2, fMax, data.sourceXmp
+        )
+    }
+
+    /** 增益图像素 → 原区间下的增益（log2）。规范解码：去 gamma 后按 min/span 线性还原 */
+    private fun decodeGainLog2(
+        gp: Int, minL2: Float, span: Float, gamma: Float, gammaNeutral: Boolean
+    ): Float {
+        val gv = (((gp shr 16) and 0xFF) * 0.299f + ((gp shr 8) and 0xFF) * 0.587f +
+                (gp and 0xFF) * 0.114f) / 255f
+        // 增益图存的是「已加 gamma 的 0..1」，规范解码要开 1/gamma 次方
+        val p = if (gammaNeutral) gv else Math.pow(gv.toDouble(), 1.0 / gamma).toFloat()
+        return minL2 + span * p
+    }
+
+    /** 还原原图 HDR 所需的增益（log2），规范模型的逆运算 */
+    private fun needGainLog2(
+        gp: Int, op: Int, lNew: Float, minL2: Float, span: Float,
+        gamma: Float, offSdr: Float, offHdr: Float, gammaNeutral: Boolean
+    ): Float {
+        val log2Gain = decodeGainLog2(gp, minL2, span, gamma, gammaNeutral)
+        val lOld = SRGB_TO_LINEAR[lumaIndex(op)]
+        val hdr = (lOld + offSdr) * Math.pow(2.0, log2Gain.toDouble()).toFloat() - offHdr
+        return (Math.log(((hdr + offHdr).coerceAtLeast(1e-6f) / (lNew + offSdr)).toDouble()) / LN2).toFloat()
+    }
+
+    private fun histBin(g2: Float): Int =
+        (((g2 - HIST_LO) / HIST_STEP).toInt()).coerceIn(0, HIST_BINS - 1)
+
+    /** 直方图分位（返回该分位所在的 bin 中点，精度 ±HIST_STEP/2） */
+    private fun histQuantile(hist: IntArray, total: Long, q: Double): Float {
+        val target = (q * total).toLong()
+        var acc = 0L
+        for (i in hist.indices) {
+            acc += hist[i]
+            if (acc >= target) return HIST_LO + (i + 0.5f) * HIST_STEP
+        }
+        return HIST_LO + (HIST_BINS - 0.5f) * HIST_STEP
+    }
+
+    private fun fmtLog2(v: Float): String =
+        String.format(java.util.Locale.US, "%.5f", v)
+
+    private const val LN2 = 0.6931472
+
+    /** Rec.601 亮度，四舍五入的整数索引（0..255），用于查 [SRGB_TO_LINEAR] */
+    private fun lumaIndex(p: Int): Int {
+        val r = (p shr 16) and 0xFF
+        val g = (p shr 8) and 0xFF
+        val b = p and 0xFF
+        return ((299 * r + 587 * g + 114 * b + 500) / 1000).coerceIn(0, 255)
+    }
+
+    private fun pct(n: Long, total: Long): String =
+        String.format(java.util.Locale.US, "%.3f%%", n * 100.0 / total)
+
+    private fun decodeGainBitmap(jpeg: ByteArray): Bitmap? =
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+
+    /** 按「不小于目标尺寸」的 2 的幂降采样解码，再精确缩放到目标尺寸 */
+    private fun decodeScaledBytes(jpeg: ByteArray, tw: Int, th: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        val opt = BitmapFactory.Options().apply {
+            inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, tw, th)
+        }
+        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opt) ?: return null
+        return fitTo(bmp, tw, th)
+    }
+
+    private fun decodeScaledFile(file: File, tw: Int, th: Int, sample: Int): Bitmap? {
+        val opt = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bmp = BitmapFactory.decodeFile(file.absolutePath, opt) ?: return null
+        return fitTo(bmp, tw, th)
+    }
+
+    private fun fitTo(bmp: Bitmap, tw: Int, th: Int): Bitmap {
+        if (bmp.width == tw && bmp.height == th) return bmp
+        val scaled = Bitmap.createScaledBitmap(bmp, tw, th, true)
+        if (scaled !== bmp) bmp.recycle()
+        return scaled
+    }
+
+    /** 最大的 2 的幂降采样倍率，使降采样后仍不小于目标尺寸（上限 8，够覆盖 200MP） */
+    private fun sampleSizeFor(w: Int, h: Int, tw: Int, th: Int): Int {
+        var s = 1
+        while (s < 8 && w / (s * 2) >= tw && h / (s * 2) >= th) s *= 2
+        return s
     }
 }

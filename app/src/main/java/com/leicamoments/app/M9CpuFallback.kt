@@ -134,12 +134,11 @@ object M9CpuFallback {
             }
             val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             result.setPixels(outPixels, 0, w, 0, 0, w, h)
-            val bos = java.io.ByteArrayOutputStream()
-            result.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            val encoded = JpegEnc.encode(result)
             result.recycle()
             if (aligned !== bmp) aligned.recycle()
             // 回填源 EXIF（机型/拍摄参数/GPS），下游 applyToJpeg/applyWarmLut 才有可续传的 APP1 段
-            return com.codex.leicaapp.MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            return com.codex.leicaapp.MadridLegendary.copyExif(jpeg, encoded)
         } catch (t: Throwable) {
             DiagLog.e(TAG, "cpu chain failed", t)
             lastStatus = "exception: ${t.message}"

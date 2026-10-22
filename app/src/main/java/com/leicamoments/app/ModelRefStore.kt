@@ -68,6 +68,22 @@ internal object ModelRefStore {
     fun thumbFile(ctx: Context, styleId: String, index: Int): File? =
         jpg(ctx, styleId, index).takeIf { it.isFile }
 
+    /** M7.1：逐图风格指纹 e_i（n×36 fp32），供候选聚类。 */
+    fun embFile(ctx: Context, styleId: String): File = File(dir(ctx), "${styleId}_emb.bin")
+
+    fun saveEmb(ctx: Context, styleId: String, e: FloatArray): Boolean = runCatching {
+        val bb = java.nio.ByteBuffer.allocate(e.size * 4)
+        bb.asFloatBuffer().put(e)
+        embFile(ctx, styleId).writeBytes(bb.array())
+    }.isSuccess
+
+    fun loadEmb(ctx: Context, styleId: String): FloatArray? = runCatching {
+        val f = embFile(ctx, styleId)
+        if (!f.isFile) return@runCatching null
+        val bb = java.nio.ByteBuffer.wrap(f.readBytes())
+        FloatArray(bb.remaining() / 4) { bb.float }
+    }.getOrNull()
+
     /** 已落盘的缩略图数量（下标连续，遇到缺口即停；旧模型没有缩略图时为 0） */
     fun count(ctx: Context, styleId: String): Int {
         var i = 0

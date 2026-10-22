@@ -18,11 +18,11 @@ import java.nio.ByteBuffer
 import java.util.zip.CRC32
 
 /**
- * M9/M9+/M10R 全机型 ORT 降级链（OffLineM9 解密权重的 ONNX 移植）。
+ * M9/M9+/M10R 全机型 ORT 降级链（StyleTrans 网络的 ONNX 移植）。
  *
  * 定位：native styletrans（QNN/HTP）与 QNN CPU 补丁链都不可用的机型上的
- * "真 M9 神经网络"降级档——同一个 StyleTrans 网络（ESRGAN/RRDB 形态，
- * 权重自小米 17U ROM HTP 上下文解出），ORT CPU fp32 推理。
+ * "真 M9 神经网络"降级档——同一个 StyleTrans 网络（ESRGAN/RRDB 形态），
+ * ORT CPU fp32 推理。模型文件不随仓库分发，缺失时该档自动跳过并走下一级降级。
  *
  * 管线复刻 m9/styletrans.py（工作分辨率自适应版）：
  *   竖图转横 → fit 4096x3072 → 中心 pad(镜像)到最小 4:3 画布 → 缩 1024x768 → pad 48
@@ -92,12 +92,11 @@ object M9OrtFallback {
             val warmed = LegendaryPostProcessor.applyWarmLutBitmapBin(
                 app, work, warmBin, denoise, ev, warmth)
 
-            val bos = ByteArrayOutputStream(jpeg.size)
             val outBmp = warmed ?: work
-            outBmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            val encoded = JpegEnc.encode(outBmp)
             if (outBmp !== work) work.recycle()
             outBmp.recycle()
-            val out = MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            val out = MadridLegendary.copyExif(jpeg, encoded)
 
             DiagLog.w(TAG, "降级链完成 ${out.size}B, ${(System.currentTimeMillis() - t0)}ms")
             out

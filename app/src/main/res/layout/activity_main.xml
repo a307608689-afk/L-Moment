@@ -76,12 +76,11 @@
         android:layout_weight="1"
         android:background="#000000">
 
-        <ImageView
+        <com.leicamoments.app.ZoomableImageView
             android:id="@+id/imgPreview"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:contentDescription="预览"
-            android:scaleType="fitCenter" />
+            android:contentDescription="预览" />
 
         <TextView
             android:id="@+id/txtEmpty"
@@ -233,7 +232,7 @@
 
         </LinearLayout>
 
-        <!-- 调节浮层：点击「调节」向上展开，三个调节项各由胶囊包裹；再点收起 -->
+        <!-- 调节浮层：点击「调节」向上展开五档滑杆（拖动调档，双击标签复位到 0）；再点收起 -->
         <LinearLayout
             android:id="@+id/adjPanel"
             android:layout_width="wrap_content"
@@ -244,233 +243,377 @@
             android:orientation="vertical"
             android:visibility="gone">
 
-            <!-- 亮度步进器组（排最前） -->
+            <!-- 亮度滑杆组（排最前）：名称列统一 minWidth 44dp（=最宽名「黑色阶」），五行滑杆起止对齐；进度 0..20 ↔ 档位 -10..+10 -->
             <LinearLayout
-                android:layout_width="wrap_content"
+                android:layout_width="240dp"
                 android:layout_height="wrap_content"
                 android:background="@drawable/bg_pill"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingStart="10dp"
+                android:paddingStart="12dp"
                 android:paddingEnd="10dp"
-                android:paddingTop="6dp"
-                android:paddingBottom="6dp">
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
 
                 <TextView
-                    android:id="@+id/btnBrightMinus"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="−"
-                    android:textColor="#FFFFFF"
-                    android:textSize="13sp" />
-
-                <TextView
-                    android:id="@+id/txtBrightLevel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:minWidth="80dp"
-                    android:gravity="center"
-                    android:paddingStart="6dp"
-                    android:paddingEnd="6dp"
+                    android:minWidth="44dp"
                     android:text="亮度"
                     android:textColor="#FFFFFF"
                     android:textSize="13sp" />
 
-                <TextView
-                    android:id="@+id/btnBrightPlus"
-                    android:layout_width="wrap_content"
+                <SeekBar
+                    android:id="@+id/sbBright"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="+"
-                    android:textColor="#FFFFFF"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtBrightVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
                     android:textSize="13sp" />
 
             </LinearLayout>
 
+            <!-- 曝光滑杆组：同亮度组紧凑口径 -->
             <LinearLayout
-                android:layout_width="wrap_content"
+                android:layout_width="240dp"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:background="@drawable/bg_pill"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingStart="10dp"
+                android:paddingStart="12dp"
                 android:paddingEnd="10dp"
-                android:paddingTop="6dp"
-                android:paddingBottom="6dp">
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
 
                 <TextView
-                    android:id="@+id/btnLumMinus"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="−"
-                    android:textColor="#FFFFFF"
-                    android:textSize="13sp" />
-
-                <TextView
-                    android:id="@+id/txtLumLevel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:minWidth="80dp"
-                    android:gravity="center"
-                    android:paddingStart="6dp"
-                    android:paddingEnd="6dp"
+                    android:minWidth="44dp"
                     android:text="曝光"
                     android:textColor="#FFFFFF"
                     android:textSize="13sp" />
 
-                <TextView
-                    android:id="@+id/btnLumPlus"
-                    android:layout_width="wrap_content"
+                <SeekBar
+                    android:id="@+id/sbLum"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="+"
-                    android:textColor="#FFFFFF"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtLumVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
                     android:textSize="13sp" />
 
             </LinearLayout>
 
-            <!-- 高光步进器组（阴影前） -->
+            <!-- 高光滑杆组（阴影前）：同亮度组紧凑口径 -->
             <LinearLayout
-                android:layout_width="wrap_content"
+                android:layout_width="240dp"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:background="@drawable/bg_pill"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingStart="10dp"
+                android:paddingStart="12dp"
                 android:paddingEnd="10dp"
-                android:paddingTop="6dp"
-                android:paddingBottom="6dp">
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
 
                 <TextView
-                    android:id="@+id/btnHighMinus"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="−"
-                    android:textColor="#FFFFFF"
-                    android:textSize="13sp" />
-
-                <TextView
-                    android:id="@+id/txtHighLevel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:minWidth="80dp"
-                    android:gravity="center"
-                    android:paddingStart="6dp"
-                    android:paddingEnd="6dp"
+                    android:minWidth="44dp"
                     android:text="高光"
                     android:textColor="#FFFFFF"
                     android:textSize="13sp" />
 
-                <TextView
-                    android:id="@+id/btnHighPlus"
-                    android:layout_width="wrap_content"
+                <SeekBar
+                    android:id="@+id/sbHigh"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="+"
-                    android:textColor="#FFFFFF"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtHighVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
                     android:textSize="13sp" />
 
             </LinearLayout>
 
+            <!-- 阴影滑杆组：同亮度组紧凑口径 -->
             <LinearLayout
-                android:layout_width="wrap_content"
+                android:layout_width="240dp"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:background="@drawable/bg_pill"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingStart="10dp"
+                android:paddingStart="12dp"
                 android:paddingEnd="10dp"
-                android:paddingTop="6dp"
-                android:paddingBottom="6dp">
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
 
                 <TextView
-                    android:id="@+id/btnShadowMinus"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="−"
-                    android:textColor="#FFFFFF"
-                    android:textSize="13sp" />
-
-                <TextView
-                    android:id="@+id/txtShadowLevel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:minWidth="80dp"
-                    android:gravity="center"
-                    android:paddingStart="6dp"
-                    android:paddingEnd="6dp"
+                    android:minWidth="44dp"
                     android:text="阴影"
                     android:textColor="#FFFFFF"
                     android:textSize="13sp" />
 
-                <TextView
-                    android:id="@+id/btnShadowPlus"
-                    android:layout_width="wrap_content"
+                <SeekBar
+                    android:id="@+id/sbShadow"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="+"
-                    android:textColor="#FFFFFF"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtShadowVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
                     android:textSize="13sp" />
 
             </LinearLayout>
 
+            <!-- 黑色阶滑杆组：同亮度组紧凑口径 -->
             <LinearLayout
-                android:layout_width="wrap_content"
+                android:layout_width="240dp"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:background="@drawable/bg_pill"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingStart="10dp"
+                android:paddingStart="12dp"
                 android:paddingEnd="10dp"
-                android:paddingTop="6dp"
-                android:paddingBottom="6dp">
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
 
                 <TextView
-                    android:id="@+id/btnBlackMinus"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="−"
-                    android:textColor="#FFFFFF"
-                    android:textSize="13sp" />
-
-                <TextView
-                    android:id="@+id/txtBlackLevel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:minWidth="80dp"
-                    android:gravity="center"
-                    android:paddingStart="6dp"
-                    android:paddingEnd="6dp"
+                    android:minWidth="44dp"
                     android:text="黑色阶"
                     android:textColor="#FFFFFF"
                     android:textSize="13sp" />
 
+                <SeekBar
+                    android:id="@+id/sbBlack"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
                 <TextView
-                    android:id="@+id/btnBlackPlus"
+                    android:id="@+id/txtBlackVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+
+            </LinearLayout>
+
+            <!-- 饱和度滑杆组：同黑色阶组紧凑口径 -->
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingEnd="10dp"
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
+
+                <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minWidth="34dp"
-                    android:gravity="center"
-                    android:text="+"
+                    android:minWidth="44dp"
+                    android:text="饱和度"
                     android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbSat"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtSatVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+
+            </LinearLayout>
+
+            <!-- 对比度滑杆组：同黑色阶组紧凑口径 -->
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingEnd="10dp"
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="对比度"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbCon"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtConVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+
+            </LinearLayout>
+
+            <!-- 柔光（第八档）：正=Orton 柔雾，负=清晰化；进度 0..20 ↔ 档位 -10..+10 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingEnd="10dp"
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="柔光"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbGlow"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtGlowVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
                     android:textSize="13sp" />
 
             </LinearLayout>

@@ -128,6 +128,72 @@
         android:layout_marginTop="28dp"
         android:paddingStart="24dp"
         android:paddingEnd="24dp"
+        android:text="滤镜条"
+        android:textColor="#8E8E93"
+        android:textSize="13sp" />
+
+    <LinearLayout
+        android:id="@+id/rowPinnedCross"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_settings_row"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="置顶跨分类显示"
+            android:textColor="#E8E8EA"
+            android:textSize="15sp" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/txtPinnedCrossValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="关"
+            android:textColor="#8E8E93"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="›"
+            android:textColor="#5A5A5E"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:paddingStart="32dp"
+        android:paddingEnd="32dp"
+        android:text="关：置顶的色彩只出现在 L-Moment 与它所属的分类；开：在所有分类都排最前"
+        android:textColor="#5A5A5E"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="28dp"
+        android:paddingStart="24dp"
+        android:paddingEnd="24dp"
         android:text="RAW"
         android:textColor="#8E8E93"
         android:textSize="13sp" />
@@ -199,6 +265,63 @@
         android:textSize="13sp" />
 
     <LinearLayout
+        android:id="@+id/rowLeicaBadge"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_settings_row"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="徕卡徽章"
+            android:textColor="#E8E8EA"
+            android:textSize="15sp" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/txtLeicaBadgeValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="开"
+            android:textColor="#8E8E93"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="›"
+            android:textColor="#5A5A5E"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/txtLeicaBadgeHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:paddingStart="32dp"
+        android:paddingEnd="32dp"
+        android:text="开 = 导出写入徕卡识别元数据，相册显示「徕卡」徽章\n关 = 导出无徽章，并清除源图自带的徽章元数据\n机型、拍摄参数、GPS 等 EXIF 不受开关影响"
+        android:textColor="#5A5A5E"
+        android:textSize="12sp" />
+
+    <LinearLayout
         android:id="@+id/rowFullRes"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -251,7 +374,64 @@
         android:layout_marginTop="6dp"
         android:paddingStart="32dp"
         android:paddingEnd="32dp"
-        android:text="50MP / 200MP 的「原图」档按原始像素导出，耗时与内存更高；仅对之后导入的图片生效"
+        android:text="50MP / 200MP 图的最高导出像素：\n· 原图（不套滤镜）、LUT 色彩、M9+ / M10-R → 原始像素\n· M9、M9D → 约 2400 万（4240×5632，整图链无条带伪影）\n· SA、LP9、自定义 LUT → 1280 万（4096×3072）\n开关只对之后导入的图片生效；开启后耗时与内存更高"
+        android:textColor="#5A5A5E"
+        android:textSize="12sp" />
+
+    <LinearLayout
+        android:id="@+id/rowM9Hires"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_settings_row"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="M9 超高分辨率（50MP 档）"
+            android:textColor="#E8E8EA"
+            android:textSize="15sp" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/txtM9HiresValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="关"
+            android:textColor="#8E8E93"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="›"
+            android:textColor="#5A5A5E"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/txtM9HiresHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:paddingStart="32dp"
+        android:paddingEnd="32dp"
+        android:text="仅 M9 / M9D 生效：50MP 源零降采样、200MP 出 50MP（8192×6144），耗时约 20s；需先开启「全像素导出」，失败自动回落 24MP 档"
         android:textColor="#5A5A5E"
         android:textSize="12sp" />
 

@@ -21,6 +21,9 @@
         <activity
             android:name=".BatchTestActivity"
             android:exported="true" />
+        <activity
+            android:name=".CandidateTestActivity"
+            android:exported="true" />
     </application>
 
 </manifest>

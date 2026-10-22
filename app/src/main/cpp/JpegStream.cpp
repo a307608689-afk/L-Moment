@@ -21,6 +21,7 @@
  */
 
 #include <jni.h>
+#include <android/bitmap.h>
 #include <android/log.h>
 #include <new>
 #include <setjmp.h>
@@ -319,6 +320,86 @@ Java_com_leicamoments_app_JpegStream_nativeWriteBandDirect(JNIEnv *env, jclass,
     return -1;
   }
   return writeBandPixels(enc, (const unsigned char *)pixels, rows);
+}
+
+/*
+ * P3: one-shot in-memory encode of a whole Bitmap, forced 4:4:4.
+ *
+ * Android's Bitmap.compress() leaves libjpeg at its defaults, i.e. 4:2:0, which
+ * is what puts chroma blocks in dark areas and colour fringes on edges.  This
+ * entry point reads the pixels straight from the Bitmap (stride aware, no Java
+ * heap copy) and encodes with h/v_samp_factor = 1.
+ *
+ * Returns NULL on any failure; callers must fall back to Bitmap.compress.
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_com_leicamoments_app_JpegStream_nativeEncodeBitmap(JNIEnv *env, jclass,
+                                                       jobject jbitmap,
+                                                       jint quality) {
+  AndroidBitmapInfo info;
+  if (AndroidBitmap_getInfo(env, jbitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+    LOGE("bitmap info unavailable");
+    return NULL;
+  }
+  if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width == 0 || info.height == 0) {
+    LOGE("unsupported bitmap: format=%d %ux%u", info.format, info.width, info.height);
+    return NULL;
+  }
+  void *pixels = NULL;
+  if (AndroidBitmap_lockPixels(env, jbitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+      !pixels) {
+    LOGE("lockPixels failed");
+    return NULL;
+  }
+
+  /* Longjmp-safe: only POD locals below, and every buffer is freed on both paths. */
+  unsigned char *outBuf = NULL;
+  unsigned long outSize = 0;
+  struct jpeg_compress_struct cinfo;
+  LjtErrorMgr jerr;
+  cinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = ljt_error_exit;
+  jerr.pub.emit_message = ljt_emit_message;
+  if (setjmp(jerr.setjmp_buffer)) {
+    jpeg_destroy_compress(&cinfo);
+    if (outBuf) free(outBuf);
+    AndroidBitmap_unlockPixels(env, jbitmap);
+    return NULL;
+  }
+
+  jpeg_create_compress(&cinfo);
+  jpeg_mem_dest(&cinfo, &outBuf, &outSize);
+
+  cinfo.image_width = info.width;
+  cinfo.image_height = info.height;
+  cinfo.input_components = 4;
+  cinfo.in_color_space = JCS_EXT_RGBA;
+
+  jpeg_set_defaults(&cinfo);
+  jpeg_set_quality(&cinfo, quality, TRUE);
+  cinfo.comp_info[0].h_samp_factor = 1;
+  cinfo.comp_info[0].v_samp_factor = 1;
+  cinfo.optimize_coding = FALSE;
+  cinfo.dct_method = JDCT_ISLOW;
+
+  jpeg_start_compress(&cinfo, TRUE);
+  while (cinfo.next_scanline < cinfo.image_height) {
+    JSAMPROW row = (JSAMPROW)((unsigned char *)pixels +
+                              (size_t)cinfo.next_scanline * (size_t)info.stride);
+    jpeg_write_scanlines(&cinfo, &row, 1);
+  }
+  jpeg_finish_compress(&cinfo);
+  jpeg_destroy_compress(&cinfo);
+  AndroidBitmap_unlockPixels(env, jbitmap);
+
+  if (!outBuf || outSize == 0 || outSize > 0x7FFFFFFFUL) {
+    if (outBuf) free(outBuf);
+    return NULL;
+  }
+  jbyteArray arr = env->NewByteArray((jsize)outSize);
+  if (arr) env->SetByteArrayRegion(arr, 0, (jsize)outSize, (const jbyte *)outBuf);
+  free(outBuf);
+  return arr;
 }
 
 JNIEXPORT jint JNICALL

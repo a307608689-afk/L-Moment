@@ -110,11 +110,17 @@ object RefAnalyzer {
     /** 参考图像素下限：低于此值伪配对样本不足，分色相桶全靠个位数样本 */
     private const val MIN_PIXELS = 120_000
 
-    /** 硬截断（任一通道 ≥250 / 三通道全 ≤5）占比上限，超过即判不合格 */
-    private const val CLIP_REJECT = 0.30f
+    /**
+     * 硬截断（三通道全 ≥250 / 全 ≤5）占比拒绝线。
+     *
+     * 截断只损失对应亮度段的桶样本（64 桶的两端），中间桶由未截断像素撑起，
+     * 曲线另有单调钳制与 smooth1d(2.4)。30% 就硬拒会误杀大量夜景/剪影/浓色成片；
+     * 55% 之后影调段才可能真的无样本，此时拒绝比烘出坏表更诚实。
+     */
+    private const val CLIP_REJECT = 0.55f
 
-    /** 硬截断占比警戒线：通过但提示结果可能偏硬 */
-    private const val CLIP_WARN = 0.15f
+    /** 硬截断占比警戒线：与拒绝线保持一档间隔，通过但提示结果可能偏硬 */
+    private const val CLIP_WARN = 0.35f
 
     /** 单一色相占比警戒线：色彩复刻范围会被限制在参考图覆盖的色域内 */
     private const val MONO_WARN = 0.65f
@@ -190,13 +196,19 @@ object RefAnalyzer {
 
         val frac = neutralize(sr, sg, sb, n)
         // 中性像素太少 → 光源估计不可信（整幅纯色场景会把主体色当成光照色）。
-        // 直接判失败，让用户换一张带白墙/云/灰地面的成片，而不是静默产出偏色 LUT。
-        if (frac < 0.015f) {
+        // 但 neutralize 的 trust = frac/0.06：frac<0.03 时白平衡增益本就只施加不足一半，
+        // 属于天然「弱中和」。因此只在近乎无中性像素时才拒绝，0.5%~3% 放行并提示，
+        // 避免把夜景/剪影/浓色风光一刀切掉。
+        if (frac < 0.005f) {
             val msg = "参考图色彩过于单一（中性像素仅 ${(frac * 100f).toInt()}%），" +
                 "换一张带白墙 / 云 / 灰地面的成片"
             lastReject = msg
             DiagLog.w("Custom", msg)
             return null
+        }
+        if (frac < 0.03f) {
+            val msg = "参考图中性像素仅 ${(frac * 1000f).toInt() / 10f}%，白平衡按弱中和处理，风格可能偏淡。"
+            lastWarning = if (lastWarning == null) msg else lastWarning + msg
         }
         // M4：先算出感知哈希挂到 seed 上（去重 / 断点续跑用），算不出也不影响拟合
         val fp = fingerprintOf(px, w, h)

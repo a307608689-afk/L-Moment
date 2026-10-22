@@ -52,12 +52,19 @@ object LeicaEngine {
         LM9("LM9", "L-M9", "一瞬 M9 · CCD"),
         // M9「一体化蒸馏」微网（整个 M9 重链蒸馏成 0.64MB 学生网，全分辨率 512 分块直出）
         M9D("M9D", "M9 蒸馏", "一体化微网"),
+        // F-胶片家族：均为「assets 3D LUT 查表 + 颗粒/暗角」单链（fuji_bake.py 解析式烘焙）
+        FCHROME("FCHROME", "经典铬", "哑光纪实 · 低饱和硬调"),
+        FCNEG("FCNEG", "经典负片", "高对比 · 青影暖高"),
+        FNN("FNN", "怀旧负片", "琥珀暖调 · 柔和褪色"),
+        FPNH("FPNH", "人像负片·高", "人像高对比 · 肤色优先"),
+        FACROS("FACROS", "细腻黑白", "深黑细粒 · 平滑灰阶"),
         // A 路线：Lab 仿射 + 逐通道节点 LUT，参数由参考图闭式解出（无训练）
         SA("SA", "Style A", "闭式拟合 · 参考图直算");
 
         companion object {
             /** 仅「assets 3D LUT 查表」单链的风格：LUT 加载失败即输出原图。 */
-            private val LUT_ONLY = setOf(M4, LP9, A709, REVEAL, DUNE, LALALAND, JOKER)
+            private val LUT_ONLY = setOf(M4, LP9, A709, REVEAL, DUNE, LALALAND, JOKER,
+                FCHROME, FCNEG, FNN, FPNH, FACROS)
 
             /** CCD 家族（SepLUT 链路）：降级诊断走详情弹窗，其余档走 toast。 */
             private val CCD_FAMILY = setOf(M13, CCDP, CCDW)
@@ -108,6 +115,17 @@ object LeicaEngine {
             Style.LP9 -> processLP9(app, input, onFallback)
             Style.LM9 -> processLM9(app, input, onFallback, allowCpuFallback)
             Style.M9D -> processM9D(app, input, onFallback)
+            // F-胶片家族：复用 ARRI 单链（assets LUT 查表 + 颗粒/暗角），配方与 fuji_bake.py 对齐
+            Style.FCHROME -> processArriLut(app, input, Style.FCHROME,
+                AlexaLut.LUT_FUJI_CHROME, 0.14f, 0.55f, onFallback)
+            Style.FCNEG -> processArriLut(app, input, Style.FCNEG,
+                AlexaLut.LUT_FUJI_CNEG, 0.16f, 0.55f, onFallback)
+            Style.FNN -> processArriLut(app, input, Style.FNN,
+                AlexaLut.LUT_FUJI_NN, 0.12f, 0.45f, onFallback)
+            Style.FPNH -> processArriLut(app, input, Style.FPNH,
+                AlexaLut.LUT_FUJI_PNH, 0.10f, 0.40f, onFallback)
+            Style.FACROS -> processArriLut(app, input, Style.FACROS,
+                AlexaLut.LUT_FUJI_ACROS, 0.15f, 0.60f, onFallback)
             Style.SA -> processSA(app, input, onFallback)
         }
     }
@@ -347,10 +365,9 @@ object LeicaEngine {
             // 一次「解码→矩阵→编码」的重量化点：蒸馏链上游的抖色在这里会被抹掉，必须在
             // 编码前补一次（幅度 1.0 LSB，与 M9Distill 出口同口径）。
             Dither.tpdf(out, 1.0f)
-            val bos = java.io.ByteArrayOutputStream()
-            out.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            val encoded = JpegEnc.encode(out)
             out.recycle()
-            MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            MadridLegendary.copyExif(jpeg, encoded)
         } catch (t: Throwable) {
             DiagLog.e("Engine", "色彩后推失败，返回原字节", t)
             jpeg

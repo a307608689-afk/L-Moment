@@ -9,6 +9,9 @@
     <!-- 全像素导出：前台服务 + 部分唤醒锁，保证切后台/息屏后条带编码不被系统挂起 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 媒体位置：Android 10+ 无此权限时，系统从相册/选择器返回的图会剥掉 EXIF GPS；
+         授权后配合 MediaStore.setRequireOriginal 读取未脱敏原件，导出才能保留定位 -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
     <application
         android:allowBackup="true"

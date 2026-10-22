@@ -70,6 +70,8 @@ target_include_directories(jpegturbo PUBLIC ${LJT} ${CMAKE_SOURCE_DIR}/ljt-confi
 target_compile_options(jpegturbo PRIVATE -O3 -fPIC -fvisibility=hidden -w)
 
 # ---- JNI 封装共享库 ----
-add_library(rawdecoder SHARED RawDecoder.cpp JpegStream.cpp)
-target_link_libraries(rawdecoder libraw jpegturbo log)
+add_library(rawdecoder SHARED RawDecoder.cpp JpegStream.cpp ModelColor.cpp)
+target_link_libraries(rawdecoder libraw jpegturbo log jnigraphics)
+# ModelColor.cpp uses std::clamp / std::thread; the NDK defaults to C++14.
+set_target_properties(rawdecoder PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_include_directories(rawdecoder PRIVATE ${CMAKE_SOURCE_DIR}/libraw)

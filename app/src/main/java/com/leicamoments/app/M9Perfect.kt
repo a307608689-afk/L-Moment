@@ -83,10 +83,9 @@ object M9Perfect {
             val outBmp = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
             outBmp.setPixels(filtered, 0, sw, 0, 0, sw, sh)
 
-            val bos = ByteArrayOutputStream(exifFrom.size)
-            outBmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            val encoded = JpegEnc.encode(outBmp)
             outBmp.recycle()
-            val out = MadridLegendary.copyExif(exifFrom, bos.toByteArray())
+            val out = MadridLegendary.copyExif(exifFrom, encoded)
             onProgress?.invoke(100)
             DiagLog.w(TAG, "完整管线完成 ${fe.w}x${fe.h} ${out.size}B, " +
                     "${System.currentTimeMillis() - t0}ms")
@@ -125,11 +124,10 @@ object M9Perfect {
             val warmed = LegendaryPostProcessor.applyWarmLutBitmapBin(
                 app, styled, warmBin, denoise, ev, warmth)
             val outBmp = warmed ?: styled
-            val bos = ByteArrayOutputStream(jpeg.size)
-            outBmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            val encoded = JpegEnc.encode(outBmp)
             if (outBmp !== styled) styled.recycle()
             outBmp.recycle()
-            val out = MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            val out = MadridLegendary.copyExif(jpeg, encoded)
             onProgress?.invoke(100)
 
             DiagLog.w(TAG, "完美档完成 ${out.size}B, ${System.currentTimeMillis() - t0}ms")

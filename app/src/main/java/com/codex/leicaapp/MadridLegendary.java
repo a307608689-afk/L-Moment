@@ -243,10 +243,9 @@ public final class MadridLegendary {
                 }
             }
 
-            ByteArrayOutputStream bos = new ByteArrayOutputStream(jpeg.length);
-            bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos);
+            byte[] encoded = com.leicamoments.app.JpegEnc.encode(bmp);
             bmp.recycle();
-            return copyExif(jpeg, bos.toByteArray());
+            return copyExif(jpeg, encoded);
         } catch (Throwable t) {
             return jpeg;
         }

@@ -81,7 +81,8 @@ object M9Distill {
     /** 每百万像素追加的预算：实测旗舰 12.58MP ≈ 4.9s（≈390ms/MP），给约 3× 余量。 */
     private const val PER_MP_MS = 1200L
     private const val MIN_BUDGET_MS = 4000L
-    private const val MAX_BUDGET_MS = 15000L
+    /** 封顶：24MP 档需 ~30s、8192 档（50MP，48 块）需 ~62s，留余量取 70s。 */
+    private const val MAX_BUDGET_MS = 70000L
 
     /** 内存估算里除位图之外还要留的量（分块平面缓冲 + ORT 内部 + 编码）。 */
     private const val HEAP_SLACK_BYTES = 32L * 1024 * 1024
@@ -108,9 +109,20 @@ object M9Distill {
     // styled 单槽缓存（网络输出与暖调参数无关，M9/M9D 共用同一份输入时可直接复用）
     @Volatile private var cacheHash: Long = Long.MIN_VALUE
     @Volatile private var cacheStyled: Bitmap? = null
+    /**
+     * 缓存口径：`cacheHash` 只编码 jpeg 内容，必须连同 longEdge 一起校验——
+     * 否则同一份 jpeg 换口径（4096 / 5632）会复用错尺寸的 styled 位图。
+     * （现有调用方输入字节必然不同，原风险仅为 crc32 碰撞；补校验后彻底消除，
+     * 并保证同一图连续 HiRes 导出能正确复用缓存。）
+     */
+    @Volatile private var cacheLongEdge: Int = W4K
 
     /**
      * @param warmBin 暖调 LUT bin 资产名（蒸馏网只取代 styled 段，暖调语义与 M9 一致保留）
+     * @param longEdge 画布长边上限：默认 4096（旧口径，所有既有调用不变）。
+     *        传 [ImageUtils.HIRES_M9_LONG] 走「高分辨率工作链」（B 方案，2026-10-21）：
+     *        M9 系放弃全像素条带链后，用整图链在 24MP 级画布上出图——暖调全图一次调用，
+     *        结构上不存在带边收敛/条带台阶；失败（预算/超时/native 异常）由调用方回落工作版。
      * @return 处理后 JPEG 字节；任何失败返回 null
      */
     fun run(
@@ -120,11 +132,12 @@ object M9Distill {
         ev: Float = -0.95f,
         warmth: Float = 0.3f,
         warmBin: String = "leica_filter_param_m9_snapshot.bin",
+        longEdge: Int = W4K,
     ): ByteArray? {
         lastFail = Fail.NONE
         return try {
             val t0 = System.currentTimeMillis()
-            val styled = styledCached(app, jpeg, crc32(jpeg)) ?: return null
+            val styled = styledCached(app, jpeg, crc32(jpeg), longEdge) ?: return null
 
             // 暖调必须在副本上做：applyWarmLutBitmapBin 对 mutable 输入是「原地改并返回同一对象」，
             // 而 styled 在正常路径就是 mutable —— 直接喂它再 recycle，会把单槽缓存里那张位图废掉
@@ -135,14 +148,14 @@ object M9Distill {
             Dither.tpdf(work, DITHER_PRE)
             val warmed = LegendaryPostProcessor.applyWarmLutBitmapBin(
                 app, work, warmBin, denoise * DENOISE_SCALE, ev, warmth)
-            val bos = ByteArrayOutputStream(jpeg.size)
             val outBmp = warmed ?: work
             // 抖色②（8bit 出口）：native 输出已是 8bit，台阶在平坦区固化成常量块，这里最后打散
             Dither.tpdf(outBmp, DITHER_POST)
-            outBmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            // P3：出口走 4:4:4（Bitmap.compress 是 4:2:0，暗部色块/边缘彩边来源）
+            val encoded = JpegEnc.encode(outBmp)
             if (outBmp !== work) work.recycle()
             outBmp.recycle()
-            val out = MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            val out = MadridLegendary.copyExif(jpeg, encoded)
             DiagLog.w(TAG, "蒸馏链完成 ${out.size}B, ${System.currentTimeMillis() - t0}ms")
             out
         } catch (t: Throwable) {
@@ -161,34 +174,40 @@ object M9Distill {
      */
     fun styleOnly(app: Context, jpeg: ByteArray): Bitmap? = styledInternal(app, jpeg)
 
-    private fun styledCached(app: Context, jpeg: ByteArray, hash: Long): Bitmap? {
+    private fun styledCached(app: Context, jpeg: ByteArray, hash: Long,
+                             longEdge: Int = W4K): Bitmap? {
         cacheStyled?.let { cached ->
-            if (cacheHash == hash) {
+            if (cacheHash == hash && cacheLongEdge == longEdge) {
                 DiagLog.w(TAG, "styled 缓存命中 (${cached.width}x${cached.height})")
                 return cached
             }
         }
         synchronized(this) {
             cacheStyled?.let { cached ->
-                if (cacheHash == hash) {
+                if (cacheHash == hash && cacheLongEdge == longEdge) {
                     DiagLog.w(TAG, "styled 缓存命中 (${cached.width}x${cached.height})")
                     return cached
                 }
             }
-            val s = styledInternal(app, jpeg) ?: return null
+            val s = styledInternal(app, jpeg, longEdge) ?: return null
             cacheHash = hash
+            cacheLongEdge = longEdge
             cacheStyled = s
             return s
         }
     }
 
     /** 微网推理 + 几何还原，产出未加暖调的 styled Bitmap（mutable，供暖调就地写回）。 */
-    private fun styledInternal(app: Context, jpeg: ByteArray): Bitmap? {
+    private fun styledInternal(app: Context, jpeg: ByteArray,
+                               longEdge: Int = W4K): Bitmap? {
         // 像素预算：解码前只读 JPEG 头判尺寸，吃不下就直接退场（别先 OOM 再退——
         // OOM 之前必然先经历一轮 GC 风暴，用户看到的是 2~3s 卡顿之后才降级）。
-        if (!canAfford(jpeg)) {
+        // 高分辨率口径（longEdge > 4K）单独放宽到 0.85：24MP 峰值≈317MB，
+        // 0.7 的余量在 512MB 堆上会误拒；失败仍被 run() 的 catch 兜住。
+        val ratio = if (longEdge > W4K) 0.85f else HEAP_SAFE_RATIO.toFloat()
+        if (!canAfford(jpeg, ratio, longEdge)) {
             lastFail = Fail.BUDGET
-            DiagLog.w(TAG, "像素/内存预算不足，跳过蒸馏链直落下一级")
+            DiagLog.w(TAG, "像素/内存预算不足（${longEdge}px 口径），跳过蒸馏链直落下一级")
             return null
         }
         val t0 = System.currentTimeMillis()
@@ -200,7 +219,7 @@ object M9Distill {
         val landscape = if (portrait) rotate(src, -90f) else src
         if (landscape !== src) src.recycle()
 
-        val fitted = fit(landscape)
+        val fitted = fit(landscape, longEdge)
         if (fitted !== landscape) landscape.recycle()
         val fw = fitted.width
         val fh = fitted.height
@@ -433,7 +452,10 @@ object M9Distill {
 
     // ---- 辅助 ----
 
-    /** 按像素数给时间预算：12.58MP 封顶 15s（旗舰实测 4.9s，余量留给低端机）。 */
+    /**
+     * 按像素数给时间预算：12.58MP ≈ 16.6s（旗舰实测 4.9s，余量留给低端机）；
+     * 高分辨率口径（24MP ≈ 30s）需要更长的上限，故封顶 40s。超时即中止并降级，不会崩。
+     */
     private fun budgetMs(pixels: Long): Long {
         val byArea = BASE_BUDGET_MS + (pixels / 1_000_000L) * PER_MP_MS
         return byArea.coerceIn(MIN_BUDGET_MS, MAX_BUDGET_MS)
@@ -446,7 +468,8 @@ object M9Distill {
      * + 一块 IntArray 结果 + 固定余量。上限取可用堆的 70%——蒸馏之后还要做暖调副本
      * 与 JPEG 编码，这里必须留余量，否则会把「省一次 GC」换成「真 OOM」。
      */
-    private fun canAfford(jpeg: ByteArray): Boolean {
+    private fun canAfford(jpeg: ByteArray, safeRatio: Float = HEAP_SAFE_RATIO.toFloat(),
+                          longEdge: Int = W4K): Boolean {
         val opts = BitmapFactory.Options()
         opts.inJustDecodeBounds = true
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
@@ -455,10 +478,18 @@ object M9Distill {
         if (w <= 0 || h <= 0) return true          // 尺寸读不出，交给正常解码路径报错
         val px = w * h
         if (px > MAX_PIXELS) return false
-        val need = px * 4L * 3L + HEAP_SLACK_BYTES
+        // 估算口径：默认按「3 份同尺寸位图」保守估（旧口径，12.5MP 路径不变）。
+        // 高分辨率档（longEdge > 4K）改按 1.5 份估：Android 8+ 的 Bitmap 像素在 native 堆，
+        // 不计入 Java 堆上限，真正的 Java 堆峰值是 tiledInfer 的 outPx（1 份）+ 临时数组。
+        // 若仍按 3 份估，8192 档会被算出 636MB 而误拒（512MB 堆上永远不可达）。
+        val need = if (longEdge > W4K) {
+            px * 4L * 3L / 2 + HEAP_SLACK_BYTES
+        } else {
+            px * 4L * 3L + HEAP_SLACK_BYTES
+        }
         val rt = Runtime.getRuntime()
         val avail = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
-        return need <= (avail * HEAP_SAFE_RATIO).toLong()
+        return need <= (avail * safeRatio).toLong()
     }
 
     /** 失败归因：OOM 类（含 allocate 失败）单独标记，其余记为 OTHER。 */
@@ -492,11 +523,17 @@ object M9Distill {
         return out
     }
 
-    private fun fit(b: Bitmap): Bitmap {
+    /**
+     * 画布等比收敛：默认 4096×3072（旧口径，既有调用零影响）；
+     * 传 [longEdge] > 4096 时按「长边 = longEdge、短边 = 4:3 推算」收敛
+     * （高分辨率工作链用，见 [run] 的 longEdge 参数）。
+     */
+    private fun fit(b: Bitmap, longEdge: Int = W4K): Bitmap {
+        val shortEdge = longEdge * 3 / 4
         val w = b.width
         val h = b.height
-        if (w <= W4K && h <= H4K) return b
-        val s = minOf(W4K.toFloat() / w, H4K.toFloat() / h)
+        if (w <= longEdge && h <= shortEdge) return b
+        val s = minOf(longEdge.toFloat() / w, shortEdge.toFloat() / h)
         return Bitmap.createScaledBitmap(b, (w * s).toInt(), (h * s).toInt(), true)
     }
 }

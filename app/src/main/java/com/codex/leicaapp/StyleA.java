@@ -361,9 +361,8 @@ public final class StyleA {
             bmp.getPixels(px, 0, w, 0, 0, w, h);
             p.applyPx(px, w, h);
             bmp.setPixels(px, 0, w, 0, 0, w, h);
-            ByteArrayOutputStream bos = new ByteArrayOutputStream(jpeg.length);
-            bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos);
-            byte[] ret = MadridLegendary.copyExif(jpeg, bos.toByteArray());
+            byte[] ret = MadridLegendary.copyExif(jpeg,
+                    com.leicamoments.app.JpegEnc.encode(bmp));
             DiagLog.i(TAG, "ok ref=" + ref + " " + w + "x" + h + " "
                     + (System.currentTimeMillis() - t0) + "ms out=" + ret.length + "B");
             return ret;

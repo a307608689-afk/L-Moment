@@ -419,9 +419,7 @@ public final class LegendaryPostProcessor {
     }
 
     private static byte[] encode(Bitmap bmp, byte[] srcJpeg) {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream(srcJpeg.length);
-        bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos);
-        return MadridLegendary.copyExif(srcJpeg, bos.toByteArray());
+        return MadridLegendary.copyExif(srcJpeg, com.leicamoments.app.JpegEnc.encode(bmp));
     }
 
     private static int readOrientation(byte[] jpeg) {

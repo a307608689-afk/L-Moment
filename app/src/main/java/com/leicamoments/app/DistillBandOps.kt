@@ -3,6 +3,7 @@ package com.leicamoments.app
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Rect
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
@@ -46,13 +47,57 @@ object DistillBandOps {
     /** 模型链覆盖的风格 id。 */
     private val STYLES = setOf("M9", "M9P", "M10R", "M9D")
 
+    /**
+     * 调试开关：完全跳过 native 暖调 LUT（含其逐带修正与托底），仅 debug 批测用。
+     *
+     * 用于隔离「暖调逐带调用」是否为带边界台阶的成因：暖调是链上唯一同时带统计与空间
+     * 行为的算子，其空间增益场按传入 Bitmap 的宽高归一化，逐带调用时每条带都被当作
+     * 独立图像处理。关掉它若台阶消失，即可确认病灶。
+     */
+    @Volatile
+    var debugNoWarm = false
+
     /** 调试开关：关闭暖调逐带修正（仅 debug 批测用）。 */
     @Volatile
     var debugNoToneFix = false
 
+    /**
+     * 暖调重叠窗口行数：>0 时暖调（含前置抖动/托底/逐带修正）在「上下各扩该行数」的
+     * 窗口上执行，只取中间本带。0 = 旧口径（暖调逐带独立）。
+     *
+     * 暖调是链上唯一按「整个输入 Bitmap 的宽高」归一化的算子：逐带调用时每条带都被当成
+     * 一张独立图像，空间增益场在带边被迫收敛、带内被拉伸，形成 256 行周期的横向条纹
+     * （200MP 纯灰探针：带尾抬亮 ~0.6 级、接缝暗线 ~0.85 级、真实照片平滑区折叠幅度
+     * 中位 3.8 级）。真机 warmover 探针实测接缝凹陷随扩窗单调收敛：
+     * E=0/-1.10、32/-0.57、64/-0.27、128/-0.08（B 通道级）。
+     *
+     * 默认 64（2026-10-21 真机对拍恢复）：warmOverlap=0 曾被误判「无可见收益」回退，
+     * 真机实测直接打脸——条带边界暗线（用户所见「画面中间那条暗线」）在 E=0 时
+     * y=6144 残差 -2.24 级、全图条带边界均值 -0.90；E=64 时分别为 -0.83 / -0.24
+     * （N4 修复版 FlatHfClean 生效后 E=0 也仅 -2.00 / -0.67，仍显著劣于 64）。
+     * 即 E=0→64 的收益就是这条用户全程可见的暗线，+22% 耗时是必要代价。
+     * 留档——E=64：200MP 纯灰探针带边台阶 0.67→0.12 级（-82%）、带内折叠 1.32→0.32 级、
+     * 真实照片平滑区 2.50→0.72 级，导出耗时 +22%（98s→120s）、heap +4MB。
+     * E=128 还能再降到 0.05/0.50，但要 +70% 耗时（167s），边际收益不足以抵消。
+     */
+    @Volatile
+    var warmOverlap = 64
+
     /** 调试开关：只做蒸馏推理，跳过全部后处理（拆解带间偏差来源用）。 */
     @Volatile
     var debugStyledOnly = false
+
+    /**
+     * 出口细噪治理总开关（默认开）。
+     *
+     * 200MP 条带链把平滑区细噪/中频云纹放大到原图 ~2 倍（native 暖调局部增强 +
+     * 双次 TPDF 抖动，厂商 .so 不可改参）——预览链因降采样推理+缩屏显示不可见，
+     * 100% 查看导出图显形为「水彩纹/条纹」。治理 = LevelStack 之后做平坦区高频衰减
+     * （[FlatHfClean]，边缘门控保护）+ 出口 0.6 LSB TPDF 抖动（重建被衰减抹掉的
+     * 防色块噪声地板）。关掉即完全回到旧口径（真机 A/B 用）。
+     */
+    @Volatile
+    var grainClean = true
 
     /** 调试开关：把拟合出的修正网格转储到外部 files 目录（离线分析网格形态用）。 */
     @Volatile
@@ -160,6 +205,14 @@ object DistillBandOps {
          */
         private var tileOut = IntArray(0)
         private var tileOutTop = Int.MIN_VALUE
+
+        /** 暖调重叠窗口复用位图（尺寸 = fullW × (rows + 2E)，200MP 时约 33MB）。 */
+        private var extWin: Bitmap? = null
+        /** 上一带最后若干行的 styled（推理产物、未暖调）像素，供本带上扩使用。 */
+        private var tailPx = IntArray(0)
+        private var tailRows = 0
+        private var tailTop = Int.MIN_VALUE
+
         private var fullArr = FloatArray(0)
         private var lowArr = FloatArray(0)
         private var fullBuf: FloatBuffer? = null
@@ -195,7 +248,7 @@ object DistillBandOps {
             if (band.isRecycled || rows <= 0 || fullW <= 0) return null
 
             // 首带时确定真实带几何并拟合暖调修正（bandRows 由 native 决定，prepare 阶段未知）
-            if (!gridTried && top == 0 && !debugStyledOnly) ensureToneCorrection(rows)
+            if (!gridTried && top == 0 && !debugStyledOnly && !debugNoWarm) ensureToneCorrection(rows)
 
             val stat = debugBandStat
             val preRows = if (stat) FloatArray(rows) else null
@@ -241,28 +294,66 @@ object DistillBandOps {
                 }
 
                 var post: Bitmap = band
-                Dither.tpdf(post, DITHER, top, DITHER_PHASE_PRE)
-                val warmed = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
-                        app, post, warmBin, denoise * DENOISE_SCALE, ev, warmth, warmTime)
-                if (warmed == null) {
-                    DiagLog.w(TAG, "暖调 LUT 失败")
-                    return null
+                if (debugNoWarm) {
+                    Dither.tpdf(post, DITHER, top, DITHER_PHASE_PRE)
+                } else {
+                    val ov = warmOverlap
+                    val ext = if (ov > 0)
+                        buildWarmWindow(session, band, top, rows, fullW, fullH, ov) else null
+                    val srcW = ext?.first ?: band
+                    val yBase = ext?.second ?: top
+                    val hWin = ext?.third ?: rows
+                    // 上扩行必须来自「本带之前的 styled」，必须在暖调把窗口写脏之前缓存
+                    if (ext != null) rememberTail(srcW, top, rows, yBase, fullW, ov)
+                    val p2 = warmStage(srcW, yBase, hWin, fullH)
+                    if (p2 == null) {
+                        DiagLog.w(TAG, "暖调 LUT 失败")
+                        return null
+                    }
+                    if (ext != null) {
+                        // 只取扩展窗口的中间本带，带边那 E 行（暖调的空间场在此收敛）被丢弃
+                        try {
+                            Canvas(band).drawBitmap(p2, 0f, (yBase - top).toFloat(), null)
+                        } catch (t: Throwable) {
+                            DiagLog.e(TAG, "扩窗暖调回写失败 top=$top", t)
+                            return null
+                        }
+                        if (p2 !== srcW) p2.recycle()
+                        post = band
+                    } else {
+                        if (p2 !== band) band.recycle()
+                        post = p2
+                    }
                 }
-                if (warmed !== post) {
-                    post.recycle()
-                    post = warmed
-                }
-                Dither.tpdf(post, DITHER, top, DITHER_PHASE_WARM)
-                // 暖调逐带修正：把「只看自己这一带」的暖调结果拉回「整幅暖调」的目标值
-                applyToneFix(post, top, rows, fullH)
                 if (boost) {
                     boostInPlace(post)
                     Dither.tpdf(post, DITHER, top, DITHER_PHASE_BOOST)
                 }
                 // 空间性后处理：传全图高度 + 带起点（否则暗角/颗粒在带边界错位）
                 if (m10r) MadridShader.apply(post, 0.3f, 1f, fullH, top)
+                // 出口色度护栏：暖调 LUT + 逐带修正 + 饱和后推会把低值通道（典型是暖黄主体的蓝）
+                // 削顶到 0，造成色阶塌陷/色块。这里只把已经跌到下限以下的通道按色差比例拉回。
+                val guardHits = ChromaGuard.knee(post)
+                if (bandCount == 0) {
+                    DiagLog.w(TAG, "色度护栏 首带命中=$guardHits/${post.width}x${post.height}")
+                }
                 // 五滑杆最后（与整图导出顺序一致）；LevelStack 会回收输入，band 本就是一次性的
                 if (levels.any { it != 0 }) post = LevelStack.apply(post, levels)
+
+                // 出口细噪治理：平坦区高频衰减（边缘门控）+ 0.6 LSB 出口抖动。
+                // 前者把平滑区被链上放大的细噪/云纹压回原图水平，后者重建防量化色块的
+                // 噪声地板（衰减会把 warm 段两次抖动的效果在平坦区抹掉）。见 FlatHfClean。
+                if (grainClean) {
+                    val ms = FlatHfClean.apply(post, top, src)
+                    val msC = ChromaClean.apply(post)
+                    if (bandCount == 0) DiagLog.w(
+                        TAG,
+                        "平坦区高频衰减 首带 ${ms}ms ${FlatHfClean.lastStat} " +
+                            "(T0=5.0 正确门控；meanWgt<0.2 = 门控过弱，blend<50% = 活动场异常)；" +
+                            "色度清理 ${msC}ms"
+                    )
+                    Dither.tpdf(post, DITHER_OUT, top, DITHER_PHASE_OUT)
+                }
 
                 bandCount++
                 if (bandCount == 1) DiagLog.w(TAG, "首带完成 rows=$rows keep=$gridKeep")
@@ -279,6 +370,14 @@ object DistillBandOps {
             } catch (_: Throwable) {
             }
             window = null
+            try {
+                extWin?.recycle()
+            } catch (_: Throwable) {
+            }
+            extWin = null
+            tailPx = IntArray(0)
+            tailRows = 0
+            tailTop = Int.MIN_VALUE
             tilePx = IntArray(0)
             tmpPx = IntArray(0)
             lowPx = IntArray(0)
@@ -299,6 +398,7 @@ object DistillBandOps {
             src = null
             sess = null
             env = null
+            FlatHfClean.reset()   // 清跨带 A 场递推状态，避免下次导出用上次的衔接值
             DiagLog.w(TAG, "release，共 $bandCount 带")
         }
 
@@ -314,6 +414,134 @@ object DistillBandOps {
             val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             window = b
             return b
+        }
+
+        // ---- 暖调重叠窗口 ----
+
+        /**
+         * 组装「本带 + 上下各扩 ov 行」的 styled（推理产物、未暖调）窗口。
+         *
+         * 返回 (窗口位图, 窗口顶行在整图中的 y, 窗口行数)；不需要扩窗时返回 null（走旧口径）。
+         *
+         * 带外行的来源：上侧用上一带缓存的 styled 尾部（[tailPx]），下侧直接用分块行缓存
+         * （[tileRowAt]）——需要时会把下一条规范分块行提前算出来，而它本来就要在下一带
+         * 被算，总量不变，只是把成本前移了一带。
+         */
+        private fun buildWarmWindow(session: OrtSession, band: Bitmap, top: Int, rows: Int,
+                                    fullW: Int, fullH: Int, ov: Int): Triple<Bitmap, Int, Int>? {
+            val extTop = maxOf(0, top - ov)
+            val extEnd = minOf(fullH, top + rows + ov)
+            val extRows = extEnd - extTop
+            if (extRows <= rows) return null
+            val w = extWinOf(fullW, extRows) ?: return null
+            var ok = true
+            if (extTop < top) {
+                val up = top - extTop
+                if (tailRows >= up && tailTop + tailRows == top) {
+                    try {
+                        w.setPixels(tailPx, 0, fullW, 0, 0, fullW, up)
+                    } catch (t: Throwable) {
+                        DiagLog.e(TAG, "上扩行写入失败 top=$top", t)
+                        ok = false
+                    }
+                } else {
+                    ok = copyStyledRows(session, extTop, top, fullW, fullH, w, 0)
+                }
+            }
+            if (ok) {
+                try {
+                    Canvas(w).drawBitmap(band, 0f, (top - extTop).toFloat(), null)
+                } catch (t: Throwable) {
+                    DiagLog.e(TAG, "本带写入扩窗失败 top=$top", t)
+                    return null
+                }
+                if (extEnd > top + rows) {
+                    ok = copyStyledRows(session, top + rows, extEnd, fullW, fullH,
+                            w, rows + (top - extTop))
+                }
+            }
+            return if (ok) Triple(w, extTop, extRows) else null
+        }
+
+        /** 把 [y0,y1) 的 styled 行从规范分块行缓存拷进 [dst] 的第 [dstRow] 行起。 */
+        private fun copyStyledRows(session: OrtSession, y0: Int, y1: Int, fullW: Int, fullH: Int,
+                                   dst: Bitmap, dstRow: Int): Boolean {
+            if (y1 <= y0) return true
+            if (gridKeep <= 0 || gridYs.isEmpty()) return false
+            var any = false
+            for (g in gridYs) {
+                if (g + gridKeep <= y0) continue
+                if (g >= y1) break
+                val line = tileRowAt(session, g, gridKeep, fullW, fullH) ?: return false
+                val s = maxOf(y0, g)
+                val e = minOf(y1, g + gridKeep)
+                try {
+                    for (y in s until e) {
+                        dst.setPixels(line, (y - g) * fullW, fullW, 0, dstRow + (y - y0), fullW, 1)
+                    }
+                } catch (t: Throwable) {
+                    DiagLog.e(TAG, "扩窗行拷贝失败 [$s,$e) dstRow=$dstRow", t)
+                    return false
+                }
+                any = true
+            }
+            return any
+        }
+
+        /** 缓存本带尾部 [ov] 行 styled 像素（下一带的上扩输入），必须在暖调之前调用。 */
+        private fun rememberTail(win: Bitmap, top: Int, rows: Int, winTop: Int,
+                                 fullW: Int, ov: Int) {
+            if (ov <= 0 || rows <= 0) return
+            val n = minOf(ov, rows)
+            val start = top + rows - n
+            val off = start - winTop
+            if (off < 0 || off + n > win.height) return
+            if (tailPx.size < n * fullW) tailPx = IntArray(n * fullW)
+            try {
+                win.getPixels(tailPx, 0, fullW, 0, off, fullW, n)
+                tailRows = n
+                tailTop = start
+            } catch (t: Throwable) {
+                DiagLog.e(TAG, "尾部 styled 缓存失败 top=$top", t)
+                tailRows = 0
+                tailTop = Int.MIN_VALUE
+            }
+        }
+
+        private fun extWinOf(w: Int, h: Int): Bitmap? {
+            val cur = extWin
+            if (cur != null && !cur.isRecycled && cur.width == w && cur.height == h) return cur
+            try {
+                cur?.recycle()
+            } catch (_: Throwable) {
+            }
+            extWin = null
+            return try {
+                Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { extWin = it }
+            } catch (t: Throwable) {
+                DiagLog.e(TAG, "扩窗缓冲分配失败 ${w}x$h", t)
+                null
+            }
+        }
+
+        /**
+         * 暖调阶段（前置抖动 → 暖调 LUT → 抖动 → 托底 → 逐带修正）。
+         * 返回的 Bitmap 可能就地改写 [src]，也可能是新对象。
+         */
+        private fun warmStage(src: Bitmap, yBase: Int, hWin: Int, fullH: Int): Bitmap? {
+            Dither.tpdf(src, DITHER, yBase, DITHER_PHASE_PRE)
+            var p = src
+            val warmed = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
+                    app, p, warmBin, denoise * DENOISE_SCALE, ev, warmth, warmTime)
+                    ?: return null
+            if (warmed !== p) p = warmed
+            Dither.tpdf(p, DITHER, yBase, DITHER_PHASE_WARM)
+            // 托底：暖调把暖黄主体的蓝压到 0~3，先拉到色域下限之上，让逐带修正与
+            // 后续饱和/暖偏后推都在「还有层次」的域里工作（拟合侧用同一口径，见下方代理）。
+            ChromaGuard.knee(p)
+            // 暖调逐带修正：把「只看自己这一带」的暖调结果拉回「整幅暖调」的目标值
+            applyToneFix(p, yBase, hWin, fullH)
+            return p
         }
 
         // ---- 暖调逐带修正 ----
@@ -441,24 +669,42 @@ object DistillBandOps {
                 }
                 if (pWhole !== wholeSrc) wholeSrc.recycle()
 
+                // 与实际链同口径：真实带在「上下各扩 warmOverlap 行」的窗口上做暖调，
+                // 代理侧按同一比例扩 eProxy 行、只取中间本带，否则拟合出的修正量会对着
+                // 旧口径（逐带独立暖调）的偏差过修。
+                val eProxy = if (warmOverlap > 0)
+                    ((warmOverlap.toDouble() * ph) / h + 0.5).toInt() else 0
                 pBands = Bitmap.createBitmap(pw, ph, Bitmap.Config.ARGB_8888)
                 val cv = Canvas(pBands)
                 for (i in pRows.indices) {
-                    val crop = Bitmap.createBitmap(px, 0, pTops[i], pw, pRows[i])
+                    val y0 = pTops[i]
+                    val y1 = y0 + pRows[i]
+                    val e0 = maxOf(0, y0 - eProxy)
+                    val e1 = minOf(ph, y1 + eProxy)
+                    val crop = Bitmap.createBitmap(px, 0, e0, pw, e1 - e0)
                             .copy(Bitmap.Config.ARGB_8888, true) ?: continue
                     val wr = warmOnProxy(crop)
                     if (wr == null) {
                         crop.recycle()
                         continue
                     }
-                    cv.drawBitmap(wr, 0f, pTops[i].toFloat(), null)
-                    if (wr !== crop) crop.recycle()
-                    wr.recycle()
+                    cv.drawBitmap(wr, Rect(0, y0 - e0, pw, y1 - e0), Rect(0, y0, pw, y1), null)
+                    if (wr !== crop) wr.recycle()
+                    crop.recycle()
                 }
 
                 // 网格纵向**覆盖整幅**（不是每条带一套）：带边若各带独立按带高归一化，
                 // 边界两侧的校正值互不相干，残差恰好落在边界行上
                 // （200MP 实测边界行跳变中位 0.196 / 峰 3.0 级，非边界中位 0.020）。
+                //
+                // 曾试「带周期整数格」（每带 10 格、带缝恒落格边界）：纯灰探针反而变差
+                // （whole p2p 1.240 → 2.324，接缝台阶 −1.115 级）——带首/带末两格只被
+                // 单侧样本锚定，格值偏 ±0.5~1.7 级，跨带就形成真实台阶。故维持整幅口径。
+                // 拟合前先跑同一出口软膝：暖调把低值通道压到 0~3 时，「整幅暖调」这个目标值
+                // 本身就在削顶区，直接拟合会把带内结果对齐到一片没有层次的 0 上。
+                // 让目标与带内输入/结果同域（都已托底），修正才是在有色阶的域里做。
+                pWhole?.let { ChromaGuard.knee(it) }
+                pBands?.let { ChromaGuard.knee(it) }
                 val ghTotal = (ph / GRID_ROW_ROWS).coerceIn(8, GRID_H_MAX)
                 val fitted = fitToneGridGlobal(app, pWhole, pBands, GRID_W, ghTotal, GRID_LEVELS)
                 toneGrid = fitted
@@ -840,26 +1086,12 @@ object DistillBandOps {
             val con = LeicaEngine.M9P_BOOST_CONTRAST
             val warm = LeicaEngine.M9P_BOOST_WARM
 
-            // 饱和度矩阵（Rec.601 亮度权重，与 ColorMatrix.setSaturation 一致）
+            // Rec.601 亮度权重（与 ColorMatrix.setSaturation 一致）
             val ir = 0.299f
             val ig = 0.587f
             val ib = 0.114f
-            var m00 = ir + (1f - ir) * sat
-            var m01 = ig - ig * sat
-            var m02 = ib - ib * sat
-            var m10 = ir - ir * sat
-            var m11 = ig + (1f - ig) * sat
-            var m12 = ib - ib * sat
-            var m20 = ir - ir * sat
-            var m21 = ig - ig * sat
-            var m22 = ib + (1f - ib) * sat
-            // 暖偏：R 增益 +warm，B 增益 -warm（postConcat 右乘 scale）
-            m00 *= (1f + warm); m10 *= (1f + warm); m20 *= (1f + warm)
-            m02 *= (1f - warm); m12 *= (1f - warm); m22 *= (1f - warm)
-            // 对比：右乘 scale
-            m00 *= con; m01 *= con; m02 *= con
-            m10 *= con; m11 *= con; m12 *= con
-            m20 *= con; m21 *= con; m22 *= con
+            val warmUp = 1f + warm
+            val warmDown = 1f - warm
 
             val w = bmp.width
             val h = bmp.height
@@ -869,13 +1101,22 @@ object DistillBandOps {
                 bmp.getPixels(px, 0, w, 0, y, w, 1)
                 for (i in 0 until w) {
                     val p = px[i]
-                    val r = (p shr 16) and 0xFF
-                    val g = (p shr 8) and 0xFF
-                    val b = p and 0xFF
-                    val nr = (m00 * r + m01 * g + m02 * b).roundToInt().coerceIn(0, 255)
-                    val ng = (m10 * r + m11 * g + m12 * b).roundToInt().coerceIn(0, 255)
-                    val nb = (m20 * r + m21 * g + m22 * b).roundToInt().coerceIn(0, 255)
-                    px[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+                    val r0 = (p shr 16) and 0xFF
+                    val g0 = (p shr 8) and 0xFF
+                    val b0 = p and 0xFF
+                    // 暖偏作用在输入通道（与旧矩阵右乘 scale 等价）
+                    val r = r0 * warmUp
+                    val b = b0 * warmDown
+                    val lum = ir * r + ig * g0 + ib * b
+                    // 饱和限幅：最小通道越低越让出增益，避免把已偏低的通道推穿 0（削顶）
+                    val satEff = ChromaGuard.satGain(minOf(r0, g0, b0).toFloat(), sat)
+                    val nr = (lum + (r - lum) * satEff) * con
+                    val ng = (lum + (g0 - lum) * satEff) * con
+                    val nb = (lum + (b - lum) * satEff) * con
+                    px[i] = (0xFF shl 24) or
+                            (nr.roundToInt().coerceIn(0, 255) shl 16) or
+                            (ng.roundToInt().coerceIn(0, 255) shl 8) or
+                            nb.roundToInt().coerceIn(0, 255)
                 }
                 bmp.setPixels(px, 0, w, 0, y, w, 1)
             }
@@ -914,12 +1155,14 @@ object DistillBandOps {
         val sum = FloatArray(cells * levels)
         val gxs = IntArray(w)
         for (x in 0 until w) gxs[x] = gridIndex(x, w, gw) * 3
+        val gys = IntArray(h)
+        for (py in 0 until h) gys[py] = gridIndex(py, h, gh)
         val rowW = IntArray(w)
         val rowB = IntArray(w)
         for (py in 0 until h) {
             whole.getPixels(rowW, 0, w, 0, py, w, 1)
             band.getPixels(rowB, 0, w, 0, py, w, 1)
-            val base = gridIndex(py, h, gh) * gw * 3
+            val base = gys[py] * gw * 3
             for (x in 0 until w) {
                 val cell = base + gxs[x]
                 val cw = rowW[x]
@@ -985,7 +1228,10 @@ object DistillBandOps {
                 // 近白像素整段染成该内容的颜色（实测 B 253 → 38 的黄花高光）
                 val span = if (n > 0 && l < vxs[0]) TAIL_BLEND_DARK else TAIL_BLEND_BRIGHT
                 val w = if (dist <= 0) 1f else (1f - dist / span).coerceAtLeast(0f)
-                val d = ((raw - ident) * w).coerceIn(-MAX_DEV, MAX_DEV)
+                // 最暗档下压限幅：暖调后被打到 0~3 的低值通道（典型是暖黄主体的蓝）若还允许
+                // -64，整片会被钉死在 0 上（色阶全塌），且逐格修正量不同会让差异显形成块。
+                val maxDown = if (ident < ChromaGuard.TONE_LOW_GUARD) ChromaGuard.TONE_LOW_DEV else MAX_DEV
+                val d = ((raw - ident) * w).coerceIn(-maxDown, MAX_DEV)
                 grid[base + l] = (ident + d).coerceIn(0f, 255f)
             }
         }
@@ -1055,6 +1301,9 @@ object DistillBandOps {
     private const val DENOISE_SCALE = 0.33f
     private const val DITHER = 1.0f
 
+    /** 出口抖动幅度（LSB）：细噪衰减后重建防色块噪声地板，幅度小于链内两次 1.0 */
+    private const val DITHER_OUT = 0.5f
+
     // ---- 暖调逐带修正（代理图拟合）----
     /** 代理图像素数上限（拟合专用的低分副本）。 */
     private const val PROXY_PX = 2_500_000.0
@@ -1073,9 +1322,10 @@ object DistillBandOps {
      * 纵向网格：整幅高度切 [GRID_ROW_ROWS] 个代理行一格（代理行 ≈ 全分辨率 9 行，
      * 故一格 ≈ 27 全分辨率行），总行数落在 [8, GRID_H_MAX]。
      *
-     * 旧实现是「每条带 48 行封顶、按带高归一化」：200MP 一条 256 行带只摊到 9 格，
-     * 且带边的格子退化成恒等映射，残差全部堆在边界行上。改成整幅连续网格后，
-     * 单元格数总量与旧实现相当（≈450 行 × 48 列），内存不涨。
+     * 三代口径的教训：①「每带 48 格封顶、带边格子恒等」→ 残差全堆在边界行；
+     * ②整幅连续网格（464 格，200MP 纯灰残差 1.240 / 边界台阶 0.037 级）；
+     * ③带周期整数格（每带 10 格）→ 带首/带末两格只被单侧样本锚定，偏 ±0.5~1.7 级，
+     * 跨带反而出现 1.1 级真台阶（残差 2.324）。故保留②。
      */
     private const val GRID_ROW_ROWS = 3
     private const val GRID_H_MAX = 512
@@ -1098,4 +1348,5 @@ object DistillBandOps {
     private const val DITHER_PHASE_PRE = 0
     private const val DITHER_PHASE_WARM = 1
     private const val DITHER_PHASE_BOOST = 2
+    private const val DITHER_PHASE_OUT = 3
 }

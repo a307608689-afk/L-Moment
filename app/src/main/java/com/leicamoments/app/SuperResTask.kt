@@ -82,6 +82,18 @@ object SuperResTask {
     @Volatile
     var pendingBlackLevel: Int = 0
 
+    /** 饱和度档（±10，0=不调） */
+    @Volatile
+    var pendingSatLevel: Int = 0
+
+    /** 对比度档（±10，0=不调） */
+    @Volatile
+    var pendingContrastLevel: Int = 0
+
+    /** 柔光档（±10，0=不调；正=Orton 柔雾，负=清晰化） */
+    @Volatile
+    var pendingGlowLevel: Int = 0
+
     fun addListener(l: (State) -> Unit) {
         listeners.add(l)
         l(state) // 立即回放当前态（Activity 重建/回前台恢复）
@@ -113,10 +125,15 @@ object SuperResTask {
                     val hlL0 = pendingHighlightLevel
                     val shL0 = pendingShadowLevel
                     val blL0 = pendingBlackLevel
-                    if (brL0 != 0 || evL0 != 0 || hlL0 != 0 || shL0 != 0 || blL0 != 0) {
+                    val saL0 = pendingSatLevel
+                    val coL0 = pendingContrastLevel
+                    val glL0 = pendingGlowLevel
+                    if (brL0 != 0 || evL0 != 0 || hlL0 != 0 || shL0 != 0 || blL0 != 0 ||
+                        saL0 != 0 || coL0 != 0 || glL0 != 0
+                    ) {
                         val tL = android.os.SystemClock.elapsedRealtime()
-                        pwork = Shadows.applyStackToJpeg(pwork, brL0, evL0, hlL0, shL0, blL0)
-                        DiagLog.i("Perfect", "亮度 ${brL0}/曝光 ${evL0}/高光 ${hlL0}/阴影 ${shL0}/黑色阶 ${blL0} 已烘焙 耗时 ${android.os.SystemClock.elapsedRealtime() - tL}ms")
+                        pwork = Shadows.applyStackToJpeg(pwork, brL0, evL0, hlL0, shL0, blL0, saL0, coL0, glL0)
+                        DiagLog.i("Perfect", "亮度 ${brL0}/曝光 ${evL0}/高光 ${hlL0}/阴影 ${shL0}/黑色阶 ${blL0}/饱和度 ${saL0}/对比度 ${coL0}/柔光 ${glL0} 已烘焙 耗时 ${android.os.SystemClock.elapsedRealtime() - tL}ms")
                     }
                     val style = pendingPerfectStyle ?: LeicaEngine.Style.M9
                     val tP = android.os.SystemClock.elapsedRealtime()
@@ -152,10 +169,15 @@ object SuperResTask {
                 val hlL = pendingHighlightLevel
                 val shL = pendingShadowLevel
                 val blL = pendingBlackLevel
-                if (brL != 0 || evL != 0 || hlL != 0 || shL != 0 || blL != 0) {
+                val saL = pendingSatLevel
+                val coL = pendingContrastLevel
+                val glL = pendingGlowLevel
+                if (brL != 0 || evL != 0 || hlL != 0 || shL != 0 || blL != 0 ||
+                    saL != 0 || coL != 0 || glL != 0
+                ) {
                     val tL = android.os.SystemClock.elapsedRealtime()
-                    work = Shadows.applyStackToJpeg(work, brL, evL, hlL, shL, blL)
-                    DiagLog.i("SuperRes", "亮度 ${brL}/曝光 ${evL}/高光 ${hlL}/阴影 ${shL}/黑色阶 ${blL} 已烘焙 耗时 ${android.os.SystemClock.elapsedRealtime() - tL}ms")
+                    work = Shadows.applyStackToJpeg(work, brL, evL, hlL, shL, blL, saL, coL, glL)
+                    DiagLog.i("SuperRes", "亮度 ${brL}/曝光 ${evL}/高光 ${hlL}/阴影 ${shL}/黑色阶 ${blL}/饱和度 ${saL}/对比度 ${coL}/柔光 ${glL} 已烘焙 耗时 ${android.os.SystemClock.elapsedRealtime() - tL}ms")
                 }
 
                 val decoded = ImageUtils.fromJpeg(work) ?: throw IllegalStateException("解码失败")
@@ -174,14 +196,18 @@ object SuperResTask {
                     work, ImageUtils.toJpeg(result, 95))
                 // 自动导出：写入相机标记并按导出命名规则入库（与手动导出产物一致）
                 val marked = try {
-                    LeicaMark.mark(workBytes)
+                    LeicaMark.mark(workBytes, SettingsStore.leicaBadgeEnabled(app))
                 } catch (t: Throwable) {
                     DiagLog.e("SuperRes", "mark failed, export unmarked", t)
                     workBytes
                 }
                 // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）；
                 // 未回嵌则裁掉 EOI 之后的残留二次图（增益图与超分后的主图尺寸必然不匹配）
-                val hdrSrc = pendingHdr
+                // C3 增益图重标定：套色后的 SDR 已不是原图，旧增益图的分母失配 → 按新 SDR 重算
+                // （用超分前的工作版 SDR 作为新 SDR：色调与成品一致，尺寸小、解码便宜）
+                val hdrSrc = if (pendingHdr != null && work !== bytes) {
+                    HdrGainMap.rebakeJpeg(bytes, work, pendingHdr!!) ?: pendingHdr
+                } else pendingHdr
                 val exported = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
                     else HdrGainMap.truncateToPrimary(marked)
                 // 装配结果自检（detail 里的比例/容器结构进 DiagLog）

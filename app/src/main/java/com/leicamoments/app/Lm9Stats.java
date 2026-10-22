@@ -264,11 +264,12 @@ public final class Lm9Stats {
             Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
             out.setPixels(px, 0, w, 0, 0, w, h);
 
-            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(jpeg.length);
-            out.compress(Bitmap.CompressFormat.JPEG, 98, bos);   // 95→98：减少二次编码在平滑渐变上的等值带
+            // P3：4:4:4 + q95（LM9_QUALITY）。旧口径 q98/4:2:0（95→98 是为压平滑渐变的等值带），
+            // 真机实测 q95/4:4:4 相对它体积 +9.5~11.8%（判据 ≤ +15%），而色度高频 σ 更高。
+            byte[] encoded = JpegEnc.encode(out, JpegEnc.LM9_QUALITY);
             out.recycle();
-            DiagLog.INSTANCE.w("LM9STAT", "统计同源链完成 bucket=" + KEYS[bucket] + " " + bos.size() + "B");
-            return com.codex.leicaapp.MadridLegendary.copyExif(jpeg, bos.toByteArray());
+            DiagLog.INSTANCE.w("LM9STAT", "统计同源链完成 bucket=" + KEYS[bucket] + " " + encoded.length + "B");
+            return com.codex.leicaapp.MadridLegendary.copyExif(jpeg, encoded);
         } catch (Throwable t) {
             DiagLog.INSTANCE.e("LM9STAT", "统计同源链失败，回落正常 M9", t);
             return null;

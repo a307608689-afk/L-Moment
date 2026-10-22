@@ -44,6 +44,37 @@ object JpegStream {
     external fun nativeAbort(handle: Long)
 
     /**
+     * 整图内存编码（强制 4:4:4，`quality` 生效）。失败返回 null。
+     *
+     * native 侧直接 `AndroidBitmap_lockPixels` 读 Bitmap（stride 感知，不经过
+     * Java 堆），因此只接受 ARGB_8888；其它配置请走 [encode]。
+     */
+    external fun nativeEncodeBitmap(bitmap: Bitmap, quality: Int): ByteArray?
+
+    /**
+     * P3：整图出口编码，强制 4:4:4（`Bitmap.compress` 是 4:2:0，暗部色块/边缘彩边来源）。
+     * 返回 null 表示不可用，调用方须回落到 `Bitmap.compress`。
+     */
+    @JvmStatic
+    fun encode(bitmap: Bitmap, quality: Int): ByteArray? {
+        if (bitmap.isRecycled) return null
+        var temp: Bitmap? = null
+        return try {
+            val src = if (bitmap.config != Bitmap.Config.ARGB_8888) {
+                bitmap.copy(Bitmap.Config.ARGB_8888, false)?.also { temp = it } ?: return null
+            } else {
+                bitmap
+            }
+            nativeEncodeBitmap(src, quality)
+        } catch (t: Throwable) {
+            Log.e(TAG, "native encode failed: ${t.message}")
+            null
+        } finally {
+            temp?.recycle()
+        }
+    }
+
+    /**
      * 打开一个流式写入器。[maxBandRows] 为期望的条带上限（像素行），
      * native 会在此基础上选取能整除且满足 DRI 16 位限制的条带高度。
      */

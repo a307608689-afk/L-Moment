@@ -90,10 +90,8 @@ object M3Mono {
 
                 convert(px, w, h)
                 b.setPixels(px, 0, w, 0, 0, w, h)
-                val bos = ByteArrayOutputStream(jpeg.size)
-                b.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+                val out = JpegEnc.encode(b)
                 b.recycle()
-                val out = bos.toByteArray()
                 lastInfo = "converted sample=$sample ${w}x$h meanChroma=$mean"
                 return out
             } catch (t: Throwable) {

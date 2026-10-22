@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -23,7 +24,9 @@ import android.text.Editable
 import android.text.InputFilter
 import android.text.TextUtils
 import android.text.TextWatcher
+import android.view.GestureDetector
 import android.view.Gravity
+import java.io.ByteArrayOutputStream
 import java.io.File
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
@@ -36,6 +39,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.ProgressBar
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,7 +54,10 @@ import com.codex.leicaapp.IccProfile
 import com.codex.leicaapp.LeicaMark
 import com.codex.leicaapp.StyleA
 import com.codex.leicaapp.StyleAFit
+import com.leicamoments.app.AdaptiveColorNet.toMono
 import java.util.concurrent.Executors
+import kotlin.math.max
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
@@ -63,7 +70,7 @@ class MainActivity : AppCompatActivity() {
         const val BIG_EXPORT_PIXELS = 100_000_000L
     }
 
-    private lateinit var imgPreview: ImageView
+    private lateinit var imgPreview: ZoomableImageView
     private lateinit var txtEmpty: TextView
     private lateinit var txtStyleHint: TextView
     private lateinit var progress: ProgressBar
@@ -83,24 +90,39 @@ class MainActivity : AppCompatActivity() {
     private var sourceUri: Uri? = null                 // 导入源（完美档 RAW 完整管线需重读 DNG）
     private var sourceIsRaw = false
     private lateinit var adjPanel: LinearLayout
-    private lateinit var btnBrightMinus: TextView
-    private lateinit var txtBrightLevel: TextView
-    private lateinit var btnBrightPlus: TextView
-    private lateinit var btnHighMinus: TextView
-    private lateinit var txtHighLevel: TextView
-    private lateinit var btnHighPlus: TextView
-    private lateinit var btnLumMinus: TextView
-    private lateinit var txtLumLevel: TextView
-    private lateinit var btnLumPlus: TextView
-    private lateinit var btnShadowMinus: TextView
-    private lateinit var txtShadowLevel: TextView
-    private lateinit var btnShadowPlus: TextView
-    private lateinit var btnBlackMinus: TextView
-    private lateinit var txtBlackLevel: TextView
-    private lateinit var btnBlackPlus: TextView
+    // P3：七档调节滑杆（进度 0..20 ↔ 档位 -10..+10；拖动调档，双击标签复位到 0）
+    private lateinit var sbBright: SeekBar
+    private lateinit var sbLum: SeekBar
+    private lateinit var sbHigh: SeekBar
+    private lateinit var sbShadow: SeekBar
+    private lateinit var sbBlack: SeekBar
+    private lateinit var sbSat: SeekBar
+    private lateinit var sbCon: SeekBar
+    private lateinit var sbGlow: SeekBar
+    private lateinit var txtBrightVal: TextView
+    private lateinit var txtLumVal: TextView
+    private lateinit var txtHighVal: TextView
+    private lateinit var txtShadowVal: TextView
+    private lateinit var txtBlackVal: TextView
+    private lateinit var txtSatVal: TextView
+    private lateinit var txtConVal: TextView
+    private lateinit var txtGlowVal: TextView
 
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // 调档预览专用队列：与共享 executor（导出烘焙/风格渲染等长任务）隔离，
+    // 调 +/− 档时预览重算不再排在长任务后面
+    private val adjExecutor = Executors.newSingleThreadExecutor()
+
+    // P2：RAW 提亮/强力提亮档导入时的 16-bit 线性预览基准（曲线映射后、未量化）。
+    // 调五档时若仍在原图卡片（无风格结果），直接在它上面应用 ToneCurve——
+    // RAW 的 10/12/14-bit 数据一路保真，调阴影/高光不再有 8-bit 源量化色带
+    private var rawLin16: RawToneMap.Lin16? = null
+    private var rawLin16Level = 0
+
+    // P2：导入时的 DNG 内嵌预览字节（导出重放 16-bit 五档时分位匹配必须用同一份，观感才一致）
+    private var rawPreviewJpeg: ByteArray? = null
 
     // 状态
     private var originalBytes: ByteArray? = null      // 工作 JPEG 字节（导出用）
@@ -120,6 +142,13 @@ class MainActivity : AppCompatActivity() {
     // 不参与滤镜链路（引擎硬上限 4096×3072），因此与 originalBytes 并存。
     // 源以 cache 文件形式驻留磁盘（50MB 级字节不进 Java 堆），EXIF 只需头部几十 KB 副本。
     private var fullResFile: File? = null
+    /**
+     * 一次性兜底标志：M9 高分辨率导出（[exportDistillHiRes]）失败时置 true 并重入 [export]，
+     * 让本次跳过全像素分支、直接走工作版原链路。成功后即被消费清零，不跨任务残留。
+     */
+    private var skipFullResOnce = false
+    /** M6 全像素条带失败后回落工作版：仅用于把 toast 文案改成「已按工作版导出」。 */
+    private var fullResFallbackOnce = false
     private var fullResExifHead: ByteArray? = null
     private var fullResWidth = 0
     private var fullResHeight = 0
@@ -129,6 +158,9 @@ class MainActivity : AppCompatActivity() {
     private var highlightLevel = 0            // 高光档（±10，0=不调；仅 RAW 导入显示步进器）
     private var shadowLevel = 0               // 阴影档（±10，0=不调；仅 RAW 导入显示步进器）
     private var blackLevel = 0                // 黑色阶档（±10，0=不调；仅 RAW 导入显示步进器）
+    private var satLevel = 0                  // 饱和度档（±10，0=不调）
+    private var contrastLevel = 0             // 对比度档（±10，0=不调）
+    private var glowLevel = 0                 // 柔光档（±10，0=不调；正=Orton 柔雾，负=清晰化）
     private var liftedOriginal: Bitmap? = null  // 原图调整显示版（曝光/阴影任一≠0 时存在）
     private var liftedResult: Bitmap? = null    // 滤镜结果调整显示版（同上）
     private var liftGen = 0                     // 调整重算代次，防与切滤镜/换图竞态
@@ -151,6 +183,8 @@ class MainActivity : AppCompatActivity() {
     private var coachVisible = false
     /** 上次同步的色彩库代次：设置页导入备份后回到这里，据此决定要不要重建滤镜条 */
     private var seenRevision = -1
+    /** 上次同步的「置顶跨分类」开关：设置页改了开关回这里，按新口径重建滤镜条 */
+    private var seenPinnedCross: Boolean? = null
 
     /** 分享码自动识别：本次会话里已被用户点「取消」的指令，不再重复打扰 */
     private var declinedShareSig: String? = null
@@ -160,11 +194,6 @@ class MainActivity : AppCompatActivity() {
 
     private val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) onImagePicked(uri)
-    }
-
-    // 新建自定义色彩：一次可多选参考图（1~10 张）
-    private val pickRefImages = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
-        if (!uris.isNullOrEmpty()) createFromRefs(uris)
     }
 
     // 增强（S4）：在游标版本的基础上追加参考图，先预览强度再落盘
@@ -190,10 +219,7 @@ class MainActivity : AppCompatActivity() {
     private val maxSeedPool = 50                      // 单个色彩的参考图池上限（跨版本累计）
     private val maxVersions = 6                       // 初始版 + 5 次增强，初始版永不删
 
-    private var creating = false                      // 生成中（挡重复入口）
-    private val maxRefs = 10                          // 新建色彩一次最多取多少张参考图
-    @Volatile
-    private var createCanceled = false
+    private val maxRefs = 10                          // 单次增强最多新增的参考图数
     private val customThumbPending = mutableSetOf<String>()  // 自定义卡缩略图在途，防空转
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -206,27 +232,63 @@ class MainActivity : AppCompatActivity() {
         applyImmersiveBars()
         bindViews()
         setupCategoryEntry()
-        btnImport.setOnClickListener { pickImage.launch("image/*") }
+        btnImport.setOnClickListener { requestMediaLocationThen { pickImage.launch("image/*") } }
         btnExport.setOnClickListener { export() }
-        imgPreview.setOnTouchListener { _, event -> onPreviewTouch(event) }
+        imgPreview.onCompareEnter = { if (hasColor()) originalBitmap?.let { imgPreview.setImageBitmap(it) } }
+        imgPreview.onCompareExit = { if (hasColor()) refreshPreviewImage() }
         btnSuperRes.setOnClickListener { confirmSuperRes(false) }
         btnSuperResFast.setOnClickListener { confirmSuperRes(true) }
         btnPerfect.setOnClickListener { onPerfectClicked() }
-        setupStepperButton(btnBrightPlus) { applyBrightChange(brightLevel + 1) }
-        setupStepperButton(btnBrightMinus) { applyBrightChange(brightLevel - 1) }
-        setupStepperButton(btnLumPlus) { applyExposureChange(exposureLevel + 1) }
-        setupStepperButton(btnLumMinus) { applyExposureChange(exposureLevel - 1) }
-        setupStepperButton(btnHighPlus) { applyHighChange(highlightLevel + 1) }
-        setupStepperButton(btnHighMinus) { applyHighChange(highlightLevel - 1) }
-        setupStepperButton(btnShadowPlus) { applyShadowChange(shadowLevel + 1) }
-        setupStepperButton(btnShadowMinus) { applyShadowChange(shadowLevel - 1) }
-        setupStepperButton(btnBlackPlus) { applyBlackChange(blackLevel + 1) }
-        setupStepperButton(btnBlackMinus) { applyBlackChange(blackLevel - 1) }
+        setupSlider(sbBright, txtBrightVal, { brightLevel }, { applyBrightChange(it) })
+        setupSlider(sbLum, txtLumVal, { exposureLevel }, { applyExposureChange(it) })
+        setupSlider(sbHigh, txtHighVal, { highlightLevel }, { applyHighChange(it) })
+        setupSlider(sbShadow, txtShadowVal, { shadowLevel }, { applyShadowChange(it) })
+        setupSlider(sbBlack, txtBlackVal, { blackLevel }, { applyBlackChange(it) })
+        setupSlider(sbSat, txtSatVal, { satLevel }, { applySatChange(it) })
+        setupSlider(sbCon, txtConVal, { contrastLevel }, { applyContrastChange(it) })
+        setupSlider(sbGlow, txtGlowVal, { glowLevel }, { applyGlowChange(it) })
         btnAdjust.setOnClickListener { toggleAdjPanel() }
         SuperResTask.addListener(srListener)
         // 分享冷启动：仅首次创建处理（系统重建/配置变化不重复导入）
         if (savedInstanceState == null) handleSharedIntent(intent)
+        if (savedInstanceState == null) applyDebugAutoImport()
         if (!SettingsStore.isCoachShown(this)) showCoach()
+    }
+
+    /** debug：从 Intent 直接喂一张工作图并选中模型，绕过相册（release 不触发）。 */
+    private fun applyDebugAutoImport() {
+        if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
+        val path = intent.getStringExtra("autoImage") ?: return
+        mainHandler.post {
+            val bytes = try {
+                File(path).readBytes()
+            } catch (t: Throwable) {
+                toast("自动导入失败：读不到 $path")
+                return@post
+            }
+            val bmp = decodePreview(bytes, 2048) ?: run {
+                toast("自动导入失败：解码失败")
+                return@post
+            }
+            originalBytes = bytes
+            originalBitmap?.recycle()
+            originalBitmap = bmp
+            resultBitmap?.recycle()
+            resultBitmap = null
+            val sz = ImageUtils.probeJpegSize(bytes)
+            workWidth = sz?.getOrNull(0) ?: bmp.width
+            workHeight = sz?.getOrNull(1) ?: bmp.height
+            imgPreview.setImageBitmap(bmp)
+            generateThumbnails()
+            val id = intent.getStringExtra("autoModel") ?: return@post
+            val def = CustomStyleStore.byId(id)
+            if (def == null) {
+                toast("自动选中的模型不存在")
+            } else {
+                toast("自动应用 ${def.name}（${if (def.hasModelNet) "M6" else "旧 LUT"}）")
+                onCustomSelected(FilterEntry.Custom(id))
+            }
+        }
     }
 
     /** 黑匣子：崩溃写盘；下次启动若存在崩溃记录则弹窗展示（无 ADB 环境的排障通道） */
@@ -303,6 +365,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         // 设置页里导入备份后，MainActivity 还在栈下不会重建滤镜条：
         // 只有色彩库真的变了才重建一次（首次 resume 只记录基线，避免重复构建）。
+        var rebuild = false
         val revision = CustomStyleStore.revision
         if (seenRevision < 0) {
             seenRevision = revision
@@ -314,8 +377,17 @@ class MainActivity : AppCompatActivity() {
                 currentCustomId = null
                 txtStyleHint.text = "原图"
             }
-            buildFilterBar(currentCategory)
+            rebuild = true
         }
+        // 设置页改了「置顶跨分类显示」开关：滤镜条要按新口径重建（首次只记基线）
+        val cross = SettingsStore.pinnedCrossCategory(this)
+        if (seenPinnedCross == null) {
+            seenPinnedCross = cross
+        } else if (cross != seenPinnedCross) {
+            seenPinnedCross = cross
+            rebuild = true
+        }
+        if (rebuild) buildFilterBar(currentCategory)
         // 微信里复制分享指令后切回本应用：等窗口拿到焦点再读剪贴板
         // （Android 10+ 只允许有焦点的应用读剪贴板，onResume 当下还读不到）
         mainHandler.postDelayed({
@@ -366,21 +438,22 @@ class MainActivity : AppCompatActivity() {
         txtCoach = findViewById(R.id.txtCoach)
         filterScroll = findViewById(R.id.filterScroll)
         adjPanel = findViewById(R.id.adjPanel)
-        btnBrightMinus = findViewById(R.id.btnBrightMinus)
-        txtBrightLevel = findViewById(R.id.txtBrightLevel)
-        btnBrightPlus = findViewById(R.id.btnBrightPlus)
-        btnHighMinus = findViewById(R.id.btnHighMinus)
-        txtHighLevel = findViewById(R.id.txtHighLevel)
-        btnHighPlus = findViewById(R.id.btnHighPlus)
-        btnLumMinus = findViewById(R.id.btnLumMinus)
-        txtLumLevel = findViewById(R.id.txtLumLevel)
-        btnLumPlus = findViewById(R.id.btnLumPlus)
-        btnShadowMinus = findViewById(R.id.btnShadowMinus)
-        txtShadowLevel = findViewById(R.id.txtShadowLevel)
-        btnShadowPlus = findViewById(R.id.btnShadowPlus)
-        btnBlackMinus = findViewById(R.id.btnBlackMinus)
-        txtBlackLevel = findViewById(R.id.txtBlackLevel)
-        btnBlackPlus = findViewById(R.id.btnBlackPlus)
+        sbBright = findViewById(R.id.sbBright)
+        sbLum = findViewById(R.id.sbLum)
+        sbHigh = findViewById(R.id.sbHigh)
+        sbShadow = findViewById(R.id.sbShadow)
+        sbBlack = findViewById(R.id.sbBlack)
+        sbSat = findViewById(R.id.sbSat)
+        sbCon = findViewById(R.id.sbCon)
+        sbGlow = findViewById(R.id.sbGlow)
+        txtBrightVal = findViewById(R.id.txtBrightVal)
+        txtLumVal = findViewById(R.id.txtLumVal)
+        txtHighVal = findViewById(R.id.txtHighVal)
+        txtShadowVal = findViewById(R.id.txtShadowVal)
+        txtBlackVal = findViewById(R.id.txtBlackVal)
+        txtSatVal = findViewById(R.id.txtSatVal)
+        txtConVal = findViewById(R.id.txtConVal)
+        txtGlowVal = findViewById(R.id.txtGlowVal)
     }
 
     // ---- 滤镜条 ----
@@ -433,14 +506,20 @@ class MainActivity : AppCompatActivity() {
      * 排序按创建时间倒序，与普通卡片一样排队，**不做「当前模型自动置顶」**——
      * 置顶只由用户手动置顶（[SettingsStore.pinnedIds]）产生。
      *
-     * 置顶区**不参与分类过滤**，这就是「跨分类置顶」：在经典分类下，
-     * 被置顶的 CCD 色彩照样排最前。顺序取 SettingsStore 的有序数组（最近置顶在前）。
+     * 置顶区的分类口径由设置页「置顶跨分类显示」决定（默认关）：
+     * - 关（默认）：置顶区只含属于当前分类的条目——L-Moment 恒全量；内置色彩在其
+     *   所属分类（[FilterCategory.styles]）；自定义/模型色彩只在「我的色彩」。
+     *   被置顶的 CCD 色彩**不会**再出现在 ARRI 等无关分类里。
+     * - 开（旧口径）：置顶区不参与分类过滤，任何分类下都排最前。
+     * 顺序取 SettingsStore 的有序数组（最近置顶在前）。
      */
     private fun orderedEntries(category: FilterCategory): List<FilterEntry> {
         // 模型色彩与普通自定义一样允许手动置顶（创建时不自动置顶，见上方说明）；
         // 已隐藏的内置色彩（Style A）要过滤，否则历史置顶记录会把它带回列表
+        val cross = SettingsStore.pinnedCrossCategory(this)
         val pinned = SettingsStore.pinnedIds(this).mapNotNull { resolveEntry(it) }
             .filter { !isHiddenEntry(it) }
+            .filter { cross || belongsToCategory(it, category) }
         val pinnedIds = pinned.mapTo(HashSet()) { it.id }
         val normal = when (category) {
             // L-Moment 也要能看到自己新建的色彩，否则建完只能回「我的色彩」里看；
@@ -470,6 +549,18 @@ class MainActivity : AppCompatActivity() {
     private fun isHiddenEntry(entry: FilterEntry): Boolean {
         val style = (entry as? FilterEntry.BuiltIn)?.style ?: return false
         return style !in LeicaEngine.Style.UI_VISIBLE
+    }
+
+    /**
+     * 非跨分类模式下置顶项的归属判定（与分类正常区同口径）：
+     * L-Moment 全量可见；自定义/模型色彩只在「我的色彩」；内置色彩在其所属分类。
+     */
+    private fun belongsToCategory(entry: FilterEntry, category: FilterCategory): Boolean {
+        return when (category) {
+            FilterCategory.ALL -> true
+            FilterCategory.CUSTOM -> entry is FilterEntry.Custom
+            else -> (entry as? FilterEntry.BuiltIn)?.style in category.styles
+        }
     }
 
     /** 持久化的 id → 条目；色彩已被删除时返回 null（残留的置顶记录自动跳过） */
@@ -541,6 +632,18 @@ class MainActivity : AppCompatActivity() {
     /** 分类弹窗底部独立入口 → 模型库（选择模式） */
     private fun openModelGallery() {
         pickModel.launch(Intent(this, ModelActivity::class.java))
+    }
+
+    /**
+     * 「我的色彩」新建卡 → 直达模型色彩新建：落地即弹「新建模型色彩」对话框。
+     * 选择模式下建完自动选中返回（用户不用再点一次）；取消则留在模型库，
+     * 可顺手挑一个现有模型，或退出不动。
+     */
+    private fun openModelCreate() {
+        pickModel.launch(
+            Intent(this, ModelActivity::class.java)
+                .putExtra(ModelActivity.EXTRA_AUTO_CREATE, true)
+        )
     }
 
     /** 主界面长按模型卡 →「设置」：直接进该模型的色彩模式页 */
@@ -652,7 +755,8 @@ class MainActivity : AppCompatActivity() {
                 is FilterEntry.BuiltIn -> onFilterSelected(entry)
                 is FilterEntry.Custom -> onFilterSelected(entry)
                 is FilterEntry.Orig -> onFilterSelected(entry)
-                is FilterEntry.Create -> startCreate()
+                // 新建入口统一走模型色彩（QUICK 快速生成已退役，管线见 git 历史）
+                is FilterEntry.Create -> openModelCreate()
             }
         }
         card.setOnLongClickListener { v ->
@@ -739,7 +843,7 @@ class MainActivity : AppCompatActivity() {
      * 用户不会拿到半截字符串，也不会误以为有两条路可走。
      */
     private fun shareCustomStyle(styleId: String) {
-        if (enhancing || creating || splitting) {
+        if (enhancing || splitting) {
             toast("正在生成色彩，请稍候")
             return
         }
@@ -895,7 +999,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 导入落库：后台重烘焙/写文件，完成后重建滤镜条并选中新卡片。 */
     private fun importSharePayload(payload: ColorShareCode.Payload, sig: String) {
-        if (enhancing || creating || splitting) {
+        if (enhancing || splitting) {
             toast("正在生成色彩，请稍候")
             return
         }
@@ -1223,6 +1327,9 @@ class MainActivity : AppCompatActivity() {
 
                 val preview: Bitmap
                 val workBytes: ByteArray
+                // 新导入作废旧 RAW 16-bit 基准（RAW 提亮档成功后于 decodeRaw 内重登记）
+                rawLin16 = null
+                rawPreviewJpeg = null
                 if (isRaw) {
                     val r = decodeRaw(bytes)
                     if (r == null) {
@@ -1301,6 +1408,9 @@ class MainActivity : AppCompatActivity() {
                     highlightLevel = 0
                     shadowLevel = 0
                     blackLevel = 0
+                    satLevel = 0
+                    contrastLevel = 0
+                    glowLevel = 0
                     updateLumBarUi()
                     // 作废在途调整任务：防止旧图的调整版完成于新导入之后盖在预览上
                     liftGen++
@@ -1366,14 +1476,16 @@ class MainActivity : AppCompatActivity() {
      * 的 AnalogBalance 过度增益）+ 色彩增强链（自动曝光/阴影提升/对比度/饱和度/高光压缩）。
      * 返回 (预览Bitmap, 处理输入JPEG)，失败返回 null。
      */
-    private fun decodeRaw(bytes: ByteArray): Pair<Bitmap, ByteArray>? {
-        // 解码亮度档位：按机型记忆；默认 0.01 与旧版本行为完全一致。
+    private fun decodeRaw(bytes: ByteArray): Triple<Bitmap, ByteArray, RawToneMap.Lin16?>? {
+        // 解码亮度档位：按机型记忆；默认「提亮」(level 1，2026-10-22 改定，旧版默认标准)。
         // 提亮/强力提亮改走「线性解码 + 自适应软肩曲线」（同亮度下削顶从 2.24% 降到 0.34%），
         // 标准档仍走原 thr 路径逐字节不变；新路径失败时回落原路径保证可用。
         val level = SettingsStore.rawThrLevel(this)
+        var lin16: RawToneMap.Lin16? = null
         val decoded = if (RawToneMap.isEnabled(level)) {
-            decodeLinearTone(bytes, level)
-                ?: RawDecoder.nativeDecodeWithThr(bytes, SettingsStore.rawThr(this))
+            val r = decodeLinearTone(bytes, level)
+            lin16 = r?.second
+            r?.first ?: RawDecoder.nativeDecodeWithThr(bytes, SettingsStore.rawThr(this))
         } else {
             RawDecoder.nativeDecodeWithThr(bytes, SettingsStore.rawThr(this))
         } ?: return null
@@ -1396,14 +1508,17 @@ class MainActivity : AppCompatActivity() {
         val p = scaleBitmap(base, 1600)
         val work = ImageUtils.toJpeg(base, 95)
         if (p !== base) base.recycle()
-        return Pair(p, work)
+        // P2：登记 16-bit 基准、解码档位与内嵌预览（导出重放校验用）；非提亮档为 null
+        rawLin16 = lin16
+        rawLin16Level = level
+        return Triple(p, work, lin16)
     }
 
     /**
      * 提亮档专用解码：LibRaw 线性 sRGB 16bit → 自适应软肩曲线 → ARGB。
      * 失败（native 解码异常 / 曲线异常）返回 null，由 [decodeRaw] 回落原 thr 路径。
      */
-    private fun decodeLinearTone(bytes: ByteArray, level: Int): IntArray? {
+    private fun decodeLinearTone(bytes: ByteArray, level: Int): Pair<IntArray, RawToneMap.Lin16?>? {
         val buf = RawDecoder.nativeDecodeLinearSrgb(bytes) ?: return null
         return try {
             val t0 = System.currentTimeMillis()
@@ -1415,8 +1530,11 @@ class MainActivity : AppCompatActivity() {
                 null
             }
             val t1 = System.currentTimeMillis()
-            val out = RawToneMap.render(buf, level, preview)
-            DiagLog.w("Import", "RAW 线性曲线 level=$level ${out?.get(0)}x${out?.get(1)} " +
+            // P2：一次解码出 ARGB + 1600px 16-bit 线性基准（调五档时免 8-bit 量化损失）；
+            // 顺带缓存内嵌预览字节（导出 16-bit 重放的分位匹配基准）
+            rawPreviewJpeg = preview
+            val out = RawToneMap.renderWithBase(buf, level, preview, null, 1600)
+            DiagLog.w("Import", "RAW 线性曲线 level=$level ${out?.first?.get(0)}x${out?.first?.get(1)} " +
                     "preview=${preview?.size ?: 0}B 提取${t1 - t0}ms 映射${System.currentTimeMillis() - t1}ms")
             out
         } catch (t: Throwable) {
@@ -1424,6 +1542,40 @@ class MainActivity : AppCompatActivity() {
             null
         } finally {
             RawDecoder.nativeFreeLinear(buf)
+        }
+    }
+
+    /**
+     * P2：RAW 16-bit 五档导出重放——重读源 DNG → 线性解码 → RawToneMap 曲线 +
+     * ToneCurve 七档（同一条曲线、同一份内嵌预览引导，与导入/预览完全同源）→ 编码 JPEG。
+     * 曲线七档在 16-bit 线性域完成（RAW 高位深保真）；柔光不进曲线域，在降 8-bit 的
+     * 位图上叠 SoftGlow（8-bit 域足够，见 SoftGlow 头注）。风格引擎消费其输出。
+     * 任一步失败返回 null，调用方回落「风格 → applyStackToJpeg」原链路。
+     */
+    private fun raw16TonedWorkBytes(br: Int, ev: Int, hl: Int, sh: Int, bl: Int,
+                                    sa: Int, co: Int, gl: Int = 0): ByteArray? {
+        val level = rawLin16Level
+        val preview = rawPreviewJpeg
+        val uri = sourceUri ?: return null
+        if (level == 0 || !RawToneMap.isEnabled(level) || preview == null) return null
+        return try {
+            val src = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+            val buf = RawDecoder.nativeDecodeLinearSrgb(src) ?: return null
+            try {
+                val argb = RawToneMap.renderWithTone(
+                    buf, level, preview, ToneCurve.of(br, ev, hl, sh, bl, sa, co)) ?: return null
+                val w = argb[0]
+                val h = argb[1]
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bmp.setPixels(argb, 2, w, 0, 0, w, h)
+                if (gl != 0) SoftGlow.applyInPlace(bmp, gl)
+                try { ImageUtils.toJpeg(bmp, 95) } finally { bmp.recycle() }
+            } finally {
+                RawDecoder.nativeFreeLinear(buf)
+            }
+        } catch (t: Throwable) {
+            DiagLog.e("Export", "RAW 16bit 七档重放失败，回落 8bit 链", t)
+            null
         }
     }
 
@@ -1438,7 +1590,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle("RAW 可能比相册偏暗")
             .setMessage(
                 "相册预览通常经过多帧合成，RAW 直出在白天大光比场景会暗一些。\n\n" +
-                    "如果觉得偏暗，可在 设置 → RAW 解码亮度 选「提亮」。默认「标准」，与之前的观感一致。"
+                    "默认已选「提亮」；如仍偏暗，可在 设置 → RAW 解码亮度 选「强力提亮」，追求质感偏暗可选「标准」。"
             )
             .setPositiveButton("去设置", null)
             .setNegativeButton("知道了", null)
@@ -1723,8 +1875,10 @@ class MainActivity : AppCompatActivity() {
         progress.visible()
         executor.execute {
             try {
+                // M6：带 aff/knots 的模型走 native 新链，没有才回旧 LUT
+                val useNet = def.hasModelNet
                 // M5：被 LRU 回收的旧版本在「首次应用」时按 θ 快照重烘（一次性成本）
-                if (!ModelColor.ensure(this, def, version)) {
+                if (!useNet && !ModelColor.ensure(this, def, version)) {
                     DiagLog.w("Engine", "色彩文件缺失且无法重建 ${def.id}/${version.id}")
                     mainHandler.post {
                         if (gen == processingGeneration) {
@@ -1740,8 +1894,41 @@ class MainActivity : AppCompatActivity() {
                 }
                 val t0 = System.currentTimeMillis()
                 DiagLog.i("Engine", "${def.name} 自定义色彩处理开始 ${work.size}B")
-                val out = ModelColor.render(this, work, version) {
+                val warn: () -> Unit = {
                     mainHandler.post { toast("「${def.name}」色彩文件不可用，已输出原图") }
+                    Unit
+                }
+                // M7.2：参考集有多个风格簇时，先给 640px 候选预览，选中后再渲染全图
+                val cands = if (useNet) buildCandidateStyles(work, def, intent.getBooleanExtra("debugCandAll", false)) else null
+                if (cands != null && cands.size > 1) {
+                    DiagLog.i("Engine", "${def.name} 候选 ${cands.size} 个 耗时 ${System.currentTimeMillis() - t0}ms")
+                    mainHandler.post {
+                        if (gen != processingGeneration) {
+                            cands.forEach { it.preview.recycle() }
+                            return@post
+                        }
+                        progress.gone()
+                        txtStyleHint.text = "${def.name} · 多风格"
+                        StyleCandidateSheet.show(
+                            this,
+                            cands.map { StyleCandidateSheet.Item(it.label, it.preview, it.deltaE) },
+                            onPick = { idx ->
+                                cands.forEach { it.preview.recycle() }
+                                applyCandidate(def, work, cands[idx], gen)
+                            },
+                            onCancel = {
+                                cands.forEach { it.preview.recycle() }
+                                applyCandidate(def, work, cands[0], gen)
+                            }
+                        )
+                    }
+                    return@execute
+                }
+                val out = if (useNet) {
+                    cands?.firstOrNull()?.let { renderWithStyle(work, it.style) }
+                        ?: renderModelNet(work, def) ?: ModelColor.render(this, work, version, warn)
+                } else {
+                    ModelColor.render(this, work, version, warn)
                 }
                 DiagLog.i("Engine", "${def.name} 处理完成 ${out.size}B 耗时 ${System.currentTimeMillis() - t0}ms")
                 val bmp = ImageUtils.fromJpeg(out)
@@ -1772,155 +1959,139 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---- 新建自定义色彩（S2） ----
+    /**
+     * M6：用 aff/knots 渲染工作图。native apply 约 1.6 s / 12 MP；失败返回 null，
+     * 调用方回退旧 LUT。
+     */
+    private fun renderModelNet(work: ByteArray, def: CustomStyleDef): ByteArray? {
+        val style = def.modelStyle ?: return null
+        return renderWithStyle(work, AdaptiveColorNet.Style(style.first, style.second))
+    }
+
+    private fun renderWithStyle(work: ByteArray, style: AdaptiveColorNet.Style): ByteArray? {
+        val src = ImageUtils.fromJpeg(work) ?: return null
+        val styled = try {
+            AdaptiveColorNet.apply(src, style, smooth = true)
+        } finally {
+            src.recycle()
+        }
+        if (styled == null) return null
+        return try {
+            val bos = ByteArrayOutputStream()
+            styled.compress(Bitmap.CompressFormat.JPEG, 92, bos)
+            bos.toByteArray()
+        } finally {
+            styled.recycle()
+        }
+    }
+
+    private data class Candidate(
+        val label: String,
+        val style: AdaptiveColorNet.Style,
+        val preview: Bitmap,
+        val deltaE: Float
+    )
 
     /**
-     * 新建入口：先讲清「参考图不会被保存、用的是统计量」，再进多选。
-     * 不依赖当前工作图——没导入图片也能建色彩（只是暂时没缩略图）。
+     * M7.2：读 emb_seeds → 候选簇 → 每簇 aggregate/fuse → 640px 预览 + ΔE00。
+     * 返回 null 表示没有 emb 或单候选（调用方走原路径）。
+     *
+     * 候选级 ΔE00 裁剪（3.0~12.0）：<3 视为与候选 0 重复，>12 视为离群簇；
+     * 与 PC 版 22_m7_candidates.py 的 delta_e_fn 同语义，端侧用真实渲染替代代理。
      */
-    private fun startCreate() {
-        if (creating || enhancing || splitting) { toast("正在生成色彩，请稍候"); return }
-        if (srBusy) { toast("处理中，请稍候"); return }
-        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
-            .setTitle("新建自定义色彩")
-            .setMessage(
-                "选择 1~10 张你喜欢的成片作为参考。会先中和每张图的光源色温与曝光，" +
-                    "再拟合它相对原片的色彩倾向（明暗曲线、分色相饱和度、冷暖染色），" +
-                    "生成一套可反复套用的固定色彩。\n\n" +
-                    "参考图本身不会被保存，也不会出现在导出里（只留统计量与缩略图用于重新生成）。请选已经调好色的成片；" +
-                    "画面里若有白墙、云、灰地面，光源估计会更准。"
-            )
-            .setPositiveButton("选择参考图") { _, _ -> pickRefImages.launch("image/*") }
-            .setNegativeButton("取消", null)
-            .show()
+    private fun buildCandidateStyles(
+        work: ByteArray,
+        def: CustomStyleDef,
+        skipDeGate: Boolean = false
+    ): List<Candidate>? {
+        val emb = ModelRefStore.loadEmb(this, def.id) ?: return null
+        val d = 36
+        val n = emb.size / d
+        if (n < 4) return null
+        val res = StyleCandidates.candidates(emb, n, d)
+        if (res.single) return null
+        // 黑白参考 → 候选簇同样转单色，否则用户切到任何候选都会回到彩色
+        val refThumbs = ModelRefStore.allThumbs(this, def.id).sortedBy { it.first }
+            .mapNotNull { (_, f) -> BitmapFactory.decodeFile(f.absolutePath) }
+        val monoRefs = refThumbs.isNotEmpty() &&
+            AdaptiveColorNet.refsMeanChroma(refThumbs) < AdaptiveColorNet.MONO_MEAN_CHROMA
+        refThumbs.forEach { it.recycle() }
+        val src = ImageUtils.fromJpeg(work) ?: return null
+        val scale = 640f / max(src.width, src.height)
+        val small = if (scale < 1f) Bitmap.createScaledBitmap(
+            src,
+            (src.width * scale).roundToInt().coerceAtLeast(1),
+            (src.height * scale).roundToInt().coerceAtLeast(1),
+            true
+        ) else src
+        val out = ArrayList<Candidate>()
+        try {
+            for ((i, p) in res.picks.withIndex()) {
+                val sub = FloatArray(p.members.size * d)
+                p.members.forEachIndexed { j, m -> System.arraycopy(emb, m * d, sub, j * d, d) }
+                val r = AdaptiveColorNet.aggregate(sub, p.members.size)
+                val style = (AdaptiveColorNet.fuse(this, r) ?: continue).let {
+                    if (monoRefs) it.toMono() else it
+                }
+                val styled = AdaptiveColorNet.apply(small, style, smooth = true) ?: continue
+                val de = if (out.isEmpty()) 0f else ColorMath.avgDeltaE00(out[0].preview, styled)
+                out.add(Candidate(if (i == 0) "原风格" else "风格 ${i + 1}", style, styled, de))
+            }
+        } finally {
+            if (small !== src) small.recycle()
+            src.recycle()
+        }
+        if (out.size < 2) {
+            out.forEach { it.preview.recycle() }
+            return null
+        }
+        val kept = if (skipDeGate) out
+        else out.filterIndexed { i, c -> i == 0 || c.deltaE.isNaN() || (c.deltaE in 3f..12f) }
+        out.forEach { if (it !in kept) it.preview.recycle() }
+        return if (kept.size < 2) {
+            kept.forEach { it.preview.recycle() }
+            null
+        } else kept
     }
 
-    /** 参考图 → 逐张指纹 → 聚合烘焙 33³ LUT → 建卡并自动选中。 */
-    private fun createFromRefs(uris: List<Uri>) {
-        if (uris.isEmpty()) return
-        val picked = if (uris.size > maxRefs) uris.take(maxRefs) else uris
-        if (uris.size > maxRefs) toast("最多 $maxRefs 张参考图，已取前 $maxRefs 张")
-        creating = true
-        createCanceled = false
-
-        val tvProgress = TextView(this).apply {
-            text = "正在分析参考图…"
-            setTextColor(Color.parseColor("#8A8A8E"))
-            textSize = 13f
-            setPadding(0, dp(12), 0, 0)
-        }
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(20), dp(24), dp(4))
-            addView(
-                ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
-                    isIndeterminate = true
-                },
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(4))
-            )
-            addView(tvProgress)
-        }
-        val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
-            .setTitle("生成色彩")
-            .setView(box)
-            .setNegativeButton("取消") { _, _ -> createCanceled = true }
-            .setCancelable(false)
-            .create()
-        dialog.show()
-
+    /** 候选选中后：全图渲染并回到预览（与 onCustomSelected 的收尾同构）。 */
+    private fun applyCandidate(def: CustomStyleDef, work: ByteArray, cand: Candidate, gen: Int) {
+        progress.visible()
         executor.execute {
-            val seeds = ArrayList<RefSeed>()
-            var failed = 0
-            var rejectMsg: String? = null
-            var warnMsg: String? = null
-            for ((i, uri) in picked.withIndex()) {
-                if (createCanceled) break
-                mainHandler.post { tvProgress.text = "分析参考图 ${i + 1}/${picked.size}" }
+            try {
                 val t0 = System.currentTimeMillis()
-                val seed = try {
-                    RefAnalyzer.analyze(this, uri)
-                } catch (t: Throwable) {
-                    DiagLog.e("Custom", "参考图分析异常 $uri", t)
-                    null
-                }
-                if (seed != null) {
-                    seeds.add(seed)
-                    DiagLog.i("Custom", "参考图 ${i + 1} 分析完成 ${System.currentTimeMillis() - t0}ms")
-                    val w = RefAnalyzer.lastWarning
-                    if (w != null) warnMsg = if (warnMsg == null) w else warnMsg + " " + w
-                } else {
-                    failed++
-                    // lastReject 是逐次调用的，必须当场取；循环继续会被后续图覆盖
-                    if (rejectMsg == null) rejectMsg = RefAnalyzer.lastReject
-                }
-            }
-            if (createCanceled) {
-                mainHandler.post { dialog.dismiss(); creating = false }
-                return@execute
-            }
-            if (seeds.isEmpty()) {
+                val version = CustomStyleStore.currentVersion(def) ?: return@execute
+                val out = renderWithStyle(work, cand.style)
+                    ?: ModelColor.render(this, work, version) {
+                        mainHandler.post { toast("「${def.name}」色彩不可用，已输出原图") }
+                    }
+                DiagLog.i("Engine", "${def.name} 候选渲染 ${out.size}B 耗时 ${System.currentTimeMillis() - t0}ms")
+                val bmp = ImageUtils.fromJpeg(out)
                 mainHandler.post {
-                    dialog.dismiss(); creating = false
-                    val why = rejectMsg
-                    if (why != null) showRefNotice("参考图无法使用", why)
-                    else toast("参考图无法解析，换几张试试")
+                    if (gen == processingGeneration) {
+                        progress.gone()
+                        if (bmp != null) {
+                            resultBitmap?.recycle()
+                            resultBitmap = bmp
+                            if (exposureLevel != 0) {
+                                refreshPreviewImage()
+                                recomputeAdjAsync()
+                            } else {
+                                imgPreview.setImageBitmap(bmp)
+                            }
+                        }
+                    } else if (bmp != null) {
+                        bmp.recycle()
+                    }
                 }
-                return@execute
-            }
-            mainHandler.post { tvProgress.text = "正在生成色彩（${seeds.size} 张参考）…" }
-
-            val id = CustomStyleStore.newId()
-            val versionId = "v_" + System.currentTimeMillis().toString(36)
-            val lutFile = "lut_${id}_${versionId}.bin"
-            val tBake = System.currentTimeMillis()
-            val ok = CustomLutBaker.bake(this, seeds, lutFile)
-            DiagLog.i("Custom", "烘焙${if (ok) "成功" else "失败"} $lutFile 耗时 ${System.currentTimeMillis() - tBake}ms 参考 ${seeds.size} 张")
-
-            mainHandler.post {
-                dialog.dismiss()
-                creating = false
-                if (!ok) { toast("色彩生成失败，请重试"); return@post }
-                val now = System.currentTimeMillis()
-                val def = CustomStyleDef(
-                    id = id,
-                    name = nextCustomName(),
-                    createdAt = now,
-                    seeds = seeds,
-                    versions = mutableListOf(
-                        StyleVersion(
-                            id = versionId,
-                            createdAt = now,
-                            label = "初始",
-                            lutFile = lutFile,
-                            seedCount = seeds.size,
-                            source = VersionSource.INITIAL
-                        )
-                    ),
-                    currentVersionId = versionId
-                )
-                CustomStyleStore.put(this, def)
-                // 入口只在「我的色彩」内，建完就地重排该分类即可看到新卡
-                SettingsStore.setLastCategory(this, FilterCategory.CUSTOM)
-                buildFilterBar(FilterCategory.CUSTOM)
-                ensureCustomThumb(id)          // 新卡的缩略图（有工作图时才有）
-                selectCardByEntry(FilterEntry.Custom(id))
-                onFilterSelected(FilterEntry.Custom(id))
-                toast(
-                    if (failed > 0) "已创建「${def.name}」（${failed} 张参考图未能采用）"
-                    else "已创建「${def.name}」"
-                )
-                val wm = warnMsg
-                if (wm != null) showRefNotice("参考图提醒", wm)
+            } catch (t: Throwable) {
+                DiagLog.e("Engine", "候选渲染失败", t)
+                mainHandler.post {
+                    progress.gone()
+                    toast("处理失败，请重试（详情见日志）")
+                }
             }
         }
-    }
-
-    /** 默认名「色彩 N」：取当前未被占用的最小序号（重命名在 S3）。 */
-    private fun nextCustomName(): String {
-        val used = CustomStyleStore.all().mapTo(HashSet()) { it.name }
-        var i = 1
-        while (used.contains("色彩 $i")) i++
-        return "色彩 $i"
     }
 
     // ---- 增强（S4）：游标版本 + 新参考图 → 新版本 ----
@@ -1932,7 +2103,7 @@ class MainActivity : AppCompatActivity() {
      * 的种子会重新变成可用额度，与提交时「先截断再追加」的语义一致。
      */
     private fun startEnhance(styleId: String) {
-        if (enhancing || creating || splitting) { toast("正在生成色彩，请稍候"); return }
+        if (enhancing || splitting) { toast("正在生成色彩，请稍候"); return }
         if (srBusy) { toast("处理中，请稍候"); return }
         val def = CustomStyleStore.byId(styleId)
         val version = def?.let { CustomStyleStore.currentVersion(it) }
@@ -2063,7 +2234,21 @@ class MainActivity : AppCompatActivity() {
             val indexes = ArrayList<Int>(baseCount + added.size)
             for (i in 0 until baseCount) indexes.add(i)
             for (i in 0 until added.size) indexes.add(baseCount + i)
-            val paramBytes = ModelFitter.fitFromThumbs(this, styleId, indexes)
+            // M6 模型：用全部 240px 缩略图重新编码 aff/knots，不碰 LUT/param
+            val isNet = def.hasModelNet
+            var netStyle: AdaptiveColorNet.Style? = null
+            if (isNet) {
+                val bitmaps = ModelRefStore.allThumbs(this, styleId)
+                    .sortedBy { it.first }
+                    .mapNotNull { (_, f) -> BitmapFactory.decodeFile(f.absolutePath) }
+                netStyle = AdaptiveColorNet.encodeStyle(this, bitmaps)?.let {
+                    // 黑白参考 → 单色风格（须在 recycle 前测色度）
+                    AdaptiveColorNet.monoIfGray(bitmaps, it).first
+                }
+                bitmaps.forEach { it.recycle() }
+                DiagLog.i("Custom", "M6 增强编码${if (netStyle != null) "成功" else "失败"} 参考 ${indexes.size} 张")
+            }
+            val paramBytes = if (isNet) null else ModelFitter.fitFromThumbs(this, styleId, indexes)
             // A 路线升级：旧版是参数才能按强度插值；旧版是 LUT 时滑块隐藏、按 100% 应用
             val oldParams = if (version.paramFile.isNotEmpty()) {
                 ModelParamStore.read(this, version.paramFile)
@@ -2080,7 +2265,7 @@ class MainActivity : AppCompatActivity() {
             var pendingFile = ""
             var oldBytes: ByteArray? = null
             var newBytes: ByteArray? = null
-            if (paramBytes == null) {
+            if (!isNet && paramBytes == null) {
                 pendingFile = "pending_${styleId}_${System.currentTimeMillis().toString(36)}.bin"
                 val t1 = System.currentTimeMillis()
                 val ok = CustomLutBaker.bake(this, effective + added, pendingFile)
@@ -2095,12 +2280,12 @@ class MainActivity : AppCompatActivity() {
             mainHandler.post {
                 dialog.dismiss()
                 enhancing = false
-                if (paramBytes == null && (oldBytes == null || newBytes == null)) {
+                if (!isNet && paramBytes == null && (oldBytes == null || newBytes == null)) {
                     if (pendingFile.isNotEmpty()) deletePendingLut(pendingFile)
                     toast(if (oldBytes == null) "当前版本的色彩文件已丢失" else "色彩生成失败，请重试")
                     return@post
                 }
-                if (paramBytes != null && !ModelColor.ready(this, version)) {
+                if (!isNet && paramBytes != null && !ModelColor.ready(this, version)) {
                     toast("当前版本的色彩文件已丢失")
                     return@post
                 }
@@ -2114,9 +2299,12 @@ class MainActivity : AppCompatActivity() {
                 val wm = warnMsg
                 if (wm != null) showRefNotice("参考图提醒", wm)
 
-                // 新效果渲染器：参数版本走 StyleA（带强度插值），旧 LUT 版本走查表
+                // 新效果渲染器：M6 走 native、参数版本走 StyleA（带强度插值），旧 LUT 走查表
+                val ns = netStyle
                 val renderNew: (android.graphics.Bitmap, Float) -> android.graphics.Bitmap? =
-                    if (paramBytes != null) {
+                    if (ns != null) {
+                        { bmp, s -> AdaptiveColorNet.apply(bmp, ns, strength = s) }
+                    } else if (paramBytes != null) {
                         { bmp, s ->
                             val bytes = if (oldParams != null && s < 0.999f) {
                                 StyleAFit.blend(oldParams, paramBytes, s) ?: paramBytes
@@ -2144,13 +2332,20 @@ class MainActivity : AppCompatActivity() {
                 EnhancePreviewDialog.show(
                     this, base, added.size,
                     effective.size + added.size,
-                    allowStrength = paramBytes == null || oldParams != null,
-                    renderOld = { bmp -> ModelColor.renderBitmap(this, bmp, version) },
+                    allowStrength = isNet || paramBytes == null || oldParams != null,
+                    renderOld = { bmp ->
+                        val os = def.modelStyle
+                        if (os != null) {
+                            AdaptiveColorNet.apply(bmp, AdaptiveColorNet.Style(os.first, os.second))
+                        } else {
+                            ModelColor.renderBitmap(this, bmp, version)
+                        }
+                    },
                     renderNew = renderNew,
                     onApply = { strength ->
                         applyEnhance(
                             styleId, version.id, pendingFile, paramBytes,
-                            oldParams != null, added, strength
+                            oldParams != null, added, strength, ns
                         )
                     },
                     onCancel = {
@@ -2179,7 +2374,8 @@ class MainActivity : AppCompatActivity() {
         paramBytes: ByteArray?,
         blendable: Boolean,
         added: List<RefSeed>,
-        strength: Float
+        strength: Float,
+        netStyle: AdaptiveColorNet.Style? = null
     ) {
         val s = strength.coerceIn(0f, 1f)
         executor.execute {
@@ -2191,6 +2387,12 @@ class MainActivity : AppCompatActivity() {
                 return@execute
             }
             val versionId = "v_" + System.currentTimeMillis().toString(36)
+
+            // M6：没有 LUT/param 文件，直接把新 aff/knots 写进新版本
+            if (netStyle != null) {
+                mainHandler.post { commitEnhance(def, base, added, versionId, "", "", s, netStyle) }
+                return@execute
+            }
 
             if (paramBytes != null) {
                 val oldParams = if (blendable) ModelParamStore.read(this, base.paramFile) else null
@@ -2244,7 +2446,8 @@ class MainActivity : AppCompatActivity() {
         versionId: String,
         lutFile: String,
         paramFile: String,
-        strength: Float
+        strength: Float,
+        netStyle: AdaptiveColorNet.Style? = null
     ) {
         // 池在 enhanceFromRefs 里已加载；这里兜底，宁可这次不提交也不能把池写成空
         if (!CustomStyleStore.ensureSeeds(def)) {
@@ -2273,7 +2476,9 @@ class MainActivity : AppCompatActivity() {
             seedCount = def.seeds.size,
             source = VersionSource.ENHANCE,
             strength = strength,
-            paramFile = paramFile
+            paramFile = paramFile,
+            modelAff = netStyle?.aff ?: FloatArray(0),
+            modelKnots = netStyle?.knots ?: FloatArray(0)
         )
         def.versions.add(version)
         def.currentVersionId = versionId
@@ -2329,7 +2534,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 历史版本面板入口；只有一个版本时没有历史可看，直接提示。 */
     private fun openVersionHistory(styleId: String) {
-        if (enhancing || creating || splitting) { toast("正在生成色彩，请稍候"); return }
+        if (enhancing || splitting) { toast("正在生成色彩，请稍候"); return }
         if (srBusy) { toast("处理中，请稍候"); return }
         val def = CustomStyleStore.byId(styleId) ?: run { toast("该色彩已不可用"); return }
         if (def.versions.size <= 1) { toast("这个色彩只有一个版本"); return }
@@ -2345,7 +2550,7 @@ class MainActivity : AppCompatActivity() {
      * 版本内容本身还在，之后再增强从这条链继续（游标之后的版本会被覆盖）。
      */
     private fun rollbackToVersion(styleId: String, version: StyleVersion) {
-        if (enhancing || creating || splitting) { toast("正在生成色彩，请稍候"); return }
+        if (enhancing || splitting) { toast("正在生成色彩，请稍候"); return }
         val def = CustomStyleStore.byId(styleId) ?: run { toast("该色彩已不可用"); return }
         if (def.currentVersionId == version.id) return
         // 参数版本查 1.6 KB 的 par_ 文件，旧版本仍查 LUT（语义与改前一致）
@@ -2374,7 +2579,7 @@ class MainActivity : AppCompatActivity() {
      * 新色彩初始版本沿用该版本的参考图前缀与强度，source 记 INITIAL（它是新色彩的起点，不参与回收）。
      */
     private fun splitFromVersion(styleId: String, version: StyleVersion) {
-        if (enhancing || creating || splitting) { toast("正在处理，请稍候"); return }
+        if (enhancing || splitting) { toast("正在处理，请稍候"); return }
         val def = CustomStyleStore.byId(styleId) ?: run { toast("该色彩已不可用"); return }
         splitting = true
         executor.execute {
@@ -2464,26 +2669,35 @@ class MainActivity : AppCompatActivity() {
         if (bmp != null) imgPreview.setImageBitmap(bmp)
     }
 
-    /** 步进器 ± 按钮：单击步进一档，长按 400ms 后每 160ms 连发；step 由调用方注入目标调整项 */
-    private fun setupStepperButton(btn: TextView, step: () -> Unit) {
-        val repeat = object : Runnable {
-            override fun run() {
-                step()
-                mainHandler.postDelayed(this, 160)
+    /**
+     * P3：五档滑杆（进度 0..20 ↔ 档位 -10..+10）。拖动实时调档——预览走 recomputeAdjAsync
+     * 既有的 1920 降采样基准 + 专用队列 + 代次过期秒退，连拖只算最新一档，全程不卡顿；
+     * valueText 为行尾固定宽数值列（"0"/"+n"/"-n"）。双击复位面=滑杆所在的整行
+     * （sb.parent：子滑杆自消费触摸，行级只收到名称/数值/空白区的点按），复位到 0
+     * 后由 apply 链路的 updateLumBarUi 把滑杆进度回写归中。
+     */
+    private fun setupSlider(sb: SeekBar, valueText: TextView, get: () -> Int, set: (Int) -> Unit) {
+        sb.max = 20
+        sb.progress = get() + 10
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, progressLevel: Int, fromUser: Boolean) {
+                if (fromUser) set(progressLevel - 10)
             }
-        }
-        btn.setOnClickListener { step() }
-        btn.setOnLongClickListener {
-            mainHandler.postDelayed(repeat, 400)
+
+            override fun onStartTrackingTouch(s: SeekBar) {}
+            override fun onStopTrackingTouch(s: SeekBar) {}
+        })
+        val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (!srBusy) set(0)
+                return true
+            }
+        })
+        val surface = sb.parent as View
+        surface.setOnTouchListener { v, event ->
+            detector.onTouchEvent(event)
+            if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
             true
-        }
-        btn.setOnTouchListener { _, event ->
-            if (event.actionMasked == MotionEvent.ACTION_UP ||
-                event.actionMasked == MotionEvent.ACTION_CANCEL
-            ) {
-                mainHandler.removeCallbacks(repeat)
-            }
-            false
         }
     }
 
@@ -2527,10 +2741,67 @@ class MainActivity : AppCompatActivity() {
         recomputeAdjAsync()
     }
 
+    private fun applySatChange(newLevel: Int) {
+        val level = newLevel.coerceIn(ToneCurve.MIN_LEVEL, ToneCurve.MAX_LEVEL)
+        if (level == satLevel) return
+        satLevel = level
+        updateLumBarUi()
+        recomputeAdjAsync()
+    }
+
+    private fun applyContrastChange(newLevel: Int) {
+        val level = newLevel.coerceIn(ToneCurve.MIN_LEVEL, ToneCurve.MAX_LEVEL)
+        if (level == contrastLevel) return
+        contrastLevel = level
+        updateLumBarUi()
+        recomputeAdjAsync()
+    }
+
+    private fun applyGlowChange(newLevel: Int) {
+        val level = newLevel.coerceIn(SoftGlow.MIN_LEVEL, SoftGlow.MAX_LEVEL)
+        if (level == glowLevel) return
+        glowLevel = level
+        updateLumBarUi()
+        recomputeAdjAsync()
+    }
+
+    // 调档预览基准（短边≤1920 降采样缓存，仅 adjExecutor 线程访问）：
+    // 调档只跑小图（12MP→~2.8MP，快 4-8 倍）；导出烘焙仍走全分辨率工作字节，
+    // 预览与导出是同一 ToneCurve 曲线，仅分辨率差异
+    private var adjBaseO: Bitmap? = null
+    private var adjBaseR: Bitmap? = null
+    private var adjSrcO: Bitmap? = null
+    private var adjSrcR: Bitmap? = null
+
     /**
-     * 依据当前基图与五档调整重算调整显示版（主线程调用，重活走 executor）。
+     * 调档预览基准（仅 adjExecutor 线程调用）。基图替换/回收后（引用不匹配或已回收）
+     * 自动重建；基图本身不大则直接复用基图对象（不额外占内存）。
+     */
+    private fun ensureAdjBase(src: Bitmap?, isOrig: Boolean): Bitmap? {
+        val oldBase = if (isOrig) adjBaseO else adjBaseR
+        val oldSrc = if (isOrig) adjSrcO else adjSrcR
+        if (src == null || src.isRecycled) {
+            if (oldBase != null && oldBase !== oldSrc && !oldBase.isRecycled) oldBase.recycle()
+            if (isOrig) { adjBaseO = null; adjSrcO = null } else { adjBaseR = null; adjSrcR = null }
+            return null
+        }
+        if (oldBase != null && !oldBase.isRecycled && oldSrc === src) return oldBase
+        // 基图已换：重建基准（旧基准若是独立位图则回收；与基图同对象则交给基图生命周期）
+        if (oldBase != null && oldBase !== oldSrc && !oldBase.isRecycled && oldBase !== src) {
+            oldBase.recycle()
+        }
+        val next = scaleBitmap(src, 1920)
+        if (isOrig) { adjBaseO = next; adjSrcO = src } else { adjBaseR = next; adjSrcR = src }
+        return next
+    }
+
+    /**
+     * 依据当前基图与五档调整重算调整显示版（主线程调用，重活走 adjExecutor 专用队列）。
      * 五档均为 0 时切回基图并回收调整版；否则后台重算（亮度→曝光→高光→阴影→黑色阶，与烘焙同序），
      * 完成后先换显示再回收旧版。
+     *
+     * 响应性三件套：专用队列（不排在导出/风格长任务后）＋任务开头过期秒退（连档只跑最新一档）
+     * ＋降采样预览基准（全尺寸基图不再全图重算）。
      */
     private fun recomputeAdjAsync() {
         val gen = ++liftGen
@@ -2539,7 +2810,10 @@ class MainActivity : AppCompatActivity() {
         val hl = highlightLevel
         val sh = shadowLevel
         val bl = blackLevel
-        if (br == 0 && ev == 0 && hl == 0 && sh == 0 && bl == 0) {
+        val sa = satLevel
+        val co = contrastLevel
+        val gl = glowLevel
+        if (br == 0 && ev == 0 && hl == 0 && sh == 0 && bl == 0 && sa == 0 && co == 0 && gl == 0) {
             // 先置空调整字段再换显示：refreshPreviewImage 才会取基图，
             // 避免把即将回收的调整版重新 setImageBitmap 上屏（否则下一帧画已回收位图崩溃）
             val oldO = liftedOriginal
@@ -2553,26 +2827,57 @@ class MainActivity : AppCompatActivity() {
         }
         val origBase = originalBitmap
         val resultBase = resultBitmap
-        executor.execute {
-            val lo = try {
-                origBase?.let {
-                    BlackLevel.applyToBitmap(
-                        Shadows.applyToBitmap(
-                            Highlights.applyToBitmap(
-                                Exposure.applyToBitmap(Brightness.applyToBitmap(it, br), ev), hl), sh), bl)
+        adjExecutor.execute {
+            // 排队期间已过期（连点加减档/换图）：直接放弃，不做全量重算
+            if (gen != liftGen) return@execute
+            var lo: Bitmap? = null
+            var lr: Bitmap? = null
+            // P2：RAW 提亮/强力提亮档 + 原图卡片（无风格结果）→ 五档直接作用于
+            // 导入时缓存的 16-bit 线性基准：RAW 高位深保真，调阴影不出量化色带
+            val lin = rawLin16
+            if (lin != null && resultBase == null) {
+                val params = ToneCurve.of(br, ev, hl, sh, bl, sa, co)
+                try {
+                    val px = IntArray(lin.w * lin.h)
+                    ToneCurve.applyLinear16ToArgb(lin.data, lin.w, lin.h, params, px)
+                    lo = Bitmap.createBitmap(lin.w, lin.h, Bitmap.Config.ARGB_8888)
+                    lo.setPixels(px, 0, lin.w, 0, 0, lin.w, lin.h)
+                    // 柔光是空间算子，不进 16-bit 曲线域——降 8-bit 后叠加（与导出链同口径）
+                    if (gl != 0) SoftGlow.applyInPlace(lo, gl)
+                } catch (t: Throwable) {
+                    DiagLog.e("Lum", "RAW 16bit 调整失败，回落 8bit", t)
+                    lo?.recycle(); lo = null
                 }
-            } catch (t: Throwable) {
-                DiagLog.e("Lum", "原图调整失败", t); null
             }
-            val lr = try {
-                resultBase?.let {
-                    BlackLevel.applyToBitmap(
-                        Shadows.applyToBitmap(
-                            Highlights.applyToBitmap(
-                                Exposure.applyToBitmap(Brightness.applyToBitmap(it, br), ev), hl), sh), bl)
+            if (lo == null) {
+                // 8-bit 路径：基图可能在排队期间被主线程回收，scaleBitmap 有竞态窗口，兜一层
+                val bO = try { ensureAdjBase(origBase, true) } catch (t: Throwable) {
+                    DiagLog.e("Lum", "原图基准准备失败", t); null
+                } ?: return@execute
+                val bR = try { ensureAdjBase(resultBase, false) } catch (t: Throwable) {
+                    DiagLog.e("Lum", "结果基准准备失败", t); null
                 }
-            } catch (t: Throwable) {
-                DiagLog.e("Lum", "结果调整失败", t); null
+                val params = ToneCurve.of(br, ev, hl, sh, bl, sa, co)
+                lo = try {
+                    ToneCurve.applyToBitmap(bO, params)
+                } catch (t: Throwable) {
+                    DiagLog.e("Lum", "原图调整失败", t); null
+                }
+                lr = try {
+                    bR?.let { ToneCurve.applyToBitmap(it, params) }
+                } catch (t: Throwable) {
+                    DiagLog.e("Lum", "结果调整失败", t); null
+                }
+                // 柔光：曲线之后叠空间算子（1920 预览基准下半径 ~min/100，代次过期秒退兜住耗时）。
+                // 坑（真机闪退定罪）：isNeutral(p) 时 applyToBitmap 原样返回输入——七档全 0 只拖柔光时
+                // lo===bO / lr===bR 同实例，原地 glow 会烘进原图本体，且落地段 recycle(lo) 会把
+                // 全局 bO 回收 → 下一帧绘制已回收位图崩溃。必须先抄独立副本再做柔光。
+                if (gl != 0) {
+                    if (lo !== null && lo === bO) lo = lo.copy(Bitmap.Config.ARGB_8888, true)
+                    if (lr !== null && bR !== null && lr === bR) lr = lr.copy(Bitmap.Config.ARGB_8888, true)
+                    lo?.let { SoftGlow.applyInPlace(it, gl) }
+                    lr?.let { SoftGlow.applyInPlace(it, gl) }
+                }
             }
             mainHandler.post {
                 if (gen != liftGen) {
@@ -2592,51 +2897,55 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateLumBarUi() {
         updateAdjustEntryText()
-        // 亮度组
+        // 亮度组（滑杆进度由本函数统一回写；程序性 setProgress 触发的
+        // onProgressChanged(fromUser=false) 在 setupSlider 中被忽略，无回环）
         val v = brightLevel
-        txtBrightLevel.text = if (v == 0) "亮度" else if (v > 0) "亮度 +$v" else "亮度 $v"
-        val vPlusOn = v < Brightness.MAX_LEVEL && !srBusy
-        val vMinusOn = v > Brightness.MIN_LEVEL && !srBusy
-        btnBrightPlus.isEnabled = vPlusOn
-        btnBrightMinus.isEnabled = vMinusOn
-        btnBrightPlus.alpha = if (vPlusOn) 1f else 0.35f
-        btnBrightMinus.alpha = if (vMinusOn) 1f else 0.35f
+        txtBrightVal.text = if (v > 0) "+$v" else "$v"
+        sbBright.progress = v + 10
+        sbBright.isEnabled = !srBusy
+        sbBright.alpha = if (srBusy) 0.35f else 1f
         // 曝光组
         val e = exposureLevel
-        txtLumLevel.text = if (e == 0) "曝光" else if (e > 0) "曝光 +$e" else "曝光 $e"
-        val ePlusOn = e < Exposure.MAX_LEVEL && !srBusy
-        val eMinusOn = e > Exposure.MIN_LEVEL && !srBusy
-        btnLumPlus.isEnabled = ePlusOn
-        btnLumMinus.isEnabled = eMinusOn
-        btnLumPlus.alpha = if (ePlusOn) 1f else 0.35f
-        btnLumMinus.alpha = if (eMinusOn) 1f else 0.35f
+        txtLumVal.text = if (e > 0) "+$e" else "$e"
+        sbLum.progress = e + 10
+        sbLum.isEnabled = !srBusy
+        sbLum.alpha = if (srBusy) 0.35f else 1f
         // 高光组
         val hl = highlightLevel
-        txtHighLevel.text = if (hl == 0) "高光" else if (hl > 0) "高光 +$hl" else "高光 $hl"
-        val hPlusOn = hl < Highlights.MAX_LEVEL && !srBusy
-        val hMinusOn = hl > Highlights.MIN_LEVEL && !srBusy
-        btnHighPlus.isEnabled = hPlusOn
-        btnHighMinus.isEnabled = hMinusOn
-        btnHighPlus.alpha = if (hPlusOn) 1f else 0.35f
-        btnHighMinus.alpha = if (hMinusOn) 1f else 0.35f
+        txtHighVal.text = if (hl > 0) "+$hl" else "$hl"
+        sbHigh.progress = hl + 10
+        sbHigh.isEnabled = !srBusy
+        sbHigh.alpha = if (srBusy) 0.35f else 1f
         // 阴影组
         val s = shadowLevel
-        txtShadowLevel.text = if (s == 0) "阴影" else if (s > 0) "阴影 +$s" else "阴影 $s"
-        val sPlusOn = s < Shadows.MAX_LEVEL && !srBusy
-        val sMinusOn = s > Shadows.MIN_LEVEL && !srBusy
-        btnShadowPlus.isEnabled = sPlusOn
-        btnShadowMinus.isEnabled = sMinusOn
-        btnShadowPlus.alpha = if (sPlusOn) 1f else 0.35f
-        btnShadowMinus.alpha = if (sMinusOn) 1f else 0.35f
+        txtShadowVal.text = if (s > 0) "+$s" else "$s"
+        sbShadow.progress = s + 10
+        sbShadow.isEnabled = !srBusy
+        sbShadow.alpha = if (srBusy) 0.35f else 1f
         // 黑色阶组
         val b = blackLevel
-        txtBlackLevel.text = if (b == 0) "黑色阶" else if (b > 0) "黑色阶 +$b" else "黑色阶 $b"
-        val bPlusOn = b < BlackLevel.MAX_LEVEL && !srBusy
-        val bMinusOn = b > BlackLevel.MIN_LEVEL && !srBusy
-        btnBlackPlus.isEnabled = bPlusOn
-        btnBlackMinus.isEnabled = bMinusOn
-        btnBlackPlus.alpha = if (bPlusOn) 1f else 0.35f
-        btnBlackMinus.alpha = if (bMinusOn) 1f else 0.35f
+        txtBlackVal.text = if (b > 0) "+$b" else "$b"
+        sbBlack.progress = b + 10
+        sbBlack.isEnabled = !srBusy
+        sbBlack.alpha = if (srBusy) 0.35f else 1f
+        // 饱和度组
+        val sa = satLevel
+        txtSatVal.text = if (sa > 0) "+$sa" else "$sa"
+        sbSat.progress = sa + 10
+        sbSat.isEnabled = !srBusy
+        sbSat.alpha = if (srBusy) 0.35f else 1f
+        // 对比度组
+        val co = contrastLevel
+        txtConVal.text = if (co > 0) "+$co" else "$co"
+        sbCon.progress = co + 10
+        sbCon.isEnabled = !srBusy
+        sbCon.alpha = if (srBusy) 0.35f else 1f
+        // 柔光组
+        val gl = glowLevel
+        txtGlowVal.text = if (gl > 0) "+$gl" else "$gl"
+        sbGlow.progress = gl + 10
+        sbGlow.isEnabled = !srBusy
+        sbGlow.alpha = if (srBusy) 0.35f else 1f
     }
 
     /** 调节浮层开合：点击「调节」在预览上向上展开三个胶囊调节项，再点收起 */
@@ -2646,7 +2955,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 入口胶囊文字：无调整时「调节」，有调整时附带生效项数 */
     private fun updateAdjustEntryText() {
-        val n = listOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel).count { it != 0 }
+        val n = listOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel,
+            satLevel, contrastLevel, glowLevel).count { it != 0 }
         btnAdjust.text = if (n == 0) "调节" else "调节 · $n"
     }
 
@@ -2721,6 +3031,9 @@ class MainActivity : AppCompatActivity() {
                     setPerfectButton(false)
                     originalBitmap?.recycle()
                     originalBitmap = decodePreview(st.jpeg, 2048)
+                    // 源已是超分 JPEG，RAW 16-bit 窗口作废
+                    rawLin16 = null
+                    rawPreviewJpeg = null
                     resultBitmap?.recycle()
                     resultBitmap = null
                     // 旧曝光版基于已回收/已替换的基图，随基图升级一并作废（同帧内换图，安全）
@@ -2858,6 +3171,9 @@ class MainActivity : AppCompatActivity() {
         SuperResTask.pendingHighlightLevel = highlightLevel
         SuperResTask.pendingShadowLevel = shadowLevel
         SuperResTask.pendingBlackLevel = blackLevel
+        SuperResTask.pendingSatLevel = satLevel
+        SuperResTask.pendingContrastLevel = contrastLevel
+        SuperResTask.pendingGlowLevel = glowLevel
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
@@ -2950,6 +3266,9 @@ class MainActivity : AppCompatActivity() {
         SuperResTask.pendingHighlightLevel = highlightLevel
         SuperResTask.pendingShadowLevel = shadowLevel
         SuperResTask.pendingBlackLevel = blackLevel
+        SuperResTask.pendingSatLevel = satLevel
+        SuperResTask.pendingContrastLevel = contrastLevel
+        SuperResTask.pendingGlowLevel = glowLevel
         // Android 13+ 通知权限：拒绝不影响超分执行，仅无岛/通知展示
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -2960,22 +3279,7 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(this, Intent(this, SuperResService::class.java))
     }
 
-    // ---- 长按对比原图 ----
-
-    private fun onPreviewTouch(event: MotionEvent): Boolean {
-        if (!hasColor()) return false
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                originalBitmap?.let { imgPreview.setImageBitmap(it) }
-                return true
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                refreshPreviewImage()
-                return true
-            }
-        }
-        return false
-    }
+    // 预览图缩放/平移/双击/长按对比：全部内聚在 ZoomableImageView，本类只挂对比回调
 
     // ---- 导出 ----
 
@@ -2989,7 +3293,8 @@ class MainActivity : AppCompatActivity() {
         if (srBakedStyle != null) { toast("超分完成后已自动导出至图库"); return }
         // C1/C4：全像素导出。原图档直通；甲档（LUT 家族）与乙档（模型链 M9/M9+/M10R/M9D）
         // 带滤镜逐带处理，同为全像素。SA 与 LP9（P9Post 依赖全图空间场）仍按工作字节导出。
-        val fullSrc = fullResFile
+        // 兜底重入：M9 高分辨率导出失败时会置位并重调本方法，让这次跳过全像素分支。
+        val fullSrc = if (skipFullResOnce) { skipFullResOnce = false; null } else fullResFile
         if (fullSrc != null) {
             if (!hasColor()) { exportFullRes(fullSrc); return }
             val fCustomDef = currentCustomId?.let { CustomStyleStore.byId(it) }
@@ -3010,7 +3315,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 val op = LutBandOps.create(
                     this, currentStyle, lutRef,
-                    intArrayOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel)
+                    intArrayOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel, satLevel, contrastLevel)
                 )
                 if (op != null) {
                     val tag = fCustomDef?.name?.let { sanitizeFileTag(it) }
@@ -3020,15 +3325,50 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
             }
-            // 乙档：模型链（M9 / M9+ / M10-R / M9D）在原生分辨率上逐带蒸馏
-            // （整图链会把画布 fit 到 4096x3072，200MP 只剩 6% 细节）
+            // 丙档：M6 自定义模型风格（aff/knots 逐像素，可条带；最高 50MP）
+            if (fCustomDef?.hasModelNet == true && AdaptiveColorNet.isNativeAvailable() &&
+                ModelNetBandOps.supports(fullResWidth, fullResHeight)
+            ) {
+                val modelStyle = fCustomDef.modelStyle
+                if (modelStyle != null) {
+                    val op = ModelNetBandOps(
+                        AdaptiveColorNet.Style(modelStyle.first, modelStyle.second),
+                        intArrayOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel, satLevel, contrastLevel)
+                    )
+                    val tag = sanitizeFileTag(fCustomDef.name)
+                    DiagLog.i("FullRes", "M6 模型风格全像素条带：${fCustomDef.name} " +
+                        "${fullResWidth}×${fullResHeight}")
+                    exportFullRes(fullSrc, op, tag, fCustomDef.id, onFailure = {
+                        DiagLog.w("FullRes", "M6 全像素条带失败 → 回落工作版")
+                        fullResFallbackOnce = true
+                        skipFullResOnce = true
+                        export()
+                    })
+                    return
+                }
+            }
+            // 乙档：模型链（M9 / M9+ / M10-R / M9D）
             if (DistillBandOps.supports(currentStyle)) {
+                val sid = currentStyle?.id ?: "orig"
+                // B 方案（2026-10-21 用户确认）：M9 / M9D 放弃全像素条带链，改走
+                // 「高分辨率工作链」——整图链在 24MP 级画布上出图，暖调**全图一次调用**，
+                // 结构上不存在带边收敛/条带台阶/周期纹（条带链的全部问题的根因）。
+                // 失败（预算/超时/native 异常）自动回落工作版（[exportWork] 口径），绝不崩。
+                // M9P / M10R 带额外 boost/LUT 后处理，暂保持条带链（零改动）。
+                if (sid == "M9" || sid == "M9D") {
+                    // RAW 源不会进到这里（口径 A，2026-10-22 复核确认）：fullResFile 只在
+                    // 导入期为 JPEG 源置位（fullResDecision 要求 trimmed!=null），RAW 恒为
+                    // null → 上方 fullSrc 门已把 RAW 落到工作版 12.5MP（P2 的 RAW 16-bit
+                    // 五档重放也在工作版内生效）。24MP 链仅服务 ≥45MP 的 JPG 源。
+                    exportDistillHiRes(fullSrc, bytes, sid, sid)
+                    return
+                }
+                // M9P / M10R：保持原有条带链全像素口径
                 val op = DistillBandOps.create(
                     this, currentStyle,
-                    intArrayOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel)
+                    intArrayOf(brightLevel, exposureLevel, highlightLevel, shadowLevel, blackLevel, satLevel, contrastLevel)
                 )
                 if (op != null) {
-                    val sid = currentStyle?.id ?: "orig"
                     exportFullRes(fullSrc, op, sid, sid)
                     return
                 }
@@ -3057,8 +3397,13 @@ class MainActivity : AppCompatActivity() {
             val hlL = highlightLevel
             val shL = shadowLevel
             val blL = blackLevel
+            val saL = satLevel
+            val coL = contrastLevel
+            val glL = glowLevel
             // M5：被回收的版本先按 θ 快照重烘；失败就明确报错，不能导出原图冒充成片
-            if (customDef != null && customVer != null && !ModelColor.ensure(this, customDef, customVer)) {
+            // M6 模型没有 LUT/param，跳过 ensure，走 renderModelNet
+            if (customDef != null && customVer != null && !customDef.hasModelNet &&
+                !ModelColor.ensure(this, customDef, customVer)) {
                 DiagLog.w("Export", "${customDef.name} 色彩文件缺失且无法重建")
                 mainHandler.post {
                     progress.gone()
@@ -3066,10 +3411,35 @@ class MainActivity : AppCompatActivity() {
                 }
                 return@execute
             }
-            var out = if (customDef != null && customVer != null) {
-                ModelColor.render(this, bytes, customVer) {
-                    DiagLog.w("Export", "${customDef.name} 色彩文件不可用，导出原图")
-                    mainHandler.post { toast("「${customDef.name}」色彩文件不可用，已导出原图") }
+            // P2：RAW 提亮/强力提亮档 + 七档非零 → 调整前移到 16-bit 线性段重放
+            // （RAW 高位深保真，调阴影无 8-bit 源量化色带），风格引擎消费调整后的 JPEG。
+            // 与预览口径一致：预览的七档同样作用于无风格数据。重放失败回落原 8-bit 链。
+            var rawToned: ByteArray? = null
+            val toneRequested = brL != 0 || evL != 0 || hlL != 0 || shL != 0 || blL != 0 ||
+                saL != 0 || coL != 0
+            if (toneRequested && rawLin16 != null && rawLin16Level != 0) {
+                val t16 = System.currentTimeMillis()
+                rawToned = raw16TonedWorkBytes(brL, evL, hlL, shL, blL, saL, coL, glL)
+                DiagLog.i("Export", "RAW 16bit 七档重放 ${if (rawToned != null) "成功" else "失败→回落8bit"} " +
+                        "耗时 ${System.currentTimeMillis() - t16}ms")
+            }
+            var out = if (rawToned != null) {
+                LeicaEngine.process(this, rawToned, currentStyle!!, onFallback = { st ->
+                    DiagLog.w("Export", "${st.label} 处理触发降级")
+                    mainHandler.post { toast(fallbackMsg(st)) }
+                })
+            } else if (customDef != null && customVer != null) {
+                if (customDef.hasModelNet) {
+                    // 导出必须与预览走同一条 native 链，否则导出会丢风格
+                    renderModelNet(bytes, customDef) ?: ModelColor.render(this, bytes, customVer) {
+                        DiagLog.w("Export", "${customDef.name} 色彩文件不可用，导出原图")
+                        mainHandler.post { toast("「${customDef.name}」色彩文件不可用，已导出原图") }
+                    }
+                } else {
+                    ModelColor.render(this, bytes, customVer) {
+                        DiagLog.w("Export", "${customDef.name} 色彩文件不可用，导出原图")
+                        mainHandler.post { toast("「${customDef.name}」色彩文件不可用，已导出原图") }
+                    }
                 }
             } else {
                 LeicaEngine.process(this, bytes, currentStyle!!, onFallback = { st ->
@@ -3078,12 +3448,19 @@ class MainActivity : AppCompatActivity() {
                 })
             }
             // 亮度+曝光+高光+阴影+黑色阶组合烘焙（滤镜之后、徽章之前；单次 decode/encode，EXIF 回填）
-            if (brL != 0 || evL != 0 || hlL != 0 || shL != 0 || blL != 0) {
+            // P2：16-bit 重放成功时七档已烘焙，跳过 8-bit 二次应用。
+            // P3：柔光条件并入（glow 可单独成立；16-bit 成功时柔光已随重放烘焙）。
+            if ((toneRequested || glL != 0) && rawToned == null) {
                 val tL = System.currentTimeMillis()
-                out = Shadows.applyStackToJpeg(out, brL, evL, hlL, shL, blL)
-                DiagLog.i("Export", "亮度 ${brL}/曝光 ${evL}/高光 ${hlL}/阴影 ${shL}/黑色阶 ${blL} 已烘焙 耗时 ${System.currentTimeMillis() - tL}ms")
+                out = Shadows.applyStackToJpeg(out, brL, evL, hlL, shL, blL, saL, coL, glL)
+                DiagLog.i("Export", "亮度 ${brL}/曝光 ${evL}/高光 ${hlL}/阴影 ${shL}/黑色阶 ${blL}/饱和度 ${saL}/对比度 ${coL}/柔光 ${glL} 已烘焙 耗时 ${System.currentTimeMillis() - tL}ms")
             }
             DiagLog.i("Export", "${styleId} 处理完成 ${out.size}B 耗时 ${System.currentTimeMillis() - t0}ms")
+            // C3 增益图重标定：套过色调后 SDR 亮度分布已变，旧增益图的分母（原 SDR）失配
+            // → 用「原 SDR + 新 SDR」重算 g' = L_hdr / L_sdr_new，失败则沿用旧增益图
+            val hdrForExport = if (pendingHdr != null) {
+                HdrGainMap.rebakeJpeg(bytes, out, pendingHdr!!) ?: pendingHdr
+            } else null
             mainHandler.post {
                 progress.gone()
                 if (gen != processingGeneration) return@post
@@ -3091,11 +3468,13 @@ class MainActivity : AppCompatActivity() {
                     requestWritePermission { export() }
                     return@post
                 }
-                val marked = LeicaMark.mark(out)
-                if (marked === out) DiagLog.w("Export", "徽章写入失败（返回原字节）")
+                val badgeOn = SettingsStore.leicaBadgeEnabled(this)
+                val marked = LeicaMark.mark(out, badgeOn)
+                if (marked === out) DiagLog.w("Export",
+                    if (badgeOn) "徽章写入失败（返回原字节）" else "徽章关闭：源图无徽章元数据（原样返回）")
                 // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）；
                 // 未回嵌时裁掉 EOI 之后的残留二次图，避免「主图已缩放、增益图仍是原尺寸」的错配
-                val hdrSrc = pendingHdr
+                val hdrSrc = hdrForExport
                 val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
                     else HdrGainMap.truncateToPrimary(marked)
                 // 装配结果自检：报告最终字节里的增益图/容器结构（detail 已进 DiagLog）
@@ -3105,12 +3484,141 @@ class MainActivity : AppCompatActivity() {
                 DiagLog.i("Export", "保存${if (uri != null) "成功" else "失败"} · $diag")
                 toast(
                     when {
-                        uri == null -> "导出失败，请重试（详情见日志）"
+                        uri == null -> {
+                            fullResFallbackOnce = false
+                            "导出失败，请重试（详情见日志）"
+                        }
+                        // M6 全像素条带失败后的自动回落：必须明确告知本次不是全像素
+                        fullResFallbackOnce -> {
+                            fullResFallbackOnce = false
+                            val hdrTail = if (hdrSrc != null && !hdrChk.ok)
+                                " · HDR 数据未完整保留" else ""
+                            "已保存到相册（${workWidth}×${workHeight}）· 全像素处理失败，已按工作版导出$hdrTail"
+                        }
                         hdrSrc != null && !hdrChk.ok -> "已保存到相册 · HDR 数据未完整保留"
                         // 200MP 源选了滤镜：本次按引擎工作字节导出，提示全像素入口
                         fullResFile != null ->
                             "已保存到相册（${workWidth}×${workHeight}）· 原图档可全像素导出"
                         else -> "已保存到相册"
+                    }
+                )
+            }
+        }
+    }
+
+    /**
+     * M9 / M9D 高分辨率导出（B 方案，2026-10-21 用户确认）。
+     *
+     * 链路：200MP/50MP 源文件 → [ImageUtils.decodeWorkForLongEdge] 按 24MP 目标解码
+     *      （setTargetSize 直接解到目标尺寸，峰值=目标位图，不做「先全解 200MP 再缩」）→
+     *      小 JPEG → [M9Distill.run]（longEdge=[ImageUtils.HIRES_M9_LONG]）→
+     *      五滑杆烘焙 → HDR 重标定 → 徽章/HDR 装配 → 保存。
+     *
+     * 与条带链（[DistillBandOps]）的本质差异：整图链的暖调是**全图一次调用**，
+     * 结构上不存在「逐带归一化 → 带边收敛」，用户报的中间暗条/周期横纹/带边界过冲
+     * 因此根本不会出现；也不再需要任何出口补偿算子。代价是画布受堆上限约束（24MP 级）。
+     *
+     * 失败（预算不足 / 超时 / native 异常 / OOM）→ 置 [skipFullResOnce] 重入 [export]，
+     * 自动回落工作版原链路（12.5MP），绝不崩溃、绝不产出半成品。
+     *
+     * 收尾段（滑杆/HDR/徽章/保存/toast）与 [export] 的工作版尾部同口径——
+     * 任一侧改动必须同步另一侧。
+     */
+    private fun exportDistillHiRes(srcFile: File, srcBytes: ByteArray,
+                                   nameTag: String, styleId: String) {
+        progress.visible()
+        val gen = ++processingGeneration
+        executor.execute {
+            val t0 = System.currentTimeMillis()
+            val brL = brightLevel
+            val evL = exposureLevel
+            val hlL = highlightLevel
+            val shL = shadowLevel
+            val blL = blackLevel
+            val saL = satLevel
+            val coL = contrastLevel
+            val glL = glowLevel
+
+            // 单档执行：按目标长边解码 → 小 JPEG（回填源 EXIF）→ 整图链。
+            // toJpeg 从 Bitmap 重编码**不写 EXIF**；而 M9Distill 内部的 copyExif 与
+            // LeicaMark.mark（在已有 APP1 段上追加 theme/legend/mode）都依赖输入带 EXIF。
+            // 不回填 → 导出丢 Make/Model/拍摄参数与徕卡徽章（2026-10-21 真机实测：
+            // MarkDiagnostic 显示 Make=/Model=/legend= 全空，FFE4 却在——段不依赖 EXIF）。
+            var hiSize = ""
+            fun tryHi(edge: Int): ByteArray? {
+                val hi = ImageUtils.decodeWorkForLongEdge(
+                    this, Uri.fromFile(srcFile), edge) ?: return null
+                hiSize = "${hi.width}×${hi.height}"
+                val jpeg = ImageUtils.toJpeg(hi, 95)
+                val wOri = ImageUtils.resolveWorkOrientation(srcBytes, hi.width, hi.height)
+                val jpegExif = ExifTransplant.copy(this, srcBytes, jpeg, wOri)
+                hi.recycle()
+                DiagLog.i("FullRes", "M9 高分辨率导出 · ${edge}档 画布 $hiSize 源JPEG ${jpegExif.size}B")
+                return M9Distill.run(this, jpegExif, longEdge = edge)
+            }
+            // 超高分辨率档（8192，实验）需设置里手动开启；失败回落 24MP 档，再失败回落工作版。
+            val xl = SettingsStore.m9HiResEnabled(this) && ImageUtils.lowEndReason(this) == null
+            var usedEdge = if (xl) ImageUtils.HIRES_M9_LONG_XL else ImageUtils.HIRES_M9_LONG
+            var out = tryHi(usedEdge)
+            if (out == null && xl) {
+                DiagLog.w("FullRes", "M9 超高分辨率档失败(${M9Distill.lastFail}) → 回落 24MP 档")
+                usedEdge = ImageUtils.HIRES_M9_LONG
+                out = tryHi(usedEdge)
+            }
+            DiagLog.i("FullRes", "M9 高分辨率导出 · ${usedEdge}档" +
+                    (if (out != null) "成功 ${out.size}B" else "失败(${M9Distill.lastFail})") +
+                    " 耗时 ${System.currentTimeMillis() - t0}ms")
+            if (out == null) {
+                // 兜底：回落工作版原链路（12.5MP）。skipFullResOnce 让这次 export() 跳过全像素分支。
+                mainHandler.post {
+                    progress.gone()
+                    if (gen != processingGeneration) return@post
+                    DiagLog.w("FullRes", "M9 高分辨率导出不可用 → 回落工作版原链路")
+                    skipFullResOnce = true
+                    export()
+                }
+                return@execute
+            }
+            // 3) 八滑杆（与工作版口径一致：滤镜之后、徽章之前）
+            if (brL != 0 || evL != 0 || hlL != 0 || shL != 0 || blL != 0 || saL != 0 || coL != 0 || glL != 0) {
+                val tL = System.currentTimeMillis()
+                out = Shadows.applyStackToJpeg(out, brL, evL, hlL, shL, blL, saL, coL, glL)
+                DiagLog.i("Export", "亮度 ${brL}/曝光 ${evL}/高光 ${hlL}/阴影 ${shL}/黑色阶 ${blL}/饱和度 ${saL}/对比度 ${coL}/柔光 ${glL} 已烘焙 耗时 ${System.currentTimeMillis() - tL}ms")
+            }
+            // 4) HDR 增益图重标定。
+            // 增益图来源：全像素直通场景存在 fullResHdr（导入期 `pendingHdr` 只在 jpegDirect
+            // 时赋值，200MP/50MP 直通一律为 null——曾导致 HiRes 导出静默丢 HDR，2026-10-21 修）。
+            // 套了滤镜必须 rebake：增益图的分母是「源 SDR」，成品 SDR 亮度分布已变；
+            // rebakeJpeg 内部把新旧 SDR 都缩到增益图尺寸，与输出主图尺寸无关（几何安全）。
+            val outFinal = out
+            val hdrData = fullResHdr ?: pendingHdr
+            val hdrForExport = if (hdrData != null) {
+                HdrGainMap.rebakeJpeg(srcBytes, outFinal, hdrData) ?: hdrData
+            } else null
+            mainHandler.post {
+                progress.gone()
+                if (gen != processingGeneration) return@post
+                if (Build.VERSION.SDK_INT <= 28 && !hasWritePermission()) {
+                    // 老设备写权限兜底：授权后回落工作版重跑（避免 HiRes 再失败一次）
+                    requestWritePermission { skipFullResOnce = true; export() }
+                    return@post
+                }
+                val badgeOn = SettingsStore.leicaBadgeEnabled(this)
+                val marked = LeicaMark.mark(outFinal, badgeOn)
+                if (marked === outFinal) DiagLog.w("Export",
+                    if (badgeOn) "徽章写入失败（返回原字节）" else "徽章关闭：源图无徽章元数据（原样返回）")
+                val hdrSrc = hdrForExport
+                val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
+                    else HdrGainMap.truncateToPrimary(marked)
+                val hdrChk = HdrGainMap.verify(finalBytes)
+                val diag = MarkDiagnostic.describe(marked) + " " + hdrChk.brief
+                val uri = saveNamed(finalBytes, "Leica_${nameTag}_${System.currentTimeMillis()}.jpg")
+                DiagLog.i("Export", "保存${if (uri != null) "成功" else "失败"} · $diag")
+                toast(
+                    when {
+                        uri == null -> "导出失败，请重试（详情见日志）"
+                        hdrSrc != null && !hdrChk.ok -> "已保存到相册 · HDR 数据未完整保留"
+                        else -> "已保存到相册（高分辨率 $hiSize）"
                     }
                 )
             }
@@ -3134,7 +3642,8 @@ class MainActivity : AppCompatActivity() {
         op: ImageUtils.StripBandOp? = null,
         nameTag: String = "orig",
         styleId: String = "orig",
-        confirmed: Boolean = false
+        confirmed: Boolean = false,
+        onFailure: (() -> Unit)? = null
     ) {
         val w0 = fullResWidth
         val h0 = fullResHeight
@@ -3143,7 +3652,10 @@ class MainActivity : AppCompatActivity() {
         val big = px >= BIG_EXPORT_PIXELS
         if (big && !confirmed) {
             confirmBigExport(px, w0, h0, op != null) {
-                exportFullRes(srcFile, op, nameTag, styleId, confirmed = true)
+                exportFullRes(
+                    srcFile, op, nameTag, styleId,
+                    confirmed = true, onFailure = onFailure
+                )
             }
             return
         }
@@ -3186,9 +3698,16 @@ class MainActivity : AppCompatActivity() {
                         "${res.outBytes}B 耗时 ${res.elapsedMs}ms 堆 ${ImageUtils.heapUsageLabel()}")
                 if (!res.ok && !res.fallbackCopy) {
                     DiagLog.e("FullRes", "条带编码失败（strict，未写回落副本）")
+                    // onFailure 会重入 export()。exporting 要到本 runnable 的 finally（后台线程）
+                    // 才清零，主线程先跑 post 的话 export() 入口闸门会把它当「导出进行中」吞掉。
+                    // 这里先解除（finally 再写一次无害），且写在 post 之前，借 post 的
+                    // happens-before 保证主线程可见。权限分支已有同款先例。
+                    exporting = false
                     mainHandler.post {
                         progress.gone()
-                        toast(
+                        if (gen != processingGeneration || isFinishing || isDestroyed) return@post
+                        if (onFailure != null) onFailure()
+                        else toast(
                             if (op != null) "全像素滤镜导出失败，请重试（详情见日志）"
                             else "全像素导出失败，请重试（详情见日志）"
                         )
@@ -3200,13 +3719,20 @@ class MainActivity : AppCompatActivity() {
                 DiagLog.i("FullRes", "EXIF 回填${if (exifOk) "完成" else "跳过"} 堆 ${ImageUtils.heapUsageLabel()}")
                 // §22 P1：源图 ICC 色彩档案随导出走（纯字节搬运，不改像素；读失败静默跳过）
                 val iccBlocks = IccProfile.readBlocks(srcFile)
-                val badgeOk = LeicaMark.markFile(tmp, iccBlocks)
+                val badgeOn = SettingsStore.leicaBadgeEnabled(this)
+                val badgeOk = LeicaMark.markFile(tmp, iccBlocks, badgeOn)
+                val badgeMsg = if (badgeOn) "徽章写入${if (badgeOk) "完成" else "失败（保留原样）"}"
+                else "徽章关闭（剥离徽章元数据）${if (badgeOk) "完成" else "失败（保留原样）"}"
                 DiagLog.i("FullRes",
-                    "徽章写入${if (badgeOk) "完成" else "失败（保留原样）"} · " +
+                    "$badgeMsg · " +
                         "ICC ${if (iccBlocks != null) "${iccBlocks.size}B" else "源图无"} " +
                         "堆 ${ImageUtils.heapUsageLabel()}")
                 // HDR 回嵌：徽章链会移除 XMP/MPF，必须在其后；无增益图时裁掉残留二次图防错配
-                val hdrChk = if (hdrSrc != null) HdrGainMap.embedFile(tmp, hdrSrc)
+                // C3：全像素源若自带增益图且本次套了色（op != null），增益图按新 SDR 重标定
+                val hdrForExport = if (hdrSrc != null && op != null) {
+                    HdrGainMap.rebakeFiles(srcFile, tmp, hdrSrc, w, h) ?: hdrSrc
+                } else hdrSrc
+                val hdrChk = if (hdrForExport != null) HdrGainMap.embedFile(tmp, hdrForExport)
                     else HdrGainMap.truncateToPrimaryFile(tmp)
                 val diag = fileHeaderDiag(tmp) + " " + hdrChk.brief
                 val name = "Leica_${nameTag}_full_${System.currentTimeMillis()}.jpg"
@@ -3220,8 +3746,10 @@ class MainActivity : AppCompatActivity() {
                 mainHandler.post {
                     progress.gone()
                     if (gen != processingGeneration || isFinishing || isDestroyed) return@post
-                    val tail = if (op != null) "· ${nameTag} 已套色" else ""
-                    val hdrShort = hdrSrc != null && !hdrChk.ok
+                    // 柔光是空间算子不进条带链（半径 > 重叠带必带边不连续），全像素条带导出时明示
+                    val glowNote = if (op != null && glowLevel != 0) " · 柔光未参与" else ""
+                    val tail = (if (op != null) "· ${nameTag} 已套色" else "") + glowNote
+                    val hdrShort = hdrForExport != null && !hdrChk.ok
                     when {
                         uri == null -> toast("全像素导出失败，请重试（详情见日志）")
                         big -> showBigExportDoneDialog(w, h, elapsed, hdrShort, tail)
@@ -3231,10 +3759,13 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (t: Throwable) {
                 DiagLog.e("FullRes", "全像素导出异常：${t.message}", t)
+                // 同上：onFailure 回落要重入 export()，必须先解除 exporting 保护
+                exporting = false
                 mainHandler.post {
                     progress.gone()
                     if (gen == processingGeneration && !isFinishing && !isDestroyed) {
-                        toast("全像素导出失败：${t.javaClass.simpleName}")
+                        if (onFailure != null) onFailure()
+                        else toast("全像素导出失败：${t.javaClass.simpleName}")
                     }
                 }
             } finally {
@@ -3386,11 +3917,18 @@ class MainActivity : AppCompatActivity() {
             val hlL = highlightLevel
             val shL = shadowLevel
             val blL = blackLevel
+            val saL = satLevel
+            val coL = contrastLevel
+            val glL = glowLevel
             var out = src
-            if (brL != 0 || evL != 0 || hlL != 0 || shL != 0 || blL != 0) {
-                out = Shadows.applyStackToJpeg(out, brL, evL, hlL, shL, blL)
+            if (brL != 0 || evL != 0 || hlL != 0 || shL != 0 || blL != 0 || saL != 0 || coL != 0 || glL != 0) {
+                out = Shadows.applyStackToJpeg(out, brL, evL, hlL, shL, blL, saL, coL, glL)
             }
             DiagLog.i("Export", "完美成片导出 $styleId ${out.size}B 耗时 ${System.currentTimeMillis() - t0}ms")
+            // C3：完美档同样是「套了色调的 SDR」，增益图需按新 SDR 重标定
+            val hdrForExport = if (pendingHdr != null && originalBytes != null) {
+                HdrGainMap.rebakeJpeg(originalBytes!!, out, pendingHdr!!) ?: pendingHdr
+            } else null
             mainHandler.post {
                 progress.gone()
                 if (gen != processingGeneration) return@post
@@ -3398,9 +3936,9 @@ class MainActivity : AppCompatActivity() {
                     requestWritePermission { exportPerfect() }
                     return@post
                 }
-                val marked = LeicaMark.mark(out)
+                val marked = LeicaMark.mark(out, SettingsStore.leicaBadgeEnabled(this))
                 // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF）；未回嵌则裁掉残留增益图尾数据
-                val hdrSrc = pendingHdr
+                val hdrSrc = hdrForExport
                 val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
                     else HdrGainMap.truncateToPrimary(marked)
                 val hdrChk = HdrGainMap.verify(finalBytes)
@@ -3435,6 +3973,28 @@ class MainActivity : AppCompatActivity() {
 
     private var permissionRetry: (() -> Unit)? = null
 
+    /**
+     * 导入前补齐「媒体位置」权限（Android 10+）：系统按它决定返回的图带不带 EXIF GPS。
+     * 只请求一次；拒绝/永久拒绝/低版本都直接继续导入，仅导出无定位，不阻塞主流程。
+     */
+    private fun requestMediaLocationThen(go: () -> Unit) {
+        if (Build.VERSION.SDK_INT < 29 ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_MEDIA_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            go()
+            return
+        }
+        locationRetry = go
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.ACCESS_MEDIA_LOCATION),
+            1003
+        )
+    }
+
+    private var locationRetry: (() -> Unit)? = null
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -3445,6 +4005,11 @@ class MainActivity : AppCompatActivity() {
             val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
             if (granted) permissionRetry?.invoke() else toast("未授予存储权限，无法导出")
             permissionRetry = null
+        }
+        if (requestCode == 1003) {
+            // 授权 → 本次及以后读到带 GPS 原件；拒绝 → 照常导入，导出无定位
+            locationRetry?.invoke()
+            locationRetry = null
         }
     }
 

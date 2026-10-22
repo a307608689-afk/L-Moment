@@ -27,13 +27,13 @@ gradle assembleDebug
 
 ## 资产
 
-`app/src/main/assets/` 中随仓库分发的二进制共 15 个，均为本项目自产：
+`app/src/main/assets/` 中随仓库分发的二进制共 22 个，均为本项目自产：
 
-- LUT：`lut_alexa`、`lut_p9vibrant`、`lut_arri709`、`lut_arrireveal`、`lut_arridune`、`lut_arrilala`、`lut_arrijoker`
+- LUT：`lut_alexa`、`lut_p9vibrant`、`lut_arri709`、`lut_arrireveal`、`lut_arridune`、`lut_arrilala`、`lut_arrijoker`，以及 F-胶片家族 `lut_fuji_acros`、`lut_fuji_chrome`、`lut_fuji_cneg`、`lut_fuji_nn`、`lut_fuji_pnh`
 - 风格参数表：`styleA_s0` ~ `styleA_s5`
-- 蒸馏模型：`m9_distill.onnx`、`lm9_net.onnx`
+- 蒸馏/网络模型：`m9_distill.onnx`、`lm9_net.onnx`，以及模型色彩两段网络 `m7_stage1.onnx`、`m7_stage2.onnx`
 
-上述以外的一切二进制（含第三方预训练权重、厂商引擎与参数快照）都不在本仓库内，也不会被接受为贡献。
+上述以外的一切二进制（含第三方预训练权重、厂商引擎与参数快照）都不在本仓库内，也不会被接受为贡献。部分未随仓库分发的模型档（如高分辨率 StyleTrans）在缺失时对应处理档位自动降级。
 
 ## 许可
 

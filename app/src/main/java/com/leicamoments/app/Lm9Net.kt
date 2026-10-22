@@ -61,10 +61,9 @@ object Lm9Net {
         return try {
             val t0 = System.currentTimeMillis()
             val styled = styledInternal(app, jpeg) ?: return null
-            val bos = ByteArrayOutputStream(jpeg.size)
-            styled.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            val encoded = JpegEnc.encode(styled)
             styled.recycle()
-            val out = MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            val out = MadridLegendary.copyExif(jpeg, encoded)
             DiagLog.w(TAG, "L-M9 模型链完成 ${out.size}B, ${System.currentTimeMillis() - t0}ms")
             out
         } catch (t: Throwable) {

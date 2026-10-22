@@ -3,7 +3,7 @@ package com.codex.leicaapp;
 /**
  * L-P9 专用 Hooks：治"云斑显形"。
  *
- * <p>审计结论（lm9_work\37_p9audit.py）：L-P9 输出的云 vs 蓝天色度差被 LUT 饱和增益
+ * <p>审计结论（PC 台对拍）：L-P9 输出的云 vs 蓝天色度差被 LUT 饱和增益
  * 全频段放大 ×1.32~1.50（Y 结构不变），薄云在鲜艳蓝天上显形为水彩斑块。
  * 修复 = pre 域两段色度清理（LUT 放大之前先衰减）：
  *  1) chromaDenoise：≤36px 色度降噪（保留 30%）

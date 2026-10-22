@@ -37,9 +37,11 @@ import kotlin.math.roundToInt
  * 与「我的色彩」的关系见 `docs/模型色彩方案.md`：
  * 模型不进 [FilterCategory]，只在主界面留一张「当前模型」临时卡；本界面负责挑选与落盘。
  *
- * 两种进入方式：
+ * 三种进入方式：
  * - 无 [EXTRA_MANAGE_ID]：**选择模式**，点卡片 → `RESULT_OK` + [EXTRA_PICKED_ID] → 主界面套用；
- * - 带 [EXTRA_MANAGE_ID]：**管理模式**（主界面长按模型卡进来），点卡片只弹管理菜单。
+ * - 带 [EXTRA_MANAGE_ID]：**管理模式**（主界面长按模型卡进来），点卡片只弹管理菜单；
+ * - 选择模式 + [EXTRA_AUTO_CREATE]（「我的色彩」新建卡进来）：落地即弹「新建」对话框，
+ *   建完走选择模式的自动回传，取消则留在库里。
  */
 class ModelActivity : AppCompatActivity() {
 
@@ -48,6 +50,8 @@ class ModelActivity : AppCompatActivity() {
         const val EXTRA_MANAGE_ID = "extra_manage_id"
         /** 选择模式回传：选中的模型 id */
         const val EXTRA_PICKED_ID = "extra_picked_id"
+        /** 进来即弹「新建」对话框：主界面「我的色彩」新建卡直达 */
+        const val EXTRA_AUTO_CREATE = "extra_auto_create"
 
         private const val BG = 0xFF0E0E0F.toInt()
         private const val CARD_BG = 0xFF1C1C1E.toInt()
@@ -81,6 +85,8 @@ class ModelActivity : AppCompatActivity() {
         window.statusBarColor = BG
         setContentView(buildRoot())
         rebuild()
+        // 「我的色彩」新建卡直达：落地即弹新建（选择模式下建完自动选中返回，见 createModel）
+        if (intent?.getBooleanExtra(EXTRA_AUTO_CREATE, false) == true) askCreate()
     }
 
     override fun onDestroy() {
@@ -343,6 +349,32 @@ class ModelActivity : AppCompatActivity() {
             // 参考图副本先落盘：A 路线按副本拟合，顺序必须先于拟合
             okUris.forEachIndexed { k, u -> saveRefThumb(id, k, u) }
 
+            // M6 影子数据：用刚落盘的 240px 缩略图编码 aff/knots；旧 LUT 仍照常生成，
+            // 等应用侧接好新链再切换，避免这一版改坏出图。
+            val refBitmaps = ModelRefStore.allThumbs(this, id)
+                .sortedBy { it.first }
+                .mapNotNull { (_, f) -> BitmapFactory.decodeFile(f.absolutePath) }
+            // M7.1：逐图指纹 e_i 落盘（n×36 fp32），候选聚类与增量增强共用
+            val embFlat = FloatArray(refBitmaps.size * 36)
+            var embOk = true
+            refBitmaps.forEachIndexed { i, bmp ->
+                val e = AdaptiveColorNet.encodeStats(this, listOf(bmp))
+                if (e != null && e.size >= 36) {
+                    System.arraycopy(e, 0, embFlat, i * 36, 36)
+                } else {
+                    embOk = false
+                }
+            }
+            if (embOk && refBitmaps.isNotEmpty()) {
+                ModelRefStore.saveEmb(this, id, embFlat)
+            }
+            val netStyle0 = AdaptiveColorNet.encodeStyle(this, refBitmaps)
+            // 黑白参考 → 单色风格（stage2 未学过黑白参考，需显式清零 a/b 通路）
+            val netStyle = netStyle0?.let { AdaptiveColorNet.monoIfGray(refBitmaps, it).first }
+            val netMono = netStyle0 != null && netStyle != netStyle0
+            refBitmaps.forEach { it.recycle() }
+            DiagLog.i("Model", "M6 编码${if (netStyle != null) "成功" else "不可用"} 参考 ${refBitmaps.size} 张${if (netMono) "（黑白参考→单色）" else ""}")
+
             mainHandler.post { tvProgress.text = "正在拟合模型（${seeds.size} 张参考）…" }
             val versionId = "v_" + System.currentTimeMillis().toString(36)
             val t0 = System.currentTimeMillis()
@@ -392,11 +424,15 @@ class ModelActivity : AppCompatActivity() {
                             thetaFile = thetaFile,
                             paramFile = paramFile,
                             seedCount = seeds.size,
-                            source = VersionSource.INITIAL
+                            source = VersionSource.INITIAL,
+                            modelAff = netStyle?.aff ?: FloatArray(0),
+                            modelKnots = netStyle?.knots ?: FloatArray(0)
                         )
                     ),
                     currentVersionId = versionId,
-                    kind = StyleKind.MODEL
+                    kind = StyleKind.MODEL,
+                    modelAff = netStyle?.aff ?: FloatArray(0),
+                    modelKnots = netStyle?.knots ?: FloatArray(0)
                 )
                 CustomStyleStore.put(this, def)
                 rebuild()
@@ -404,10 +440,14 @@ class ModelActivity : AppCompatActivity() {
                     if (failed > 0 || dup > 0) {
                         buildString {
                             append("已创建「${def.name}」")
-                            if (dup > 0) append("（跳过 $dup 张重复")
-                            else append("（")
-                            if (failed > 0) append("，$failed 张未采用")
-                            append("）")
+                            val extras = buildList {
+                                if (netMono) add("黑白参考，输出为黑白")
+                                if (dup > 0) add("跳过 $dup 张重复")
+                                if (failed > 0) add("$failed 张未采用")
+                            }
+                            if (extras.isNotEmpty()) {
+                                append("（").append(extras.joinToString("，")).append("）")
+                            }
                         }
                     } else {
                         "已创建「${def.name}」"

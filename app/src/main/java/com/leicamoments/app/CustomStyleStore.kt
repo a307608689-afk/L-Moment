@@ -172,7 +172,10 @@ data class StyleVersion(
     val source: VersionSource,
     val strength: Float = 1f,
     val thetaFile: String = "",
-    val paramFile: String = ""
+    val paramFile: String = "",
+    /** M6：该版本的 aff(12)/knots(27)；空数组 = 走 LUT/param。版本级存储使回退可恢复。 */
+    val modelAff: FloatArray = FloatArray(0),
+    val modelKnots: FloatArray = FloatArray(0)
 )
 
 /**
@@ -197,8 +200,31 @@ data class CustomStyleDef(
     /** 池里一共多少张（未加载时唯一可信值）；加载后与 `seeds.size` 同源 */
     var seedCount: Int = seeds.size,
     /** [seeds] 是否已在内存 */
-    var seedsLoaded: Boolean = seeds.isNotEmpty()
-)
+    var seedsLoaded: Boolean = seeds.isNotEmpty(),
+    /**
+     * M6 模型色彩：风格仿射 aff(12) 与曲线 knots(27)，由 [AdaptiveColorNet] 产出并直接应用。
+     * 空数组 = 该模型仍走旧 LUT/θ 路线（旧存档、分享包导入）。
+     */
+    val modelAff: FloatArray = FloatArray(0),
+    val modelKnots: FloatArray = FloatArray(0)
+) {
+    /**
+     * 当前版本的 aff/knots：版本级优先，旧数据回退 def 级（模型创建时只存过 def）。
+     * null = 该模型仍走旧 LUT/θ 路线。
+     */
+    val modelStyle: Pair<FloatArray, FloatArray>?
+        get() {
+            val v = versions.firstOrNull { it.id == currentVersionId }
+            if (v != null && v.modelAff.size == 12 && v.modelKnots.size == 27) {
+                return v.modelAff to v.modelKnots
+            }
+            return if (modelAff.size == 12 && modelKnots.size == 27) modelAff to modelKnots else null
+        }
+
+    /** 是否可用 M6 新链渲染。 */
+    val hasModelNet: Boolean
+        get() = modelStyle != null
+}
 
 /**
  * 自定义色彩的 JSON 持久化（filesDir/custom_styles.json）。
@@ -400,6 +426,12 @@ object CustomStyleStore {
                     // 空串不写，旧版本读到未知键会忽略
                     .put("thetaFile", v.thetaFile)
                     .apply { if (v.paramFile.isNotEmpty()) put("paramFile", v.paramFile) }
+                    .apply {
+                        if (v.modelAff.size == 12 && v.modelKnots.size == 27) {
+                            put("modelAff", floatArrayToJson(v.modelAff))
+                            put("modelKnots", floatArrayToJson(v.modelKnots))
+                        }
+                    }
             )
         }
         val o = JSONObject()
@@ -417,7 +449,22 @@ object CustomStyleStore {
             def.seeds.forEach { arr.put(SeedsStore.seedJson(it)) }
             o.put("seeds", arr)
         }
+        if (def.hasModelNet) {
+            o.put("modelAff", floatArrayToJson(def.modelAff))
+            o.put("modelKnots", floatArrayToJson(def.modelKnots))
+        }
         return o
+    }
+
+    private fun floatArrayToJson(a: FloatArray): JSONArray {
+        val arr = JSONArray()
+        for (v in a) arr.put(v.toDouble())
+        return arr
+    }
+
+    private fun jsonToFloatArray(a: JSONArray?): FloatArray {
+        if (a == null) return FloatArray(0)
+        return FloatArray(a.length()) { i -> a.optDouble(i, 0.0).toFloat() }
     }
 
     /**
@@ -451,7 +498,9 @@ object CustomStyleStore {
                         .getOrDefault(VersionSource.INITIAL),
                     strength = v.optDouble("strength", 1.0).toFloat().coerceIn(0f, 1f),
                     thetaFile = v.optString("thetaFile"),
-                    paramFile = v.optString("paramFile")
+                    paramFile = v.optString("paramFile"),
+                    modelAff = jsonToFloatArray(v.optJSONArray("modelAff")),
+                    modelKnots = jsonToFloatArray(v.optJSONArray("modelKnots"))
                 )
             )
         }
@@ -467,7 +516,9 @@ object CustomStyleStore {
                 .getOrDefault(StyleKind.QUICK),
             seedCount = seedCount,
             // 有 seeds 键 = 池随元数据一起来的（schema 1 / 备份包），已加载
-            seedsLoaded = seedArr != null
+            seedsLoaded = seedArr != null,
+            modelAff = jsonToFloatArray(o.optJSONArray("modelAff")),
+            modelKnots = jsonToFloatArray(o.optJSONArray("modelKnots"))
         )
     }
 

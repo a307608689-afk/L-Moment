@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import com.codex.leicaapp.LeicaMark
@@ -52,6 +54,10 @@ class BatchTestActivity : Activity() {
         val indir = intent.getStringExtra("indir") ?: "/sdcard/LeicaTestIn"
         val outdir = intent.getStringExtra("outdir") ?: "/sdcard/LeicaTestOut"
         val limit = intent.getIntExtra("limit", 0)
+        // P3 A/B：强制回落到旧的 Bitmap.compress（4:2:0），用于同包内同像素对比编码口径
+        JpegEnc.forceLegacy420 = intent.getBooleanExtra("legacy", false)
+        // P3 A/B：质量覆盖（0 = 用各出口默认值），用于真机扫 volume/quality 曲线
+        JpegEnc.qualityOverride = intent.getIntExtra("q", 0)
         // C1 验收入口：条带全像素直通（可用 --es mode fullres 触发）
         val mode = intent.getStringExtra("mode") ?: ""
         Log.i(tag, "启动批量测试 mode=$mode styles=$styles indir=$indir outdir=$outdir limit=$limit thr=$thr level=$level rawonly=$rawOnly dumplin=$dumpLin")
@@ -64,12 +70,18 @@ class BatchTestActivity : Activity() {
         // 乙档验收：模型链条带导出 vs 整图链参考（同尺寸下应≈一致，且无带边界接缝）
         if (mode == "band") {
             DistillBandOps.debugNoToneFix = intent.getBooleanExtra("nofix", false)
+            DistillBandOps.debugNoWarm = intent.getBooleanExtra("nowarm", false)
             DistillBandOps.debugStyledOnly = intent.getBooleanExtra("styledonly", false)
             DistillBandOps.debugDumpGrid = intent.getBooleanExtra("griddump", false)
             DistillBandOps.debugBandStat = intent.getBooleanExtra("bstat", false)
+            // 暖调重叠窗口行数（0 = 旧口径）：A/B 用 wov=0/64/128 跑同一张 200MP
+            DistillBandOps.warmOverlap =
+                    intent.getIntExtra("wov", DistillBandOps.warmOverlap)
             Log.i(tag, "band A/B: nofix=${DistillBandOps.debugNoToneFix} "
+                    + "nowarm=${DistillBandOps.debugNoWarm} "
                     + "styledonly=${DistillBandOps.debugStyledOnly} "
-                    + "bstat=${DistillBandOps.debugBandStat}")
+                    + "bstat=${DistillBandOps.debugBandStat} "
+                    + "wov=${DistillBandOps.warmOverlap}")
             Thread { runBandSuite(File(indir), File(outdir).apply { mkdirs() }, limit, styles) }.start()
             return
         }
@@ -86,9 +98,21 @@ class BatchTestActivity : Activity() {
             return
         }
 
+        // 暖调段重叠窗口验证：逐带暖调时上下各扩 E 行、只保留中间带，看带边台阶是否消失
+        if (mode == "warmover") {
+            Thread { runWarmOverlapSuite(File(indir), File(outdir).apply { mkdirs() }) }.start()
+            return
+        }
+
         // 纯色探针：判定 native 暖调是否含暗角（空间）与尺寸/统计依赖
         if (mode == "flat") {
             Thread { runFlatSuite(File(outdir).apply { mkdirs() }) }.start()
+            return
+        }
+
+        // P5/C3：增益图重标定验收（旧增益 vs 重标定，量化 HDR 还原误差）
+        if (mode == "c3") {
+            Thread { runC3Suite(File(indir), File(outdir).apply { mkdirs() }, styles, limit) }.start()
             return
         }
 
@@ -281,6 +305,297 @@ class BatchTestActivity : Activity() {
         return sb.toString()
     }
 
+    // ==================== P5/C3：增益图重标定验收（--es mode c3） ====================
+
+    /**
+     * 对 indir 下的 UltraHDR JPEG × 每个风格产出四组对照：
+     *  1) `<stem>_<style>_sdr.jpg`  ：套色后的 SDR 主图（无增益图，供看 SDR 画面）；
+     *  2) `<stem>_<style>_c1.jpg`   ：新 SDR + **旧**增益图（C1 直通语义，错误基线）；
+     *  3) `<stem>_<style>_c3.jpg`   ：新 SDR + 重标定增益图（C3，`rebakeJpeg` 字节链）；
+     *  4) `<stem>_<style>_c3file.jpg`：同上但走 `rebakeFiles`（文件级，与全像素直通同函数）。
+     *
+     * 量化：以「旧 SDR + 旧增益」重建的 HDR 亮度为基准，分别算 C1/C3 的 EV 误差与 8bit 码值误差；
+     * C3 的误差显著低于 C1 即说明重标定生效。结果写 `_c3_report.txt`。
+     */
+    private fun runC3Suite(indir: File, outdir: File, styles: List<String>, limit: Int) {
+        val sb = StringBuilder()
+        try {
+            val files = indir.listFiles { f ->
+                f.isFile && f.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
+            }?.sortedBy { it.name } ?: emptyList()
+            sb.append("mode=c3 files=${files.size} limit=$limit styles=$styles ")
+                .append("rebakeEnabled=${HdrGainMap.REBAKE_ENABLED}\n")
+            sb.append("heap=${ImageUtils.heapUsageLabel()}\n")
+            var idx = 0
+            var hit = 0
+            for (f in files) {
+                if (limit > 0 && idx >= limit) break
+                idx++
+                val block = runOneC3(f, outdir, styles)
+                if (block.contains(" verify=true ")) hit++
+                sb.append(block)
+            }
+            sb.append("done hit=$hit/${minOf(idx, files.size)}\n")
+        } catch (t: Throwable) {
+            Log.e(tag, "c3 suite 失败", t)
+            sb.append("FAIL ${t.javaClass.simpleName}: ${t.message}\n")
+        }
+        File(outdir, "_c3_report.txt").writeText(sb.toString())
+        Log.i(tag, "c3 done -> ${outdir.absolutePath}/_c3_report.txt")
+        finish()
+    }
+
+    private fun runOneC3(f: File, outdir: File, styles: List<String>): String {
+        val sb = StringBuilder()
+        val src = f.readBytes()
+        val hdr = HdrGainMap.extract(src)
+        val stem = f.nameWithoutExtension
+        sb.append("== $stem ${src.size}B hdr=${hdr != null}")
+        if (hdr == null) return sb.append(" SKIP 无增益图\n").toString()
+        val gb = BitmapFactory.decodeByteArray(hdr.gainmapJpeg, 0, hdr.gainmapJpeg.size)
+        sb.append(" gain=${hdr.gainmapJpeg.size}B ${gb?.width}x${gb?.height}").append('\n')
+        gb?.recycle()
+        sb.append("   meta[min=${hdr.minLog2} max=${hdr.maxLog2} gamma=${hdr.gamma} ")
+            .append("offSdr=${hdr.offsetSdr} offHdr=${hdr.offsetHdr} ")
+            .append("capMin=${hdr.capMinLog2} capMax=${hdr.capMaxLog2}]\n")
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(src, 0, src.size, bounds)
+        val srcW = bounds.outWidth
+        val srcH = bounds.outHeight
+
+        val work = ImageUtils.normalizeExifOrientation(src)
+        for (st in styles) {
+            // fromId 会把未知 id 回落成 M9，验收必须精确匹配
+            val style = LeicaEngine.Style.values().firstOrNull { it.id.equals(st, ignoreCase = true) }
+            if (style == null) {
+                sb.append("  SKIP style=$st\n")
+                continue
+            }
+            val sdr = LeicaEngine.process(this, work, style, null)
+            val c1 = HdrGainMap.embed(sdr, hdr)
+
+            val t0 = System.currentTimeMillis()
+            val rb = HdrGainMap.rebakeJpeg(src, sdr, hdr)
+            val rbMs = System.currentTimeMillis() - t0
+
+            val tmpSdr = File(outdir, ".tmp_${stem}_${style.id}_sdr.jpg")
+            tmpSdr.writeBytes(sdr)
+            val t1 = System.currentTimeMillis()
+            val rbFile = if (rb != null) HdrGainMap.rebakeFiles(f, tmpSdr, hdr, srcW, srcH) else null
+            val fileMs = System.currentTimeMillis() - t1
+            tmpSdr.delete()
+
+            val c3 = if (rb != null) HdrGainMap.embed(sdr, rb) else c1
+            val c3f = if (rbFile != null) HdrGainMap.embed(sdr, rbFile) else sdr
+            File(outdir, "${stem}_${style.id}_sdr.jpg").writeBytes(sdr)
+            File(outdir, "${stem}_${style.id}_c1.jpg").writeBytes(c1)
+            File(outdir, "${stem}_${style.id}_c3.jpg").writeBytes(c3)
+            File(outdir, "${stem}_${style.id}_c3file.jpg").writeBytes(c3f)
+
+            val v3 = HdrGainMap.verify(c3)
+            sb.append("  ${style.id} sdr=${sdr.size}B c1=${c1.size}B c3=${c3.size}B ")
+                .append("rebake=${if (rb != null) "${rb.gainmapJpeg.size}B/${rbMs}ms" else "NULL"} ")
+                .append("file=${if (rbFile != null) "${rbFile.gainmapJpeg.size}B/${fileMs}ms" else "NULL"} ")
+                .append("verify=${v3.ok} ${v3.brief}\n")
+            if (!v3.ok) sb.append("    verifyDetail=${v3.detail}\n")
+            // 平台侧定性：ImageDecoder 是否把导出图识别为 UltraHDR（有 gainmap 即成功）
+            sb.append("    platform(").append(style.id).append(")=")
+                .append(platformGainmapInfo(File(outdir, "${stem}_${style.id}_c3.jpg")))
+                .append(" | c1=")
+                .append(platformGainmapInfo(File(outdir, "${stem}_${style.id}_c1.jpg")))
+                .append('\n')
+
+            sb.append("    C1(旧增益)  ").append(c3ErrText(measureC3(hdr, src, sdr, hdr))).append('\n')
+            sb.append("    C3(重标定)  ").append(c3ErrText(measureC3(hdr, src, sdr, rb))).append('\n')
+            sb.append("    C3F(文件级) ").append(c3ErrText(measureC3(hdr, src, sdr, rbFile))).append('\n')
+        }
+        return sb.toString()
+    }
+
+    private fun c3ErrText(e: C3Err?): String = e?.toString() ?: "n/a"
+
+    /**
+     * 平台侧定性：ImageDecoder 解码后 Bitmap.gainmap 非空 = 系统认这张图为 UltraHDR。
+     * （自写 Container 若是元素式而非属性式，某些解码器可能找不到增益图，此检查可直接暴露）
+     */
+    private fun platformGainmapInfo(f: File): String {
+        return try {
+            val src = ImageDecoder.createSource(f)
+            val bmp = ImageDecoder.decodeBitmap(src) { decoder, _, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            }
+            var out = "no-gainmap"
+            if (Build.VERSION.SDK_INT >= 34) {
+                val gm = bmp.gainmap
+                out = if (gm == null) {
+                    "NULL"
+                } else {
+                    val gc = gm.gainmapContents
+                    val ratio = gm.ratioMax?.joinToString(",") {
+                        String.format(java.util.Locale.US, "%.2f", it)
+                    } ?: "?"
+                    "${gc?.width}x${gc?.height} ratioMax=$ratio"
+                }
+                }
+            bmp.recycle()
+            out
+        } catch (t: Throwable) {
+            "ERR ${t.javaClass.simpleName}:${t.message}"
+        }
+    }
+
+    private class C3Err(
+        val evMae: Double,
+        val evP99: Double,
+        val evMax: Double,
+        val codeMae: Double,
+        val clip: Double,
+        val n: Int,
+        val skipped: Int
+    ) {
+        override fun toString(): String = String.format(
+            java.util.Locale.US,
+            "EVmae=%.4f EVp99=%.4f EVmax=%.4f codeMAE=%.2f >0.5EV=%.2f%% n=%d skip=%d",
+            evMae, evP99, evMax, codeMae, clip * 100.0, n, skipped
+        )
+    }
+
+    /** sRGB 编码值 → 线性光（256 级查表）；与 HdrGainMap 内部口径一致 */
+    private val c3S2L = FloatArray(256) { i ->
+        val c = i / 255.0
+        (if (c <= 0.04045) c / 12.92 else Math.pow((c + 0.055) / 1.055, 2.4)).toFloat()
+    }
+
+    private fun c3Luma(p: Int): Double =
+        (0.299 * c3S2L[(p shr 16) and 0xFF] +
+            0.587 * c3S2L[(p shr 8) and 0xFF] +
+            0.114 * c3S2L[p and 0xFF])
+
+    private fun c3Encode(l: Double): Double {
+        val c = l.coerceIn(0.0, 1.0)
+        return if (c <= 0.0031308) c * 12.92 else 1.055 * Math.pow(c, 1.0 / 2.4) - 0.055
+    }
+
+    private fun decodeForMeasure(jpeg: ByteArray, tw: Int, th: Int): Bitmap? {
+        val b = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, b)
+        if (b.outWidth <= 0 || b.outHeight <= 0) return null
+        var s = 1
+        while (s < 8 && b.outWidth / (s * 2) >= tw && b.outHeight / (s * 2) >= th) s *= 2
+        val bmp = BitmapFactory.decodeByteArray(
+            jpeg, 0, jpeg.size, BitmapFactory.Options().apply { inSampleSize = s }
+        ) ?: return null
+        if (bmp.width == tw && bmp.height == th) return bmp
+        val scaled = Bitmap.createScaledBitmap(bmp, tw, th, true)
+        if (scaled !== bmp) bmp.recycle()
+        return scaled
+    }
+
+    /**
+     * 以「旧 SDR + 旧增益」重建的 HDR 亮度为基准，算 newSdr × newGain 的重建误差。
+     * newGain 传旧 hdr 时即 C1 基线（分母换了增益没换）。
+     */
+    private fun measureC3(
+        old: HdrGainMap.HdrData,
+        oldSdr: ByteArray,
+        newSdr: ByteArray,
+        newGain: HdrGainMap.HdrData?
+    ): C3Err? {
+        var gOld: Bitmap? = null
+        var gNew: Bitmap? = null
+        var oBmp: Bitmap? = null
+        var nBmp: Bitmap? = null
+        try {
+            gOld = BitmapFactory.decodeByteArray(old.gainmapJpeg, 0, old.gainmapJpeg.size) ?: return null
+            gNew = newGain?.let { BitmapFactory.decodeByteArray(it.gainmapJpeg, 0, it.gainmapJpeg.size) }
+                ?: return null
+            val gw = gOld.width
+            val gh = gOld.height
+            if (gNew.width != gw || gNew.height != gh) return null
+            oBmp = decodeForMeasure(oldSdr, gw, gh) ?: return null
+            nBmp = decodeForMeasure(newSdr, gw, gh) ?: return null
+
+            val offSdr = old.offsetSdr.toDoubleOrNull() ?: 0.0
+            val offHdr = old.offsetHdr.toDoubleOrNull() ?: 0.0
+            val minL2 = old.minLog2.toDoubleOrNull() ?: 0.0
+            val maxL2 = old.maxLog2.toDoubleOrNull() ?: 1.0
+            val gamma = (old.gamma.toDoubleOrNull() ?: 1.0).takeIf { it > 1e-6 } ?: 1.0
+            val minN = newGain.minLog2.toDoubleOrNull() ?: minL2
+            val maxN = newGain.maxLog2.toDoubleOrNull() ?: maxL2
+            val gammaN = (newGain.gamma.toDoubleOrNull() ?: gamma).takeIf { it > 1e-6 } ?: 1.0
+            val span = (maxL2 - minL2).takeIf { Math.abs(it) > 1e-6 } ?: 1.0
+            val spanN = (maxN - minN).takeIf { Math.abs(it) > 1e-6 } ?: 1.0
+            val invG = 1.0 / gamma
+            val invGN = 1.0 / gammaN
+
+            val gr = IntArray(gw)
+            val gn = IntArray(gw)
+            val orow = IntArray(gw)
+            val nrow = IntArray(gw)
+            val hist = IntArray(4001) // 0..4 EV，步长 0.001
+            var sumEv = 0.0
+            var sumCode = 0.0
+            var cnt = 0
+            var skipped = 0
+            var over = 0
+            var maxEv = 0.0
+
+            for (y in 0 until gh) {
+                gOld.getPixels(gr, 0, gw, 0, y, gw, 1)
+                gNew.getPixels(gn, 0, gw, 0, y, gw, 1)
+                oBmp.getPixels(orow, 0, gw, 0, y, gw, 1)
+                nBmp.getPixels(nrow, 0, gw, 0, y, gw, 1)
+                for (x in 0 until gw) {
+                    val p1 = ((gr[x] shr 16) and 0xFF) / 255.0
+                    val p2 = ((gn[x] shr 16) and 0xFF) / 255.0
+                    val q1 = if (gamma == 1.0) p1 else Math.pow(p1, invG)
+                    val q2 = if (gammaN == 1.0) p2 else Math.pow(p2, invGN)
+                    val ref = (c3Luma(orow[x]) + offSdr) * Math.pow(2.0, minL2 + span * q1) - offHdr
+                    val v = (c3Luma(nrow[x]) + offSdr) * Math.pow(2.0, minN + spanN * q2) - offHdr
+                    if (ref <= 1e-4) {
+                        skipped++
+                        continue
+                    }
+                    val num = v + offHdr
+                    val den = ref + offHdr
+                    val ev = if (num <= 1e-6 || den <= 1e-6) 8.0 else Math.abs(Math.log(num / den) / LN2)
+                    sumEv += ev
+                    sumCode += Math.abs(c3Encode(ref) - c3Encode(v)) * 255.0
+                    if (ev > 0.5) over++
+                    if (ev > maxEv) maxEv = ev
+                    val bin = (ev * 1000.0).toInt().coerceIn(0, 4000)
+                    hist[bin]++
+                    cnt++
+                }
+            }
+            if (cnt <= 0) return null
+            val target = (cnt * 0.99).toInt().coerceAtLeast(1)
+            var acc = 0
+            var p99 = 4.0
+            for (i in hist.indices) {
+                acc += hist[i]
+                if (acc >= target) {
+                    p99 = i / 1000.0
+                    break
+                }
+            }
+            return C3Err(sumEv / cnt, p99, maxEv, sumCode / cnt, over.toDouble() / cnt, cnt, skipped)
+        } catch (t: Throwable) {
+            Log.w(tag, "measureC3 失败", t)
+            return null
+        } finally {
+            gOld?.recycle()
+            gNew?.recycle()
+            oBmp?.recycle()
+            nBmp?.recycle()
+        }
+    }
+
+    private companion object {
+        private const val LN2 = 0.6931471805599453
+    }
+
     // ==================== B0：条带基础设施接缝基线（--es mode seam） ====================
 
     /**
@@ -364,7 +679,8 @@ class BatchTestActivity : Activity() {
             val files = indir.listFiles { f ->
                 f.isFile && f.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
             }?.sortedBy { it.name } ?: emptyList()
-            sb.append("mode=band files=${files.size} limit=$limit styles=$styles\n")
+            sb.append("mode=band wov=${DistillBandOps.warmOverlap} "
+                    + "files=${files.size} limit=$limit styles=$styles\n")
             var idx = 0
             for (f in files) {
                 if (limit > 0 && idx >= limit) break
@@ -394,6 +710,8 @@ class BatchTestActivity : Activity() {
      */
     private fun runFlatSuite(outdir: File) {
         val sb = StringBuilder()
+        val rf = File(outdir, "_flat_report.txt")
+        fun flush() = runCatching { rf.writeText(sb.toString()) }
         try {
             fun probe(w: Int, h: Int, gray: Int, label: String) {
                 val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -405,6 +723,7 @@ class BatchTestActivity : Activity() {
                     this, b, WARM_BIN, WARM_DN, WARM_EV, WARM_WA, 12345f)
                 if (r == null) {
                     sb.append("  $label ${w}x$h gray=$gray FAILED\n")
+                    flush()
                     return
                 }
                 val row = IntArray(w)
@@ -417,25 +736,45 @@ class BatchTestActivity : Activity() {
                 }
                 r.getPixels(row, 0, w, 0, h / 2, w, 1)
                 fun gAt(x: Int) = (row[x] shr 8) and 0xFF
+                // 归一化纵向剖面（9 点）：判定场形只依赖宽高比，还是也随绝对像素尺寸变化
+                val pts = intArrayOf(0, h / 8, h / 4, 3 * h / 8, h / 2,
+                    5 * h / 8, 3 * h / 4, 7 * h / 8, h - 1)
+                val prof = pts.joinToString(",") { "%.1f".format(rowMean[it]) }
                 sb.append(
-                    "  $label ${w}x$h gray=$gray outRow0=${"%.1f".format(rowMean[0])}" +
+                    "  $label ${w}x$h gray=$gray ar=${"%.2f".format(w.toFloat() / h)}" +
+                        " outRow0=${"%.1f".format(rowMean[0])}" +
                         " rowMid=${"%.1f".format(rowMean[h / 2])}" +
                         " rowLast=${"%.1f".format(rowMean[h - 1])}" +
-                        " midRowCC=${gAt(w / 2)} midRowEdge=${gAt(0)}/${gAt(w - 1)}\n"
+                        " midRowCC=${gAt(w / 2)} midRowEdge=${gAt(0)}/${gAt(w - 1)}" +
+                        " prof=$prof\n"
                 )
                 b.recycle()
+                r.recycle()
+                flush()
             }
             sb.append("mode=flat heap=${ImageUtils.heapUsageLabel()}\n")
+            flush()
             probe(1024, 768, 128, "small")
-            probe(4096, 768, 128, "tall-band")
             probe(4096, 3072, 128, "full")
+            // A 组：固定宽 4096，只改高度 → 宽高比依赖
+            probe(4096, 768, 128, "ar5")
+            probe(4096, 256, 128, "ar16")
+            probe(4096, 128, 128, "ar32")
+            probe(4096, 64, 128, "ar64")
+            // B 组：固定宽高比 63.75:1，只改绝对尺寸 → 绝对尺寸依赖（真实带 16320x256 vs 代理带 1889x30）
+            probe(16320, 256, 128, "ar64-real")
+            probe(8160, 128, 128, "ar64-half")
+            probe(4080, 64, 128, "ar64-quarter")
+            probe(2040, 32, 128, "ar64-eighth")
+            probe(1889, 30, 128, "ar64-proxy")
+            // 灰度依赖（保留既有探针）
             probe(4096, 768, 40, "dark")
             probe(4096, 768, 200, "bright")
         } catch (t: Throwable) {
             Log.e(tag, "flat 探针失败", t)
             sb.append("FATAL ${t.message}\n")
         }
-        runCatching { File(outdir, "_flat_report.txt").writeText(sb.toString()) }
+        flush()
         finish()
     }
 
@@ -1108,6 +1447,123 @@ class BatchTestActivity : Activity() {
             sb.append("FATAL ${t.message}\n")
         }
         runCatching { File(outdir, "_warm_report.txt").writeText(sb.toString()) }
+        finish()
+    }
+
+    /**
+     * 暖调段「重叠窗口」验证：逐带（256 行）暖调时把窗口上下各扩 E 行、只保留中间 256 行，
+     * 看带边台阶 / 带内边缘塌陷是否消失。台阶就是「每 256 行一条水平线」的直接来源。
+     * 判据：stepB（带边台阶）与 dipB（带边塌陷）随 E 增大而趋 0，stepI 为全图逐行抖动基线。
+     */
+    private fun runWarmOverlapSuite(indir: File, outdir: File) {
+        val sb = StringBuilder()
+        val rf = File(outdir, "_warmover_report.txt")
+        fun flush() = runCatching { rf.writeText(sb.toString()) }
+        try {
+            val f = indir.listFiles { x ->
+                x.isFile && x.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") }
+            }?.sortedBy { it.name }?.firstOrNull()
+            if (f == null) {
+                sb.append("no jpg\n")
+            } else {
+                val src = BitmapFactory.decodeFile(f.absolutePath)
+                    ?: throw IllegalStateException("decode failed")
+                val w = src.width
+                val h = src.height
+                sb.append("mode=warmover ${f.name} ${w}x$h band=256 heap=${ImageUtils.heapUsageLabel()}\n")
+                flush()
+
+                val ref = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
+                    this, src.copy(Bitmap.Config.ARGB_8888, true),
+                    WARM_BIN, WARM_DN, WARM_EV, WARM_WA, 12345f)
+                    ?: throw IllegalStateException("whole warm failed")
+                val ra = IntArray(w)
+                val rb = IntArray(w)
+
+                for (e in intArrayOf(0, 32, 64, 128)) {
+                    val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    val cv = android.graphics.Canvas(out)
+                    var top = 0
+                    while (top < h) {
+                        val rows = minOf(256, h - top)
+                        val wt = maxOf(0, top - e)
+                        val wb = minOf(h, top + rows + e)
+                        val crop = Bitmap.createBitmap(src, 0, wt, w, wb - wt)
+                            .copy(Bitmap.Config.ARGB_8888, true)
+                        val wr = LegendaryPostProcessor.applyWarmLutBitmapBinAt(
+                            this, crop, WARM_BIN, WARM_DN, WARM_EV, WARM_WA, 12345f)
+                        if (wr == null) {
+                            sb.append("  band warm failed @$top\n")
+                        } else {
+                            cv.drawBitmap(
+                                wr,
+                                android.graphics.Rect(0, top - wt, w, top - wt + rows),
+                                android.graphics.Rect(0, top, w, top + rows), null)
+                            wr.recycle()
+                        }
+                        crop.recycle()
+                        top += rows
+                    }
+
+                    val d = FloatArray(h)
+                    var mae = 0.0
+                    for (y in 0 until h) {
+                        out.getPixels(rb, 0, w, 0, y, w, 1)
+                        ref.getPixels(ra, 0, w, 0, y, w, 1)
+                        var s = 0L
+                        for (x in 0 until w) {
+                            val g = (rb[x] shr 8) and 0xFF
+                            val r = (ra[x] shr 8) and 0xFF
+                            s += (g - r)
+                            mae += Math.abs(g - r)
+                        }
+                        d[y] = s.toFloat() / w
+                    }
+                    mae /= (w.toDouble() * h)
+
+                    var stepSum = 0.0
+                    var dipSum = 0.0
+                    var nb = 0
+                    var y0 = 256
+                    while (y0 < h) {
+                        stepSum += d[y0] - d[y0 - 1]
+                        var loc = 0.0
+                        var c = 0
+                        for (k in -12 until 12) {
+                            val yy = y0 + k
+                            if (yy in 0 until h) {
+                                loc += d[yy]
+                                c++
+                            }
+                        }
+                        loc /= c
+                        dipSum += (d[y0] + d[y0 - 1]) / 2.0 - loc
+                        nb++
+                        y0 += 256
+                    }
+                    var stepI = 0.0
+                    for (y in 1 until h) stepI += Math.abs(d[y] - d[y - 1])
+                    stepI /= (h - 1)
+
+                    sb.append("  E=%d globalMae=%.2f stepB=%+.2f dipB=%+.2f stepI=%.3f\n"
+                        .format(e, mae, stepSum / nb, dipSum / nb, stepI))
+                    flush()
+                    if (e == 0 || e == 64) {
+                        runCatching {
+                            java.io.FileOutputStream(File(outdir, "warmover_e$e.jpg"))
+                                .use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                        }
+                    }
+                    out.recycle()
+                }
+                ref.recycle()
+                src.recycle()
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "warmover 失败", t)
+            sb.append("FATAL ${t.message}\n")
+        }
+        flush()
         finish()
     }
 

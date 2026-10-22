@@ -228,13 +228,15 @@ object ColorBackup {
         // A 路线参数版本：1.6 KB，永不回收，用不着重烘
         val paramBytes = if (version.paramFile.isNotEmpty()) ModelParamStore.read(ctx, version.paramFile) else null
         val isParam = paramBytes != null
+        // M6：aff/knots 直接放在 JSON 里，没有 LUT/θ/param 文件可打包
+        val isNet = def.hasModelNet
         // M5：旧 LUT 版本可能已被 LRU 回收，先按 θ 快照重烘
-        if (!isParam && !ModelLutStore.ensure(ctx, def, version)) {
+        if (!isNet && !isParam && !ModelLutStore.ensure(ctx, def, version)) {
             throw IllegalStateException("这个版本的色彩文件已丢失")
         }
         val dir = AlexaLut.customDir(ctx)
         val binFile = File(dir, version.lutFile)
-        if (!isParam) {
+        if (!isNet && !isParam) {
             if (version.lutFile.isEmpty() || !binFile.isFile) {
                 throw IllegalStateException("这个版本的色彩文件已丢失")
             }
@@ -253,8 +255,11 @@ object ColorBackup {
             seedCount = CustomStyleStore.refCount(def),
             source = VersionSource.INITIAL,
             strength = 1f,
-            lutFile = if (isParam) "" else version.lutFile,
-            thetaFile = if (isParam) "" else version.thetaFile
+            lutFile = if (isNet || isParam) "" else version.lutFile,
+            thetaFile = if (isNet || isParam) "" else version.thetaFile,
+            // 版本级优先；旧数据只有 def 级时用它补齐，保证分享包仍带 aff/knots
+            modelAff = if (version.modelAff.size == 12) version.modelAff else def.modelAff,
+            modelKnots = if (version.modelKnots.size == 27) version.modelKnots else def.modelKnots
         )
         val single = CustomStyleDef(
             id = def.id,
@@ -263,7 +268,9 @@ object ColorBackup {
             seeds = ArrayList(def.seeds),
             versions = arrayListOf(singleVersion),
             currentVersionId = singleVersion.id,
-            kind = def.kind
+            kind = def.kind,
+            modelAff = def.modelAff,
+            modelKnots = def.modelKnots
         )
         val root = JSONObject()
             .put("schema", 1)
@@ -276,7 +283,7 @@ object ColorBackup {
             .put("styles", 1)
             .put(
                 "luts",
-                if (isParam) JSONArray()
+                if (isNet || isParam) JSONArray()
                 else JSONArray().put(JSONObject().put("name", version.lutFile).put("size", binFile.length()))
             )
             .put(
@@ -297,12 +304,14 @@ object ColorBackup {
         ZipOutputStream(BufferedOutputStream(out)).use { zip ->
             putEntry(zip, MANIFEST, manifest.toString().toByteArray(Charsets.UTF_8))
             putEntry(zip, STYLES, root.toString().toByteArray(Charsets.UTF_8))
-            if (isParam) {
-                putEntry(zip, PARAM_PREFIX + version.paramFile, paramBytes!!)
-            } else {
-                zip.putNextEntry(ZipEntry(LUT_PREFIX + version.lutFile))
-                binFile.inputStream().use { it.copyTo(zip) }
-                zip.closeEntry()
+            when {
+                isNet -> Unit                       // JSON 里的 aff/knots 就是全部
+                isParam -> putEntry(zip, PARAM_PREFIX + version.paramFile, paramBytes!!)
+                else -> {
+                    zip.putNextEntry(ZipEntry(LUT_PREFIX + version.lutFile))
+                    binFile.inputStream().use { it.copyTo(zip) }
+                    zip.closeEntry()
+                }
             }
             refThumbs.forEach { (idx, f) ->
                 zip.putNextEntry(ZipEntry("$REFS_PREFIX${def.id}/$idx.jpg"))
@@ -582,7 +591,9 @@ object ColorBackup {
                     versions = mutableListOf(),
                     currentVersionId = "",
                     // 分叉也要保留模型身份，否则对方的「设置」入口会退化成普通色彩菜单
-                    kind = src.kind
+                    kind = src.kind,
+                    modelAff = src.modelAff,
+                    modelKnots = src.modelKnots
                 )
             }
             def.name = uniqueStyleName(src.name, takenNames)

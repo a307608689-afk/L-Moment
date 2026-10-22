@@ -12,6 +12,7 @@ import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
 import androidx.exifinterface.media.ExifInterface
 import com.codex.leicaapp.MadridLegendary
 import java.io.ByteArrayInputStream
@@ -23,8 +24,27 @@ import java.util.Locale
 
 object ImageUtils {
 
-    /** 从 URI 读取原始字节。 */
+    /**
+     * 从 URI 读取原始字节。
+     *
+     * Android 10+ 对相册/照片选择器给出的 URI，系统默认返回**抹掉 EXIF GPS 的脱敏副本**
+     * （机型/参数/时间仍在，位置被剥掉）。持 ACCESS_MEDIA_LOCATION 时用
+     * [MediaStore.setRequireOriginal] 声明要未脱敏原件，导出才能保留定位信息。
+     * requireOriginal 只对 MediaStore 系 URI 有效且无权限时会 open 失败——一律退回普通读法兜底。
+     */
     fun readBytes(context: Context, uri: Uri): ByteArray {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val original = try { MediaStore.setRequireOriginal(uri) } catch (t: Throwable) { null }
+            if (original != null) {
+                try {
+                    context.contentResolver.openInputStream(original)?.use { input ->
+                        return input.readBytes()
+                    }
+                } catch (t: Throwable) {
+                    // 无 ACCESS_MEDIA_LOCATION 授权 / 云端 provider 不支持：退普通读法
+                }
+            }
+        }
         context.contentResolver.openInputStream(uri)?.use { input ->
             return input.readBytes()
         }
@@ -171,6 +191,74 @@ object ImageUtils {
         }
     }
 
+    /**
+     * M9 系「高分辨率工作链」的长边目标（B 方案，2026-10-21）。
+     *
+     * 背景：M9 全像素条带链（DistillBandOps）的带边台阶/周期纹/彩噪/过削，根因是暖调厂商
+     * .so 按单带宽高归一化（逐带口径），补偿层无法真正根除。经与用户确认放弃条带链，
+     * 改走结构健康的整图链（[M9Distill]：暖调**全图一次调用**，结构上不存在带边收敛）。
+     * 整图链的瓶颈是堆：暖调全图调用要求全图位图驻留，512MB（largeHeap）下
+     * 3 份同尺寸位图的上限 ≈ 24MP，故长边取 5632（5632×4224≈23.8MP，短边按 4:3 推算）。
+     * 失败（预算不足 / native 暖调异常 / 超时）由调用方自动回落工作版（4096 口径）。
+     */
+    const val HIRES_M9_LONG = 5632
+
+    /**
+     * M9 超高分辨率档（实验，需设置里手动开启）：8192×6144 = 50.3MP。
+     *
+     * 价值：50MP 源**零降采样**、200MP 出 50MP（vs 5632 档的 24MP）。
+     * 风险：native 暖调在 50MP 位图上的稳定性未经量产验证；Java 堆峰值 ≈ outPx 201MB
+     * （Bitmap 在 native 堆，不计入 512MB 的 Java 上限）；失败由 exportDistillHiRes
+     * 自动回落 5632 档再回落工作版，不会崩（native 硬 abort 除外，需真机验证）。
+     */
+    const val HIRES_M9_LONG_XL = 8192
+
+    /**
+     * [decodeWork] 的指定长边版本（M9 高分辨率导出用）。
+     *
+     * 与 [decodeWork] 同机制：onHeaderDecoded 里 setTargetSize 直接解到目标尺寸，
+     * 峰值内存 = 目标位图本身（22~24MP ≈ 90MB），不是「先全解 200MP 再缩」。
+     */
+    fun decodeWorkForLongEdge(context: Context, uri: Uri, longEdge: Int): Bitmap? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val source = ImageDecoder.createSource(context.contentResolver, uri)
+                val decoded = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val w = info.size.width
+                    val h = info.size.height
+                    if (w > 0 && h > 0) {
+                        val s = longEdge.toFloat() / maxOf(w, h)
+                        if (s < 1f) {
+                            decoder.setTargetSize(
+                                (w * s).toInt().coerceAtLeast(1),
+                                (h * s).toInt().coerceAtLeast(1))
+                        }
+                    }
+                }
+                clampToLongEdge(decoded, longEdge)
+            } else {
+                clampToLongEdge(decodeOrientedWithBitmapFactory(context, uri, longEdge), longEdge)
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** 按长边收敛（[decodeWorkForLongEdge] 的兜底收敛）；已在限内不复制。 */
+    private fun clampToLongEdge(bmp: Bitmap, longEdge: Int): Bitmap {
+        val edge = maxOf(bmp.width, bmp.height)
+        if (edge <= longEdge) return bmp
+        val s = longEdge.toFloat() / edge
+        val out = Bitmap.createScaledBitmap(
+            bmp,
+            (bmp.width * s).toInt().coerceAtLeast(1),
+            (bmp.height * s).toInt().coerceAtLeast(1),
+            true)
+        if (out !== bmp) bmp.recycle()
+        return out
+    }
+
     /** 按横置口径把位图收敛到工作上限内；已在限内直接返回原对象（不复制）。 */
     private fun clampToWorkLimit(bmp: Bitmap): Bitmap {
         if (withinWorkLimit(bmp.width, bmp.height)) return bmp
@@ -233,12 +321,8 @@ object ImageUtils {
             ?: throw IllegalStateException("decode failed")
     }
 
-    /** Bitmap → JPEG 字节。 */
-    fun toJpeg(bitmap: Bitmap, quality: Int = 92): ByteArray {
-        val bos = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, bos)
-        return bos.toByteArray()
-    }
+    /** Bitmap → JPEG 字节（P3：走 4:4:4 编码器，失败自动回落 Bitmap.compress）。 */
+    fun toJpeg(bitmap: Bitmap, quality: Int = 92): ByteArray = JpegEnc.encode(bitmap, quality)
 
     /** JPEG 字节 → Bitmap。 */
     fun fromJpeg(bytes: ByteArray): Bitmap? {
@@ -268,11 +352,10 @@ object ImageUtils {
             m.postScale(if (exif.isFlipped) -1f else 1f, 1f)
             val out = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
             if (out !== bmp) bmp.recycle()
-            val bos = ByteArrayOutputStream(bytes.size)
-            out.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            val encoded = JpegEnc.encode(out)
             out.recycle()
             MadridLegendary.patchExifOrientationToOne(
-                MadridLegendary.copyExif(bytes, bos.toByteArray()))
+                MadridLegendary.copyExif(bytes, encoded))
         } catch (t: Throwable) {
             bytes
         }

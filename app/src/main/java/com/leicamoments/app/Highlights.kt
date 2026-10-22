@@ -44,9 +44,10 @@ object Highlights {
             var nr = r * gain
             var ng = g * gain
             var nb = b * gain
-            if (nr > 255f) nr = 255f
-            if (ng > 255f) ng = 255f
-            if (nb > 255f) nb = 255f
+            // P0 止血：补下限 clamp，负增益不得进通道（防符号位铺开出怪色）
+            if (nr > 255f) nr = 255f else if (nr < 0f) nr = 0f
+            if (ng > 255f) ng = 255f else if (ng < 0f) ng = 0f
+            if (nb > 255f) nb = 255f else if (nb < 0f) nb = 0f
             pixels[i] = (p and 0xFF000000.toInt()) or
                 (nr.toInt() shl 16) or (ng.toInt() shl 8) or nb.toInt()
         }

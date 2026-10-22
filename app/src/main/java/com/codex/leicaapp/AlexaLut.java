@@ -23,7 +23,9 @@ import java.util.HashMap;
  *  - lut_arridune.bin   : Dune 沙漠哑光（同上，65³）
  *  - lut_arrilala.bin   : LaLaLand 黄昏绚丽（同上，65³）
  *  - lut_arrijoker.bin  : Joker 绿调阴郁（同上，33³）
- *  - lut_p9vibrant.bin  : L-P9「P9 鲜艳」色彩还原（测量式拟合）</p>
+ *  - lut_p9vibrant.bin  : L-P9「P9 鲜艳」色彩还原（测量式拟合）
+ *  - lut_fuji_*.bin     : F-胶片家族五档（经典铬/经典负片/怀旧负片/人像负片·高/细腻黑白，
+ *                         解析式烘焙，33³）</p>
  *
  * <p>自定义 LUT（运行时由 Kotlin 侧烘焙，落在 filesDir/luts/）：以 {@link #FILE_PREFIX}
  * 开头的引用读取，如 {@code "file:lut_u1729_v3.bin"}。</p>
@@ -50,6 +52,18 @@ public final class AlexaLut {
     public static final String LUT_ARRI_LALA = "lut_arrilala.bin";
     /** assets 内置：Joker 绿调阴郁（33³）。 */
     public static final String LUT_ARRI_JOKER = "lut_arrijoker.bin";
+
+    // F-胶片家族：解析式烘焙，显示名走开源中性化口径
+    /** assets 内置：F-胶片 经典铬（33³）。 */
+    public static final String LUT_FUJI_CHROME = "lut_fuji_chrome.bin";
+    /** assets 内置：F-胶片 经典负片（33³）。 */
+    public static final String LUT_FUJI_CNEG = "lut_fuji_cneg.bin";
+    /** assets 内置：F-胶片 怀旧负片（33³）。 */
+    public static final String LUT_FUJI_NN = "lut_fuji_nn.bin";
+    /** assets 内置：F-胶片 人像负片·高（33³）。 */
+    public static final String LUT_FUJI_PNH = "lut_fuji_pnh.bin";
+    /** assets 内置：F-胶片 细腻黑白（33³）。 */
+    public static final String LUT_FUJI_ACROS = "lut_fuji_acros.bin";
 
     /** 自定义 LUT 引用前缀：{@code file:<name>} → filesDir/luts/<name>。 */
     public static final String FILE_PREFIX = "file:";
@@ -252,10 +266,9 @@ public final class AlexaLut {
             applyLutPx(px, lut);
             if (hooks != null) hooks.post(px, w, h);
             bmp.setPixels(px, 0, w, 0, 0, w, h);
-            ByteArrayOutputStream bos = new ByteArrayOutputStream(jpeg.length);
-            bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos);
+            byte[] encoded = com.leicamoments.app.JpegEnc.encode(bmp);
             bmp.recycle();
-            byte[] ret = MadridLegendary.copyExif(jpeg, bos.toByteArray());
+            byte[] ret = MadridLegendary.copyExif(jpeg, encoded);
             com.leicamoments.app.DiagLog.i("LMAlexaLut", "ok ref=" + ref + " dim=" + lut.dim + " " + w + "x" + h
                     + " " + (System.currentTimeMillis() - t0) + "ms out=" + ret.length + "B");
             return ret;

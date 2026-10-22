@@ -66,6 +66,12 @@ internal object LutBandOps {
         LeicaEngine.Style.DUNE -> Recipe(AlexaLut.LUT_ARRI_DUNE, 0.26f, 0.85f)
         LeicaEngine.Style.LALALAND -> Recipe(AlexaLut.LUT_ARRI_LALA, 0.12f, 0.80f)
         LeicaEngine.Style.JOKER -> Recipe(AlexaLut.LUT_ARRI_JOKER, 0.30f, 1.00f)
+        // F-胶片家族（颗粒/暗角与 LeicaEngine 逐项对齐）
+        LeicaEngine.Style.FCHROME -> Recipe(AlexaLut.LUT_FUJI_CHROME, 0.14f, 0.55f)
+        LeicaEngine.Style.FCNEG -> Recipe(AlexaLut.LUT_FUJI_CNEG, 0.16f, 0.55f)
+        LeicaEngine.Style.FNN -> Recipe(AlexaLut.LUT_FUJI_NN, 0.12f, 0.45f)
+        LeicaEngine.Style.FPNH -> Recipe(AlexaLut.LUT_FUJI_PNH, 0.10f, 0.40f)
+        LeicaEngine.Style.FACROS -> Recipe(AlexaLut.LUT_FUJI_ACROS, 0.15f, 0.60f)
         else -> null
     }
 
@@ -143,25 +149,21 @@ internal object LutBandOps {
 }
 
 /**
- * 色调五滑杆的条带版：全部是单像素查表（Brightness/Exposure/Highlights/Shadows/BlackLevel），
- * 顺序与 [Shadows.applyStackToJpeg] 的整图路径一致。
+ * 色调五滑杆的条带版：复合色调引擎单次遍历（4096 级亮度曲线 + 色相保护 + 抖动），
+ * 顺序与参数语义与 [Shadows.applyStackToJpeg] 的整图路径完全一致（同一 ToneCurve）。
  */
 internal object LevelStack {
 
     fun apply(src: Bitmap, levels: IntArray): Bitmap {
-        var cur = src
-        cur = step(cur, levels[0]) { b, v -> Brightness.applyToBitmap(b, v) }
-        cur = step(cur, levels[1]) { b, v -> Exposure.applyToBitmap(b, v) }
-        cur = step(cur, levels[2]) { b, v -> Highlights.applyToBitmap(b, v) }
-        cur = step(cur, levels[3]) { b, v -> Shadows.applyToBitmap(b, v) }
-        cur = step(cur, levels[4]) { b, v -> BlackLevel.applyToBitmap(b, v) }
-        return cur
-    }
-
-    private inline fun step(cur: Bitmap, level: Int, f: (Bitmap, Int) -> Bitmap): Bitmap {
-        if (level == 0) return cur
-        val next = f(cur, level)
-        if (next !== cur) cur.recycle()
+        // P3：levels 兼容 5 元（旧调用）与 7 元（含饱和度/对比度）两种长度。
+        // 柔光档不在此消费：空间算子半径（min/100）超条带重叠带，逐带处理必带边
+        // 不连续（LM9 v15 教训）——条带链只吃曲线类档位，柔光仅整图路径生效。
+        val next = ToneCurve.applyToBitmap(
+            src, ToneCurve.of(
+                levels[0], levels[1], levels[2], levels[3], levels[4],
+                levels.getOrElse(5) { 0 }, levels.getOrElse(6) { 0 }
+            ))
+        if (next !== src) src.recycle()   // 与旧 step() 同约：输入带由本层回收
         return next
     }
 }

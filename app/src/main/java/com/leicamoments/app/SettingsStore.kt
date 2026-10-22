@@ -11,7 +11,9 @@ import org.json.JSONArray
  * - `last_category`：最后一次**实际所处**的分类，切分类与冷启动确定分类后写入
  * - `coach_shown`：首次启动的分类引导气泡是否已展示
  * - `pinned_ids`：置顶项 id 列表（保序 JSON 数组，最近置顶的在最前）
+ * - `pinned_cross_category`：置顶跨分类显示（默认关：置顶只出现在 L-Moment 与该色彩所属分类）
  * - `full_res_export`：全像素导出开关（C4，默认开；低端机由像素预算分档强制回落）
+ * - `leica_badge`：徕卡徽章开关（默认开；关 = 导出不写徽章并剥离源图自带的徽章元数据）
  * - `raw_thr_level:<MODEL>`：RAW 解码亮度档位（按机型记忆，不进备份）
  */
 object SettingsStore {
@@ -21,10 +23,13 @@ object SettingsStore {
     private const val KEY_LAST = "last_category"
     private const val KEY_COACH = "coach_shown"
     private const val KEY_PINNED = "pinned_ids"
+    private const val KEY_PINNED_CROSS = "pinned_cross_category"
     private const val KEY_SHARE_SEEN = "share_seen_sig"
     private const val KEY_RAW_THR = "raw_thr_level"
     private const val KEY_RAW_HINT = "raw_hint_shown"
     private const val KEY_FULL_RES = "full_res_export"
+    private const val KEY_M9_HIRES = "m9_hires_export"
+    private const val KEY_LEICA_BADGE = "leica_badge"
 
     /** 「记忆上次」在 default_category 里的取值 */
     const val VALUE_LAST = "last"
@@ -60,7 +65,7 @@ object SettingsStore {
         prefs(c).edit().putBoolean(KEY_COACH, true).apply()
     }
 
-    // ---- 置顶（跨分类，内置与自定义共用一套 id 空间）----
+    // ---- 置顶（内置与自定义共用一套 id 空间）----
 
     /**
      * 置顶项 id，最近置顶的在最前。
@@ -106,6 +111,21 @@ object SettingsStore {
         if (cur.contains(id)) setPinnedIds(c, cur.filterNot { it == id })
     }
 
+    /**
+     * 置顶跨分类显示（2026-10-22 起**默认关**）。
+     *
+     * 关 = 新口径：置顶区只出现在 L-Moment 与该色彩**所属**的分类里
+     * （内置色彩查 [FilterCategory.styles] 归属；自定义/模型色彩只在「我的色彩」）；
+     * 开 = 旧口径：置顶区不参与分类过滤，任何分类下都排最前。
+     *
+     * 只影响滤镜条显示，置顶记录（[pinnedIds]）本身不随开关变化。
+     */
+    fun pinnedCrossCategory(c: Context): Boolean = prefs(c).getBoolean(KEY_PINNED_CROSS, false)
+
+    fun setPinnedCrossCategory(c: Context, enabled: Boolean) {
+        prefs(c).edit().putBoolean(KEY_PINNED_CROSS, enabled).apply()
+    }
+
     // ---- 分享指令 ----
 
     /**
@@ -123,13 +143,13 @@ object SettingsStore {
 
     /**
      * 0 = 标准（auto_bright_thr 0.01，与旧版本一致）
-     * 1 = 提亮（0.03）
+     * 1 = 提亮（0.03）——默认档（2026-10-22 改定，旧版默认 0）
      * 2 = 强力提亮（0.04）
      *
      * key 带机型：同一台机器的观感偏好换机后不沿用；也**不进 .lmc 备份**，
      * 因为该值与机型的 RAW 高光余量、预览合成策略强相关，跨机恢复只会帮倒忙。
      */
-    fun rawThrLevel(c: Context): Int = prefs(c).getInt(rawThrKey(), 0).coerceIn(0, 2)
+    fun rawThrLevel(c: Context): Int = prefs(c).getInt(rawThrKey(), 1).coerceIn(0, 2)
 
     fun setRawThrLevel(c: Context, level: Int) {
         prefs(c).edit().putInt(rawThrKey(), level.coerceIn(0, 2)).apply()
@@ -169,5 +189,37 @@ object SettingsStore {
 
     fun setFullResEnabled(c: Context, enabled: Boolean) {
         prefs(c).edit().putBoolean(KEY_FULL_RES, enabled).apply()
+    }
+
+    /**
+     * M9 / M9D 超高分辨率档（8192 长边 = 50MP 级，实验）。
+     *
+     * 默认**关**：8192 档的 native 暖调在 50MP 输入上的稳定性尚未量产验证，
+     * 默认开等于把未知风险推给所有用户。开启后 50MP 源零降采样、200MP 出 50MP，
+     * 失败自动回落 24MP 档（5632）。
+     *
+     * 依赖：[fullResEnabled] 为 true 才可选（设置页对 UI 做灰态）；
+     * 低端机即使这里为 true 也会被 [ImageUtils.lowEndReason] 的回落拦住。
+     */
+    fun m9HiResEnabled(c: Context): Boolean = prefs(c).getBoolean(KEY_M9_HIRES, false)
+
+    fun setM9HiResEnabled(c: Context, enabled: Boolean) {
+        prefs(c).edit().putBoolean(KEY_M9_HIRES, enabled).apply()
+    }
+
+    // ---- 徕卡徽章 ----
+
+    /**
+     * 徕卡徽章开关（默认开）。
+     *
+     * 开 = 导出写入徕卡识别元数据（EXIF 三私有 tag + FFE4 XIAOMI_CUSTOMIZE，见 LeicaMark），
+     * 相册据此显示「徕卡」徽章；关 = 不写徽章，并剥离源图自带的徽章元数据
+     * （含 15 Ultra 徕卡模式直出 JPG 原生携带的那份），导出即「无徽章」普通照片。
+     * 复合容器清理（XMP/MPF）与 EXIF 保留（机型/拍摄参数/GPS）不随开关变化。
+     */
+    fun leicaBadgeEnabled(c: Context): Boolean = prefs(c).getBoolean(KEY_LEICA_BADGE, true)
+
+    fun setLeicaBadgeEnabled(c: Context, enabled: Boolean) {
+        prefs(c).edit().putBoolean(KEY_LEICA_BADGE, enabled).apply()
     }
 }

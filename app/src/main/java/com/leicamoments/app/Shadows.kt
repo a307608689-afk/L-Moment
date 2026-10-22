@@ -46,9 +46,10 @@ object Shadows {
             var nr = r * gain
             var ng = g * gain
             var nb = b * gain
-            if (nr > 255f) nr = 255f
-            if (ng > 255f) ng = 255f
-            if (nb > 255f) nb = 255f
+            // P0 止血：补下限 clamp，负增益不得进通道（防符号位铺开出怪色）
+            if (nr > 255f) nr = 255f else if (nr < 0f) nr = 0f
+            if (ng > 255f) ng = 255f else if (ng < 0f) ng = 0f
+            if (nb > 255f) nb = 255f else if (nb < 0f) nb = 0f
             pixels[i] = (p and 0xFF000000.toInt()) or
                 (nr.toInt() shl 16) or (ng.toInt() shl 8) or nb.toInt()
         }
@@ -58,8 +59,10 @@ object Shadows {
     }
 
     /**
-     * 组合烘焙：亮度→曝光→高光→阴影→黑色阶一次 decode/encode（避免多道 JPEG95 重编码叠加损失），
-     * 顺序与预览管线一致；EXIF 回填源字节。五者均为 0 时原样返回。
+     * 组合烘焙：亮度→曝光→高光→阴影→黑色阶→对比度合成单条曲线 + 饱和度逐像素，
+     * 尾接柔光（SoftGlow，空间算子在曲线之后；见 SoftGlow 头注的 8-bit 域说明），
+     * 一次 decode/encode（避免多道 JPEG95 重编码叠加损失），顺序与预览管线一致；
+     * EXIF 回填源字节。八者均为 0 时原样返回。尾参缺省 0 = 旧调用零改动。
      */
     fun applyStackToJpeg(
         jpeg: ByteArray,
@@ -67,20 +70,22 @@ object Shadows {
         exposureLevel: Int,
         highlightLevel: Int,
         shadowLevel: Int,
-        blackLevel: Int
+        blackLevel: Int,
+        satLevel: Int = 0,
+        contrastLevel: Int = 0,
+        glowLevel: Int = 0
     ): ByteArray {
         if (brightLevel == 0 && exposureLevel == 0 && highlightLevel == 0 &&
-            shadowLevel == 0 && blackLevel == 0
+            shadowLevel == 0 && blackLevel == 0 && satLevel == 0 &&
+            contrastLevel == 0 && glowLevel == 0
         ) return jpeg
         val bmp = ImageUtils.fromJpeg(jpeg) ?: return jpeg
-        val adjusted = BlackLevel.applyToBitmap(
-            applyToBitmap(
-                Highlights.applyToBitmap(
-                    Exposure.applyToBitmap(Brightness.applyToBitmap(bmp, brightLevel), exposureLevel),
-                    highlightLevel
-                ), shadowLevel
-            ), blackLevel)
+        // 复合色调引擎：七参数合成单条曲线 + 逐像素饱和度，单次遍历 + 色相保护 + 抖动
+        val adjusted = ToneCurve.applyToBitmap(
+            bmp, ToneCurve.of(brightLevel, exposureLevel, highlightLevel,
+                shadowLevel, blackLevel, satLevel, contrastLevel))
         if (adjusted !== bmp) bmp.recycle()
+        if (glowLevel != 0) SoftGlow.applyInPlace(adjusted, glowLevel)
         return MadridLegendary.copyExif(jpeg, ImageUtils.toJpeg(adjusted, 95))
     }
 }

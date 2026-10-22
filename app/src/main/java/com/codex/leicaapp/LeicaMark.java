@@ -64,6 +64,20 @@ public final class LeicaMark {
 
     /** 对 JPEG 写入相机标记（EXIF + FFE4 两处）。任何异常返回原字节。 */
     public static byte[] mark(byte[] jpeg) {
+        return mark(jpeg, true);
+    }
+
+    /**
+     * 对 JPEG 写入相机标记；{@code badge=false} 时**不写**徽章，并剥离徽章识别元数据
+     * （FFE4 XIAOMI_CUSTOMIZE 段 + EXIF 三私有 tag——含源图原生携带的那份，
+     * 如 15 Ultra 徕卡模式直出 JPG）。
+     *
+     * <p>无论开关状态，复合容器清理（XMP/MPF/ISO 21496、多余 FFE1）都照常执行：
+     * HDR 回嵌依赖「复合容器已移除」这一前提，且动态照片路径会绕过主 EXIF 判定。</p>
+     *
+     * <p>任何异常返回原字节。</p>
+     */
+    public static byte[] mark(byte[] jpeg, boolean badge) {
         if (jpeg == null || jpeg.length < 4
                 || (jpeg[0] & 0xFF) != 0xFF || (jpeg[1] & 0xFF) != 0xD8) {
             return jpeg;
@@ -72,7 +86,11 @@ public final class LeicaMark {
             // 1) 删除复合照片容器元数据（XMP Container/MPF/ISO 增益图标识）——动态照片/ HDR 相册
             //    会读这套容器里的拍摄模式而忽略主 EXIF；删掉后导出变纯静态图，走主 EXIF 判定
             // 2) 删除多余的 FFE1 Exif 段（动态照片嵌入帧空壳）
-            return markCustomize(markExif(stripCompositeMeta(stripExtraExif(jpeg))));
+            byte[] cleaned = stripCompositeMeta(stripExtraExif(jpeg));
+            if (!badge) {
+                return stripBadge(cleaned);
+            }
+            return markCustomize(markExif(cleaned));
         } catch (Throwable t) {
             return jpeg;
         }
@@ -333,6 +351,70 @@ public final class LeicaMark {
             bos.write(jpeg, 2, jpeg.length - 2);
         }
         return bos.toByteArray();
+    }
+
+    // ---- 徽章元数据剥离（badge=false 导出路径）----
+
+    /**
+     * 剥离徽章识别元数据：FFE4 XIAOMI_CUSTOMIZE 段（循环删）+ EXIF 的三个徽章私有 tag
+     * （themeCustomize/legendmode/mode，IFD0 与 ExifIFD 各查一遍）。
+     *
+     * <p>tag 删除走 {@link #removeEntryInPlace}（就地、APP1 段长不变、段内外偏移不受影响），
+     * 因此可在 JPEG 字节数组上原地完成，不需要重组 APP1 段。任何异常原样返回。</p>
+     */
+    private static byte[] stripBadge(byte[] jpeg) {
+        try {
+            while (true) {
+                byte[] out = removeSegment(jpeg, 0xE4, "XIAOMI_CUSTOMIZE");
+                if (out == jpeg) break;
+                jpeg = out;
+            }
+            stripBadgeTagsInPlace(jpeg);
+        } catch (Throwable ignored) {
+        }
+        return jpeg;
+    }
+
+    /** 定位第一个 APP1 "Exif\0\0" 段，就地删除 IFD0 与 ExifIFD 里的徽章三 tag。 */
+    private static void stripBadgeTagsInPlace(byte[] jpeg) {
+        int pos = 2;
+        while (pos + 4 <= jpeg.length && (jpeg[pos] & 0xFF) == 0xFF) {
+            int marker = jpeg[pos + 1] & 0xFF;
+            if (marker == 0xDA || marker == 0xD9) return;
+            if (marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) { pos += 2; continue; }
+            int len = ((jpeg[pos + 2] & 0xFF) << 8) | (jpeg[pos + 3] & 0xFF);
+            if (len < 2 || pos + 2 + len > jpeg.length) return;
+            if (marker == 0xE1 && len >= 10
+                    && jpeg[pos + 4] == 'E' && jpeg[pos + 5] == 'x'
+                    && jpeg[pos + 6] == 'i' && jpeg[pos + 7] == 'f'
+                    && jpeg[pos + 8] == 0 && jpeg[pos + 9] == 0) {
+                int dOff = pos + 10; // TIFF 头起点（段起点 + "Exif\0\0" 6 字节）
+                if (dOff + 8 > jpeg.length) return;
+                boolean le = jpeg[dOff] == 'I' && jpeg[dOff + 1] == 'I';
+                if (!le && !(jpeg[dOff] == 'M' && jpeg[dOff + 1] == 'M')) return;
+                int ifd0 = dOff + (int) integer(jpeg, dOff + 4, 4, le);
+                removeEntryInPlace(jpeg, le, ifd0, TAG_THEME);
+                removeEntryInPlace(jpeg, le, ifd0, TAG_LEGENDMODE);
+                removeEntryInPlace(jpeg, le, ifd0, TAG_MODE);
+                // IFD0 找 ExifIFD 指针并删除其中的三 tag（count 在 IFD0 删除后重读）
+                int count = (int) integer(jpeg, ifd0, 2, le);
+                for (int i = 0; i < count; i++) {
+                    int e = ifd0 + 2 + i * 12;
+                    if (e + 12 > jpeg.length) break;
+                    if (integer(jpeg, e, 2, le) == TAG_EXIF_IFD_POINTER
+                            && integer(jpeg, e + 2, 2, le) == 4L
+                            && integer(jpeg, e + 4, 4, le) == 1L) {
+                        int exifIfd = dOff + (int) integer(jpeg, e + 8, 4, le);
+                        removeEntryInPlace(jpeg, le, exifIfd, TAG_THEME);
+                        removeEntryInPlace(jpeg, le, exifIfd, TAG_LEGENDMODE);
+                        removeEntryInPlace(jpeg, le, exifIfd, TAG_MODE);
+                        break;
+                    }
+                }
+                return;
+            }
+            pos += 2 + len;
+        }
     }
 
     // ---- EXIF tag 写入 ----
@@ -675,6 +757,20 @@ public final class LeicaMark {
      * @param iccBlocks 源图的 APP2/ICC_PROFILE 段（含段头，可能多段）；null/空 = 不处理
      */
     public static boolean markFile(File file, byte[] iccBlocks) {
+        return markFileImpl(file, iccBlocks, true);
+    }
+
+    /**
+     * 同上；{@code badge=false} 走「剥徽章」路径——不写徽章并剥离徽章元数据
+     * （FFE4 段 + EXIF 徽章三 tag），ICC 注入照常执行（合并同一次文件重写）。
+     *
+     * @return 是否处理成功（失败时原文件保持不变）
+     */
+    public static boolean markFile(File file, byte[] iccBlocks, boolean badge) {
+        return markFileImpl(file, iccBlocks, badge);
+    }
+
+    private static boolean markFileImpl(File file, byte[] iccBlocks, boolean badge) {
         if (file == null || !file.isFile() || file.length() < 4) return false;
         File tmp = null;
         RandomAccessFile in = null;
@@ -682,7 +778,7 @@ public final class LeicaMark {
         try {
             byte[] header = readHeader(file);
             if (header == null) return false;
-            byte[] marked = mark(header);
+            byte[] marked = mark(header, badge);
             if (marked == null || marked.length < 4) return false;
             if (iccBlocks != null && iccBlocks.length > 0) {
                 marked = IccProfile.embed(marked, iccBlocks);

@@ -365,10 +365,9 @@ object PortraitFilm {
             }
             src.setPixels(pixels, 0, w, 0, 0, w, h)
 
-            val bos = ByteArrayOutputStream(jpeg.size)
-            src.compress(Bitmap.CompressFormat.JPEG, 96, bos)
+            val encoded = JpegEnc.encode(src)
             src.recycle()
-            MadridLegendary.copyExif(jpeg, bos.toByteArray())
+            MadridLegendary.copyExif(jpeg, encoded)
         } catch (t: Throwable) {
             lastError = "${t.javaClass.simpleName}: ${t.message}"
             DiagLog.e("PortraitFilm", "M13 failed", t)

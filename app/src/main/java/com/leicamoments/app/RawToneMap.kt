@@ -156,6 +156,263 @@ object RawToneMap {
     }
 
     // ------------------------------------------------------------------
+    // P2：曲线后线性 16-bit 窗口（五档叠加 / 预览基准降采样）
+    // ------------------------------------------------------------------
+
+    // 编码表：65536 用于无五档直编码（与旧版逐字节一致），1024 供 ToneCurve 插值
+    private val srgb16: IntArray by lazy {
+        IntArray(LUT_SIZE) { v -> (srgbEnc(v / 65535f) * 255f + 0.5f).toInt().coerceIn(0, 255) }
+    }
+    private val bt70916: IntArray by lazy {
+        IntArray(LUT_SIZE) { v -> (bt709Enc(v / 65535f) * 255f + 0.5f).toInt().coerceIn(0, 255) }
+    }
+    private val bt709_1024: FloatArray by lazy {
+        FloatArray(1025) { i -> bt709Enc(i / 1024f) }
+    }
+
+    /** 曲线映射后的 native u16 缓冲句柄（bb 由调用方 nativeFreeLinear） */
+    class Mapped internal constructor(
+        val bb: ByteBuffer, val sb: java.nio.ShortBuffer,
+        val w: Int, val h: Int, val usedBt709: Boolean
+    )
+
+    /** 降采样后的线性 16-bit 小图（调档预览基准） */
+    class Lin16 internal constructor(val data: ShortArray, val w: Int, val h: Int)
+
+    private class Prep(val sb: java.nio.ShortBuffer, val w: Int, val h: Int, val total: Int)
+
+    private fun prepare(buf: ByteBuffer): Prep? {
+        val bb = buf.order(ByteOrder.nativeOrder())
+        val w = bb.getInt(0)
+        val h = bb.getInt(4)
+        if (w <= 0 || h <= 0) return null
+        return Prep(bb.asShortBuffer(), w, h, w * h)
+    }
+
+    /**
+     * 就地映射 native 缓冲（预览引导失败回落软肩）。
+     * 返回 true = 走了 BT.709 回退路径（编码器须跟随）。
+     */
+    private fun mapInPlace(m: Prep, level: Int, previewJpeg: ByteArray?): Boolean {
+        val p = paramsOf(level) ?: return false
+        val hist = histogram(m.sb, m.w, m.h)
+        val strength = matchStrengthOf(level)
+        if (previewJpeg != null && strength > 0f) {
+            try {
+                val gain = buildPreviewGain(hist, m.total, previewJpeg, strength)
+                if (gain != null) {
+                    applyGainInPlace(m.sb, m.w, m.h, gain, false)
+                    DiagLog.i("RawTone", "预览引导 level=$level s=$strength ${m.w}x${m.h}")
+                    return false
+                }
+            } catch (t: Throwable) {
+                DiagLog.e("RawTone", "预览引导失败（level=$level），回落软肩曲线", t)
+            }
+        }
+        val target = (m.total.toLong() * p[0].toInt() / 100L).toInt()
+        var acc = 0
+        var bin = 0
+        while (bin < BINS - 1) {
+            acc += hist[bin]
+            if (acc >= target) break
+            bin++
+        }
+        val white = ((bin + 0.5f) * (65536f / BINS)).coerceAtLeast(1f)
+        val gain = (p[1] * 65535f / white).coerceIn(1.0f, GAIN_MAX)
+        val uniform = FloatArray(BINS).also { it.fill(gain) }
+        applyGainInPlace(m.sb, m.w, m.h, uniform, true)
+        return true
+    }
+
+    /** 管线：准备 → 映射 → 编码。tone 非空且非全 0 时五档作用于线性 16-bit，末端一次量化。 */
+    private fun pipeline(
+        buf: ByteBuffer, level: Int, previewJpeg: ByteArray?, tone: ToneCurve.Params?
+    ): IntArray? {
+        val m = prepare(buf) ?: return null
+        val usedBt709 = mapInPlace(m, level, previewJpeg)
+        return if (tone == null || ToneCurve.isNeutral(tone)) {
+            encodeDirect(m.sb, m.w, m.h, if (usedBt709) bt70916 else srgb16)
+        } else {
+            encodeWithTone(m.sb, m.w, m.h, tone, if (usedBt709) bt709_1024 else null)
+        }
+    }
+
+    /** 曲线映射 + 五档叠加 → ARGB（{w,h,px...} 格式） */
+    fun renderWithTone(
+        buf: ByteBuffer, level: Int, previewJpeg: ByteArray?, tone: ToneCurve.Params
+    ): IntArray? = pipeline(buf, level, previewJpeg, tone)
+
+    /**
+     * 组合入口：曲线映射 → 编码 ARGB → 同时产出降采样 16-bit 基准（一次解码三件事）。
+     * [baseMaxDim] <=0 时不产基准（导出重放场景）。native 缓冲由本函数释放。
+     */
+    fun renderWithBase(
+        buf: ByteBuffer, level: Int, previewJpeg: ByteArray?,
+        tone: ToneCurve.Params?, baseMaxDim: Int
+    ): Pair<IntArray, Lin16?>? {
+        val m = prepare(buf) ?: return null
+        val usedBt709 = mapInPlace(m, level, previewJpeg)
+        val argb = if (tone == null || ToneCurve.isNeutral(tone)) {
+            encodeDirect(m.sb, m.w, m.h, if (usedBt709) bt70916 else srgb16)
+        } else {
+            encodeWithTone(m.sb, m.w, m.h, tone, if (usedBt709) bt709_1024 else null)
+        }
+        val base = if (baseMaxDim > 0) downsample16(m.sb, m.w, m.h, baseMaxDim) else null
+        return argb to base
+    }
+
+    /** 曲线映射后的 u16 句柄（供降采样基准；bb 由调用方 free） */
+    fun mapLinear16(buf: ByteBuffer, level: Int, previewJpeg: ByteArray?): Mapped? {
+        val m = prepare(buf) ?: return null
+        val usedBt709 = mapInPlace(m, level, previewJpeg)
+        return Mapped(buf, m.sb, m.w, m.h, usedBt709)
+    }
+
+    /** 亮度直方图（BT.709 加权，u16 右移 4 位落 4096 桶） */
+    private fun histogram(sb: java.nio.ShortBuffer, w: Int, h: Int): IntArray {
+        val hist = IntArray(BINS)
+        val stride = w * 3
+        val row = ShortArray(stride)
+        var base = 4
+        for (y in 0 until h) {
+            sb.position(base)
+            sb.get(row, 0, stride)
+            var i = 0
+            while (i < stride) {
+                val r = row[i].toInt() and 0xFFFF
+                val g = row[i + 1].toInt() and 0xFFFF
+                val b = row[i + 2].toInt() and 0xFFFF
+                hist[((r * 77 + g * 150 + b * 29) shr 8) shr 4]++
+                i += 3
+            }
+            base += stride
+        }
+        return hist
+    }
+
+    /** 按桶增益就地缩放 RGB（保色相）；soft=true 叠加自适应软肩（线性域，回退路径专用） */
+    private fun applyGainInPlace(
+        sb: java.nio.ShortBuffer, w: Int, h: Int, gain: FloatArray, soft: Boolean
+    ) {
+        val stride = w * 3
+        val row = ShortArray(stride)
+        var base = 4
+        for (y in 0 until h) {
+            sb.position(base)
+            sb.get(row, 0, stride)
+            var i = 0
+            while (i < stride) {
+                val r = row[i].toInt() and 0xFFFF
+                val g = row[i + 1].toInt() and 0xFFFF
+                val b = row[i + 2].toInt() and 0xFFFF
+                val gn = gain[((r * 77 + g * 150 + b * 29) shr 8) shr 4]
+                var rr = r * gn
+                var gg = g * gn
+                var bbv = b * gn
+                if (soft) {
+                    rr = softShoulder(rr / 65535f) * 65535f
+                    gg = softShoulder(gg / 65535f) * 65535f
+                    bbv = softShoulder(bbv / 65535f) * 65535f
+                }
+                row[i] = clamp16(rr).toShort()
+                row[i + 1] = clamp16(gg).toShort()
+                row[i + 2] = clamp16(bbv).toShort()
+                i += 3
+            }
+            sb.position(base)
+            sb.put(row, 0, stride)
+            base += stride
+        }
+    }
+
+    /** 软肩：x<=T0 线性，之后 exp 压缩趋近 CAP（与旧 LUT 同一数学） */
+    private fun softShoulder(x: Float): Float =
+        if (x <= T0) x else T0 + (CAP - T0) * (1f - exp(-(x - T0) / (CAP - T0)))
+
+    /** 映射后线性 u16 → ARGB（无五档：65536 表直查，无抖动，与旧版等价） */
+    private fun encodeDirect(sb: java.nio.ShortBuffer, w: Int, h: Int, enc: IntArray): IntArray {
+        val stride = w * 3
+        val row = ShortArray(stride)
+        val out = IntArray(w * h + 2)
+        out[0] = w
+        out[1] = h
+        var base = 4
+        var o = 2
+        for (y in 0 until h) {
+            sb.position(base)
+            sb.get(row, 0, stride)
+            var i = 0
+            while (i < stride) {
+                val r = enc[row[i].toInt() and 0xFFFF]
+                val g = enc[row[i + 1].toInt() and 0xFFFF]
+                val b = enc[row[i + 2].toInt() and 0xFFFF]
+                out[o++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                i += 3
+            }
+            base += stride
+        }
+        return out
+    }
+
+    /** 映射后线性 u16 → ToneCurve 五档（色相保护+软限+TPDF 抖动）→ 一次量化 ARGB */
+    private fun encodeWithTone(
+        sb: java.nio.ShortBuffer, w: Int, h: Int, tone: ToneCurve.Params, enc1024: FloatArray?
+    ): IntArray {
+        val n = w * h * 3
+        val lin = ShortArray(n)
+        sb.position(4)
+        sb.get(lin, 0, n)
+        val px = IntArray(w * h)
+        ToneCurve.applyLinear16ToArgb(lin, w, h, tone, px, enc1024)
+        val out = IntArray(w * h + 2)
+        out[0] = w
+        out[1] = h
+        System.arraycopy(px, 0, out, 2, w * h)
+        return out
+    }
+
+    /** 16-bit 线性 box 降采样（线性域平均是正确的降采样）→ 调档预览基准。直接读 native 缓冲。 */
+    fun downsample16(sb: java.nio.ShortBuffer, w: Int, h: Int, maxDim: Int): Lin16 {
+        val scale = max(w, h).toFloat() / maxDim
+        if (scale <= 1f) {
+            val all = ShortArray(w * h * 3)
+            sb.position(4)
+            sb.get(all, 0, all.size)
+            return Lin16(all, w, h)
+        }
+        val nw = (w / scale).toInt().coerceIn(1, w)
+        val nh = (h / scale).toInt().coerceIn(1, h)
+        val out = ShortArray(nw * nh * 3)
+        for (y in 0 until nh) {
+            val y0 = (y * h) / nh
+            val y1 = ((y + 1) * h) / nh
+            for (x in 0 until nw) {
+                val x0 = (x * w) / nw
+                val x1 = ((x + 1) * w) / nw
+                var sr = 0L; var sg = 0L; var sbv = 0L; var n = 0L
+                var sy = y0
+                while (sy < y1) {
+                    var sx = x0
+                    var i = 4 + (sy * w + x0) * 3
+                    while (sx < x1) {
+                        sr += sb.get(i).toInt() and 0xFFFF
+                        sg += sb.get(i + 1).toInt() and 0xFFFF
+                        sbv += sb.get(i + 2).toInt() and 0xFFFF
+                        n++
+                        sx++; i += 3
+                    }
+                    sy++
+                }
+                val o = (y * nw + x) * 3
+                out[o] = (sr / n).toInt().toShort()
+                out[o + 1] = (sg / n).toInt().toShort()
+                out[o + 2] = (sbv / n).toInt().toShort()
+            }
+        }
+        return Lin16(out, nw, nh)
+    }
+
+    // ------------------------------------------------------------------
     // 预览引导分位匹配
     // ------------------------------------------------------------------
 
