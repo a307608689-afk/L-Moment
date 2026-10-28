@@ -801,8 +801,13 @@ object HdrGainMap {
     /**
      * 总开关。false 时三个 rebake* 一律返回 null，调用方沿用源增益图 = C1（原图直通）语义，
      * 用于 A/B 对照与线上回退。
+     *
+     * 2026-10-27 用户拍板关闭：同图 M9 真机对比（15 Ultra）重标定后的 HDR 渲染云-天
+     * 过渡失真（云区增益整体上抬 + p99.5 削顶恰钳在云层高光形成台阶 + 整数 luma 单通道
+     * 反解在渐变带误差可见）。回退到 v1.3.0 的「源增益图原样回嵌」语义；
+     * 算法打磨（削顶分位/浮点 RGB 反解/增益图平滑）后再重开。
      */
-    const val REBAKE_ENABLED = true
+    const val REBAKE_ENABLED = false
 
     /** sRGB 编码值 → 线性光（256 级查表；逐像素 pow 太贵） */
     private val SRGB_TO_LINEAR = FloatArray(256) { i ->
@@ -1005,6 +1010,372 @@ object HdrGainMap {
             bytes, fMin, fMax, data.gamma,
             data.offsetSdr, data.offsetHdr, data.capMinLog2, fMax, data.sourceXmp
         )
+    }
+
+    // ================= D：增益图合成（SDR → UltraHDR，路线1） =================
+
+    /**
+     * 从一张**普通 SDR JPEG** 合成 UltraHDR 增益图（源图无 HDR 时用）。
+     *
+     * 与 C3 重标定的本质差异：C3 是「源增益图 + 新旧 SDR」双向重算，
+     * `g' = log2((L_hdr+offHdr)/(L_sdr_new+offSdr))` 的分母随风格漂移，区间易失控并产生台阶
+     * （2026-10-27 因此关闭，见 [REBAKE_ENABLED]）。本函数**单向**：增益恒 ≥ 0（log2），
+     * 只有最高光的一小段被抬升，暗部与中间调 g=0（L_hdr ≡ L_sdr）——
+     * SDR 主图不变、不支持 HDR 的设备看到的就是原样，HDR 设备上只变亮不变暗。
+     *
+     * 三条硬约束（全部来自 C3 事故）：
+     *  1. 增益 ≥ 0，只扩高光（见上）；
+     *  2. 锚点取 99.9% 分位（不是 99.5%），避免云层高光被钳成台阶；
+     *  3. 编码前必须空间平滑（[smoothBox]），banding 的唯一解法。
+     *
+     * @param level 0=轻(1.5EV) 1=标准(2.0EV) 2=强(2.5EV)
+     * @return null = 不可合成（非 JPEG / 解码失败 / 高光区过窄 / 异常），调用方维持纯 SDR
+     */
+    fun synth(sdrJpeg: ByteArray, level: Int): HdrData? {
+        return try {
+            if (!isJpeg(sdrJpeg)) return null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(sdrJpeg, 0, sdrJpeg.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val size = gainTargetSize(bounds.outWidth, bounds.outHeight)
+            val bmp = decodeScaledBytes(sdrJpeg, size[0], size[1]) ?: return null
+            try {
+                synthCore(bmp, level)
+            } finally {
+                bmp.recycle()
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "增益合成异常: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 文件版：全像素直通导出用。按 `inSampleSize` 直接解到增益图尺寸，
+     * 200MP 源也绝不整图入堆。
+     */
+    fun synthFile(file: File, level: Int): HdrData? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val size = gainTargetSize(bounds.outWidth, bounds.outHeight)
+            val sample = gainSampleFor(bounds.outWidth, bounds.outHeight, size[0], size[1])
+            val bmp = decodeScaledFile(file, size[0], size[1], sample) ?: return null
+            try {
+                synthCore(bmp, level)
+            } finally {
+                bmp.recycle()
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "增益合成（文件）异常: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /** 三档强度 → 增益上限（log2 域，1 EV = 亮度翻倍）。档位只改这一个常数，算法不分叉 */
+    private fun boostMaxLog2(level: Int): Float = when (level) {
+        0 -> 1.5f
+        2 -> 2.5f
+        else -> 2.0f
+    }
+
+    /** 增益图长边上限：增益图本就是低分辨率单通道数据，1024 足够且两次遍历成本可忽略 */
+    private const val SYNTH_GAIN_MAX_DIM = 1024
+
+    /** 高光起点分位：低于它的像素增益恒为 0（SDR 语义完全不变） */
+    private const val SYNTH_T0_Q = 0.90f
+
+    /** 满增益锚点分位：99.9%（C3 用 99.5% 曾把云层高光钳出台阶） */
+    private const val SYNTH_T1_Q = 0.999f
+
+    /** 高光区过窄判定（0..255 域）：分位跨度不足即放弃，宁可不做也不制造阶跃 */
+    private const val SYNTH_MIN_SPAN = 0.02f
+
+    /** 平滑半径（增益图像素） */
+    private const val SYNTH_SMOOTH_R = 2
+
+    /** 增益图目标尺寸：长边 min(1024, 源长边/4)，下限 64 */
+    private fun gainTargetSize(w: Int, h: Int): IntArray {
+        val longEdge = Math.max(w, h)
+        val target = Math.min(SYNTH_GAIN_MAX_DIM, Math.max(64, longEdge / 4))
+        val scale = target.toFloat() / longEdge.coerceAtLeast(1)
+        return intArrayOf(
+            Math.max(8, (w * scale).toInt()),
+            Math.max(8, (h * scale).toInt())
+        )
+    }
+
+    /** 增益图专用降采样倍率：上限 32（200MP → 1024 长边约 16 倍，远大于 [sampleSizeFor] 的 8） */
+    private fun gainSampleFor(w: Int, h: Int, tw: Int, th: Int): Int {
+        var s = 1
+        while (s < 32 && w / (s * 2) >= tw && h / (s * 2) >= th) s *= 2
+        return s
+    }
+
+    /**
+     * 合成核心：亮度直方图 → 高光锚点 → smoothstep² 增益场 → 盒模糊 → 8bit 灰度 JPEG。
+     * 增益语义（ISO 21496-1 同构）：`g = minL2 + maxL2 * p`，p 为去 gamma 后的 0..1，
+     * 本函数 minL2=0、gamma=1，故 `p = norm` 且 `g = maxL2 * norm`。
+     */
+    private fun synthCore(sdr: Bitmap, level: Int): HdrData? {
+        val t0ms = System.currentTimeMillis()
+        val gw = sdr.width
+        val gh = sdr.height
+        val total = gw * gh
+        if (total < 256) return null
+
+        val maxL2 = boostMaxLog2(level).coerceIn(0.2f, MAX_TOTAL_SPAN_LOG2)
+
+        // 1) 亮度场 + 直方图：一次取像素、后续复用（避免逐遍重算 luma）
+        val lum = IntArray(total)
+        val hist = IntArray(256)
+        val row = IntArray(gw)
+        var n = 0
+        for (y in 0 until gh) {
+            sdr.getPixels(row, 0, gw, 0, y, gw, 1)
+            for (x in 0 until gw) {
+                val v = lumaIndex(row[x])
+                lum[n++] = v
+                hist[v]++
+            }
+        }
+
+        // 2) 高光锚点：90% 起抬、99.9% 吃满
+        val q0 = quantileLuma(hist, total, SYNTH_T0_Q)
+        val q1 = quantileLuma(hist, total, SYNTH_T1_Q)
+        if (q1 - q0 < SYNTH_MIN_SPAN * 255f) {
+            DiagLog.i("HdrGainMap", "增益合成跳过：高光区过窄 t0=$q0 t1=$q1（level=$level）")
+            return null
+        }
+
+        // 3) 归一化增益场：smoothstep 后再平方，中段更保守，只有真高光吃满
+        val span = q1 - q0
+        val norm = FloatArray(total)
+        var boosted = 0L
+        for (i in 0 until total) {
+            val v = lum[i]
+            if (v <= q0) continue
+            var r = (v - q0) / span
+            if (r > 1f) r = 1f
+            val s = r * r * (3f - 2f * r)
+            norm[i] = s * s
+            boosted++
+        }
+        // 有效高光像素不足 0.5%：说明画面几乎没有亮部，做了也看不出，跳过以省时间
+        if (boosted * 200 < total) {
+            DiagLog.i("HdrGainMap", "增益合成跳过：高光像素过少 $boosted/$total（level=$level）")
+            return null
+        }
+
+        // 4) 编码前空间平滑 —— C3 天空色带的唯一解法，不可省
+        smoothBox(norm, gw, gh, SYNTH_SMOOTH_R)
+
+        // 5) 量化 8bit 灰度并编码（与 rebakeCore 同口径 JPEG95）
+        val out = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
+        val pRow = IntArray(gw)
+        n = 0
+        for (y in 0 until gh) {
+            for (x in 0 until gw) {
+                val v = (norm[n++] * 255f + 0.5f).toInt().coerceIn(0, 255)
+                pRow[x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            }
+            out.setPixels(pRow, 0, gw, 0, y, gw, 1)
+        }
+        val bos = ByteArrayOutputStream()
+        out.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+        out.recycle()
+        val bytes = bos.toByteArray()
+
+        val fMin = fmtLog2(0f)
+        val fMax = fmtLog2(maxL2)
+        DiagLog.i(
+            "HdrGainMap",
+            "增益图合成 level=$level ${gw}x${gh} ${bytes.size}B " +
+                "区间[$fMin,$fMax] 锚点 t0=$q0 t1=$q1 提亮占比 ${pct(boosted, total.toLong())} " +
+                "用时 ${System.currentTimeMillis() - t0ms}ms"
+        )
+        // sourceXmp=null：primaryXmp()/secondaryXmp() 都不读该字段（仅取证用），安全
+        return HdrData(
+            bytes, fMin, fMax, "1",
+            DEFAULT_OFFSET, DEFAULT_OFFSET, fMin, fMax, null
+        )
+    }
+
+    // ================= E：RAW 真增益（V2，线性数据 → 真实还原） =================
+
+    /**
+     * RAW 真 HDR：用**原始线性亮度**与最终 SDR 相除，得到真实的「被压缩了多少」。
+     *
+     * `g = log2((L_lin + off) / (L_sdr + off))`，钳位 `[0, +5]`（**不允许负增益**：
+     * RAW 提亮档会把暗部抬亮，此时算出的 g 为负；钳到 0 表示暗部在 HDR 里保持 SDR 亮度，
+     * 从而保证不支持 HDR 的设备逐像素不变、HDR 设备上只变亮不变暗）。
+     *
+     * 必须在导出末尾、对**最终 SDR 成品**调用 —— 套色/滑杆/风格 LUT 都会改亮度分布，
+     * 分母用最终成品时，同一个公式就同时完成了「真实还原」与「风格适配」，
+     * 不需要 C3 那种二次重标定。这也是它与 V1 猜测式 [synth] 的本质差异。
+     *
+     * @param luma     [RawToneMap.renderLinearLuma] 抽出的线性亮度基准（长边 ≤1024）
+     * @param sdrJpeg  最终成品 SDR（主图）
+     * @param strength RAW 档位对应的**强度系数**（0.6/1.0/1.4），不是绝对上限
+     * @return null = 不可合成（几何不匹配 / 有效高光过少 / 异常），调用方退回纯 SDR
+     */
+    fun synthFromLinear(luma: RawToneMap.Luma16, sdrJpeg: ByteArray, strength: Float): HdrData? {
+        return try {
+            if (!isJpeg(sdrJpeg)) return null
+            val w = luma.w
+            val h = luma.h
+            if (w <= 0 || h <= 0) return null
+            val bmp = decodeScaledBytes(sdrJpeg, w, h) ?: return null
+            try {
+                synthLinearCore(luma, bmp, strength)
+            } finally {
+                bmp.recycle()
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "线性增益合成异常: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /** 文件版（全像素直通导出）：SDR 按 `inSampleSize` 直接解到基准尺寸，200MP 不入堆 */
+    fun synthFromLinearFile(luma: RawToneMap.Luma16, sdr: File, strength: Float): HdrData? {
+        return try {
+            val w = luma.w
+            val h = luma.h
+            if (w <= 0 || h <= 0) return null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(sdr.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val sample = gainSampleFor(bounds.outWidth, bounds.outHeight, w, h)
+            val bmp = decodeScaledFile(sdr, w, h, sample) ?: return null
+            try {
+                synthLinearCore(luma, bmp, strength)
+            } finally {
+                bmp.recycle()
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("HdrGainMap", "线性增益合成（文件）异常: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    private fun synthLinearCore(luma: RawToneMap.Luma16, sdr: Bitmap, strength: Float): HdrData? {
+        val t0ms = System.currentTimeMillis()
+        val gw = luma.w
+        val gh = luma.h
+        val total = gw * gh
+        if (sdr.width != gw || sdr.height != gh) {
+            DiagLog.w("HdrGainMap", "线性增益跳过：SDR ${sdr.width}x${sdr.height} ≠ 基准 ${gw}x${gh}")
+            return null
+        }
+        val s = strength.coerceIn(0.1f, 3f)
+        val off = DEFAULT_OFFSET.toFloatOrNull() ?: 0.015625f
+
+        // 1) 逐像素真实增益（log2）
+        val gain = FloatArray(total)
+        val row = IntArray(gw)
+        var valid = 0L
+        for (y in 0 until gh) {
+            sdr.getPixels(row, 0, gw, 0, y, gw, 1)
+            val base = y * gw
+            for (x in 0 until gw) {
+                val lli = (luma.data[base + x].toInt() and 0xFFFF) / 65535f
+                val lsdr = SRGB_TO_LINEAR[lumaIndex(row[x])]
+                val raw = (Math.log(((lli + off) / (lsdr + off)).toDouble()) / LN2).toFloat()
+                val gv = (raw * s).coerceIn(0f, MAX_TOTAL_SPAN_LOG2)
+                gain[base + x] = gv
+                if (gv > 0.15f) valid++
+            }
+        }
+        if (valid * 200 < total) {
+            DiagLog.i("HdrGainMap", "线性增益跳过：有效像素 ${pct(valid, total.toLong())} < 0.5%")
+            return null
+        }
+
+        // 2) 99.5% 分位定上限（与 V1 同口径；真实动态范围可能到 3~4EV）
+        val bins = 4096
+        val hist = IntArray(bins)
+        for (v in gain) hist[((v / MAX_TOTAL_SPAN_LOG2) * (bins - 1)).toInt().coerceIn(0, bins - 1)]++
+        val target = (total.toLong() * 995L / 1000L).coerceAtLeast(1L)
+        var acc = 0L
+        var bin = 0
+        while (bin < bins - 1) {
+            acc += hist[bin]
+            if (acc >= target) break
+            bin++
+        }
+        val maxL2 = (bin.toFloat() / (bins - 1) * MAX_TOTAL_SPAN_LOG2)
+            .coerceIn(0.2f, MAX_TOTAL_SPAN_LOG2)
+
+        // 3) 归一化 → 平滑 → 8bit → JPEG95（与 V1 同一出口）
+        val norm = FloatArray(total)
+        for (i in 0 until total) norm[i] = (gain[i] / maxL2).coerceIn(0f, 1f)
+        smoothBox(norm, gw, gh, SYNTH_SMOOTH_R)
+
+        val out = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
+        val pRow = IntArray(gw)
+        var i = 0
+        for (y in 0 until gh) {
+            for (x in 0 until gw) {
+                val v = (norm[i++] * 255f + 0.5f).toInt().coerceIn(0, 255)
+                pRow[x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            }
+            out.setPixels(pRow, 0, gw, 0, y, gw, 1)
+        }
+        val bos = ByteArrayOutputStream()
+        out.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+        out.recycle()
+        val bytes = bos.toByteArray()
+
+        val fMin = fmtLog2(0f)
+        val fMax = fmtLog2(maxL2)
+        DiagLog.i(
+            "HdrGainMap",
+            "增益图合成(线性) ${gw}x${gh} ${bytes.size}B 区间[$fMin,$fMax] " +
+                "强度 $s 有效 ${pct(valid, total.toLong())} 用时 ${System.currentTimeMillis() - t0ms}ms"
+        )
+        return HdrData(bytes, fMin, fMax, "1", DEFAULT_OFFSET, DEFAULT_OFFSET, fMin, fMax, null)
+    }
+
+    /** 256 桶直方图 → 分位所在的亮度级（0..255） */
+    private fun quantileLuma(hist: IntArray, total: Int, q: Float): Float {
+        val target = (q * total).toLong().coerceAtLeast(1L)
+        var acc = 0L
+        for (i in hist.indices) {
+            acc += hist[i]
+            if (acc >= target) return i.toFloat()
+        }
+        return 255f
+    }
+
+    /**
+     * 分离式盒模糊（就地，边界钳位）。增益图分辨率低，半径 2 的两次一维卷积
+     * 约 800 万次加算，相对导出耗时（1.4~12s）可忽略，故不做滑动窗口优化。
+     */
+    private fun smoothBox(a: FloatArray, w: Int, h: Int, r: Int) {
+        if (r <= 0) return
+        val tmp = FloatArray(a.size)
+        val inv = 1f / (r * 2 + 1)
+        for (y in 0 until h) {
+            val base = y * w
+            for (x in 0 until w) {
+                var sum = 0f
+                for (k in (x - r)..(x + r)) {
+                    sum += a[base + (if (k < 0) 0 else if (k >= w) w - 1 else k)]
+                }
+                tmp[base + x] = sum * inv
+            }
+        }
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                var sum = 0f
+                for (k in (y - r)..(y + r)) {
+                    sum += tmp[(if (k < 0) 0 else if (k >= h) h - 1 else k) * w + x]
+                }
+                a[y * w + x] = sum * inv
+            }
+        }
     }
 
     /** 增益图像素 → 原区间下的增益（log2）。规范解码：去 gamma 后按 min/span 线性还原 */

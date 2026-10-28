@@ -419,7 +419,9 @@ public final class LegendaryPostProcessor {
     }
 
     private static byte[] encode(Bitmap bmp, byte[] srcJpeg) {
-        return MadridLegendary.copyExif(srcJpeg, com.leicamoments.app.JpegEnc.encode(bmp));
+        // M9/M9P/M10R 主链出口钉 95：不随 JpegEnc 默认档变化（云-天过渡带 banding 教训）。
+        return MadridLegendary.copyExif(srcJpeg,
+                com.leicamoments.app.JpegEnc.encode(bmp, com.leicamoments.app.JpegEnc.M9_FAMILY_QUALITY));
     }
 
     private static int readOrientation(byte[] jpeg) {

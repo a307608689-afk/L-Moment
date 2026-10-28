@@ -357,6 +357,105 @@ Java_com_leicamoments_app_RawDecoder_nativeDecodeLinearSrgb(JNIEnv *env, jclass,
 }
 
 
+/**
+ * 线性 sRGB 解码（探针版）：与 nativeDecodeLinearSrgb 参数完全一致，仅把
+ * highlight 与 adjust_maximum_thr 暴露给调用方，用于验证「超白点是否被 clip」。
+ *
+ * 仅供 debug 诊断入口（BatchTestActivity mode=linprobe）使用；产品链固定调用
+ * nativeDecodeLinearSrgb（两参数写死），本方法不参与任何出图路径。
+ *
+ * @param highlight LibRaw dcraw 高光模式：0=clip（现状）、2=Blend、5/6=Recon 类
+ * @param amt       LibRaw adjust_maximum_thr：0.75 为默认（按直方图自动拉白点），
+ *                  1.0 = 关闭自动调整（用相机白点，超白点才可能保留）
+ */
+JNIEXPORT jobject JNICALL
+Java_com_leicamoments_app_RawDecoder_nativeDecodeLinearSrgbEx(
+        JNIEnv *env, jclass, jbyteArray data, jint highlight, jfloat amt) {
+    if (data == nullptr) return nullptr;
+    jsize len = env->GetArrayLength(data);
+    if (len <= 0) return nullptr;
+    jbyte *buf = env->GetByteArrayElements(data, nullptr);
+    if (buf == nullptr) return nullptr;
+
+    jobject direct = nullptr;
+    libraw_data_t *raw = libraw_init(0);
+    do {
+        if (raw == nullptr) {
+            LOGE("libraw_init failed (linear srgb ex)");
+            break;
+        }
+        if (libraw_open_buffer(raw, buf, len) != LIBRAW_SUCCESS) {
+            LOGE("open_buffer failed (linear srgb ex)");
+            break;
+        }
+
+        raw->params.use_camera_wb = 1;
+        raw->params.use_auto_wb = 0;
+        raw->params.output_color = 1;        // sRGB
+        raw->params.output_bps = 16;
+        raw->params.gamm[0] = 1.0f;          // gamma=(1,1) → 线性
+        raw->params.gamm[1] = 1.0f;
+        raw->params.no_auto_bright = 1;
+        raw->params.bright = 1.0f;
+        raw->params.user_qual = 3;           // AHD
+        raw->params.half_size = 0;
+        // 仅这两项与产品链不同（探针的自变量）
+        raw->params.highlight = highlight;
+        raw->params.adjust_maximum_thr = amt;
+
+        if (libraw_unpack(raw) != LIBRAW_SUCCESS) {
+            LOGE("unpack failed (linear srgb ex)");
+            break;
+        }
+        if (libraw_dcraw_process(raw) != LIBRAW_SUCCESS) {
+            LOGE("dcraw_process failed (linear srgb ex)");
+            break;
+        }
+        libraw_processed_image_t *img = libraw_dcraw_make_mem_image(raw, nullptr);
+        if (img == nullptr) {
+            LOGE("make_mem_image failed (linear srgb ex)");
+            break;
+        }
+
+        int w = img->width;
+        int h = img->height;
+        int colors = img->colors;
+        int bps = img->bits;
+        if (w <= 0 || h <= 0 || colors != 3 || bps != 16) {
+            LOGE("unexpected linear srgb ex output %dx%d colors=%d bps=%d", w, h, colors, bps);
+            libraw_dcraw_clear_mem(img);
+            break;
+        }
+
+        size_t nbytes = (size_t) w * (size_t) h * 3u * 2u;
+        unsigned char *mem = (unsigned char *) malloc(8 + nbytes);
+        if (mem == nullptr) {
+            LOGE("malloc %zu failed (linear srgb ex)", nbytes);
+            libraw_dcraw_clear_mem(img);
+            break;
+        }
+        int *head = (int *) mem;
+        head[0] = w;
+        head[1] = h;
+        memcpy(mem + 8, img->data, nbytes);
+        libraw_dcraw_clear_mem(img);
+
+        direct = env->NewDirectByteBuffer(mem, (jlong) (8 + nbytes));
+        if (direct == nullptr) {
+            free(mem);
+            LOGE("NewDirectByteBuffer failed (linear srgb ex)");
+            break;
+        }
+        LOGI("linear-ex decoded hl=%d amt=%.2f %dx%d (%.1f MB)",
+             highlight, (double) amt, w, h, nbytes / 1048576.0);
+    } while (false);
+
+    if (raw != nullptr) libraw_close(raw);
+    env->ReleaseByteArrayElements(data, buf, JNI_ABORT);
+    return direct;
+}
+
+
 /** 释放 nativeDecodeLinear 的堆外缓冲。 */
 JNIEXPORT void JNICALL
 Java_com_leicamoments_app_RawDecoder_nativeFreeLinear(JNIEnv *env, jclass, jobject buffer) {

@@ -68,18 +68,37 @@ class MainActivity : AppCompatActivity() {
 
         /** ≥1 亿像素（2 亿级）才走「耗时确认 + 前台服务 + 用时弹窗」，50MP 不打扰 */
         const val BIG_EXPORT_PIXELS = 100_000_000L
+
+        /**
+         * 弹窗警示文字色：Material 暗色主题官方 error 红（#CF6679）。
+         * 纯 Color.RED（#FF0000）在黑底上饱和度过高、过于刺眼，导出/超分/完美
+         * 各确认与结论弹窗的首行警示与末段警告统一用此色。
+         */
+        const val WARN_TEXT_COLOR = 0xFFCF6679.toInt()
+
+        /**
+         * RAW 线性亮度基准的长边上限（V2 真 HDR 的分子）。
+         * 1024 约 0.8MP / 1.5MB，与增益图同一量级；再大不会提升增益精度。
+         */
+        private const val RAW_LUMA_MAX_DIM = 1024
     }
 
     private lateinit var imgPreview: ZoomableImageView
     private lateinit var txtEmpty: TextView
     private lateinit var txtStyleHint: TextView
     private lateinit var progress: ProgressBar
+    // 大图（≥1 亿像素）导出浮层：环形进度 + 百分比，替代普通转圈（仅 exportFullRes 大图分支）
+    private lateinit var bigExportOverlay: View
+    private lateinit var bigExportRing: com.google.android.material.progressindicator.CircularProgressIndicator
+    private lateinit var bigExportPercent: TextView
+    private lateinit var bigExportHint: TextView
     private lateinit var filterContainer: LinearLayout
     private lateinit var btnImport: TextView
     private lateinit var btnExport: TextView
     private lateinit var btnSuperRes: TextView
     private lateinit var btnSuperResFast: TextView
     private lateinit var btnPerfect: TextView
+    private lateinit var btnHdr: TextView
     private lateinit var btnAdjust: TextView
     private lateinit var btnCategory: View
     private lateinit var txtTitle: TextView
@@ -120,6 +139,11 @@ class MainActivity : AppCompatActivity() {
     // RAW 的 10/12/14-bit 数据一路保真，调阴影/高光不再有 8-bit 源量化色带
     private var rawLin16: RawToneMap.Lin16? = null
     private var rawLin16Level = 0
+
+    // V2：RAW 真 HDR 的分子——**未映射的原始线性亮度**低分辨率基准（1024 长边，约 1.5MB）。
+    // 与 rawLin16 同源但用途不同：rawLin16 是曲线映射后的调档预览基准；
+    // 本字段保持原始线性值，导出末尾与最终 SDR 相除得到真实增益 g = log2(L_lin/L_sdr)。
+    private var rawLinearLuma: RawToneMap.Luma16? = null
 
     // P2：导入时的 DNG 内嵌预览字节（导出重放 16-bit 五档时分位匹配必须用同一份，观感才一致）
     private var rawPreviewJpeg: ByteArray? = null
@@ -239,6 +263,7 @@ class MainActivity : AppCompatActivity() {
         btnSuperRes.setOnClickListener { confirmSuperRes(false) }
         btnSuperResFast.setOnClickListener { confirmSuperRes(true) }
         btnPerfect.setOnClickListener { onPerfectClicked() }
+        btnHdr.setOnClickListener { onHdrClicked() }
         setupSlider(sbBright, txtBrightVal, { brightLevel }, { applyBrightChange(it) })
         setupSlider(sbLum, txtLumVal, { exposureLevel }, { applyExposureChange(it) })
         setupSlider(sbHigh, txtHighVal, { highlightLevel }, { applyHighChange(it) })
@@ -409,6 +434,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         mainHandler.removeCallbacks(coachAutoHide)
+        mainHandler.removeCallbacks(exportOverlayTick)
         SuperResTask.removeListener(srListener)
         // 全像素导出线程随 Activity 线程池关闭：让前台服务拿到结局通知并收尾（免得常驻 30 分钟）
         if (exporting) ExportProgress.end(false, "已退出应用，导出中断")
@@ -424,12 +450,17 @@ class MainActivity : AppCompatActivity() {
         txtEmpty = findViewById(R.id.txtEmpty)
         txtStyleHint = findViewById(R.id.txtStyleHint)
         progress = findViewById(R.id.progress)
+        bigExportOverlay = findViewById(R.id.bigExportOverlay)
+        bigExportRing = findViewById(R.id.bigExportRing)
+        bigExportPercent = findViewById(R.id.bigExportPercent)
+        bigExportHint = findViewById(R.id.bigExportHint)
         filterContainer = findViewById(R.id.filterContainer)
         btnImport = findViewById(R.id.btnImport)
         btnExport = findViewById(R.id.btnExport)
         btnSuperRes = findViewById(R.id.btnSuperRes)
         btnSuperResFast = findViewById(R.id.btnSuperResFast)
         btnPerfect = findViewById(R.id.btnPerfect)
+        btnHdr = findViewById(R.id.btnHdr)
         btnAdjust = findViewById(R.id.btnAdjust)
         btnCategory = findViewById(R.id.btnCategory)
         txtTitle = findViewById(R.id.txtTitle)
@@ -1330,6 +1361,7 @@ class MainActivity : AppCompatActivity() {
                 // 新导入作废旧 RAW 16-bit 基准（RAW 提亮档成功后于 decodeRaw 内重登记）
                 rawLin16 = null
                 rawPreviewJpeg = null
+                rawLinearLuma = null
                 if (isRaw) {
                     val r = decodeRaw(bytes)
                     if (r == null) {
@@ -1411,6 +1443,11 @@ class MainActivity : AppCompatActivity() {
                     satLevel = 0
                     contrastLevel = 0
                     glowLevel = 0
+                    // HDR 开关是记忆项：取持久化默认值，但源图自带增益图时本次强制关闭。
+                    // 这里**只读不写**记忆——否则导一张徕卡直出（自带 HDR）就会把用户的「开」冲掉。
+                    val hasSourceHdr = pendingHdr != null || fullResHdr != null
+                    hdrBoost = SettingsStore.hdrDefaultOn(this) && !hasSourceHdr
+                    setHdrButton(hdrBoost)
                     updateLumBarUi()
                     // 作废在途调整任务：防止旧图的调整版完成于新导入之后盖在预览上
                     liftGen++
@@ -1431,6 +1468,8 @@ class MainActivity : AppCompatActivity() {
                     // 完美档完整管线需要原始 DNG：这里只记源，用时再重读（不常驻大字节）
                     sourceUri = uri
                     sourceIsRaw = isRaw
+                    // 此时 pendingHdr / fullResHdr 已赋值，仅按「源图自带 HDR」决定是否隐藏
+                    updateHdrVisibility()
                     clearPerfectState()
                     txtStyleHint.text = "原图"
                     selectCard(0)
@@ -1533,6 +1572,8 @@ class MainActivity : AppCompatActivity() {
             // P2：一次解码出 ARGB + 1600px 16-bit 线性基准（调五档时免 8-bit 量化损失）；
             // 顺带缓存内嵌预览字节（导出 16-bit 重放的分位匹配基准）
             rawPreviewJpeg = preview
+            // V2：抽线性亮度基准（必须在 renderWithBase 之前——它会原地改写线性缓冲）
+            rawLinearLuma = RawToneMap.renderLinearLuma(buf, RAW_LUMA_MAX_DIM)
             val out = RawToneMap.renderWithBase(buf, level, preview, null, 1600)
             DiagLog.w("Import", "RAW 线性曲线 level=$level ${out?.first?.get(0)}x${out?.first?.get(1)} " +
                     "preview=${preview?.size ?: 0}B 提取${t1 - t0}ms 映射${System.currentTimeMillis() - t1}ms")
@@ -1562,6 +1603,8 @@ class MainActivity : AppCompatActivity() {
             val src = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
             val buf = RawDecoder.nativeDecodeLinearSrgb(src) ?: return null
             try {
+                // V2：重解一次的同时刷新线性亮度基准（必须在 renderWithTone 之前）
+                rawLinearLuma = RawToneMap.renderLinearLuma(buf, RAW_LUMA_MAX_DIM)
                 val argb = RawToneMap.renderWithTone(
                     buf, level, preview, ToneCurve.of(br, ev, hl, sh, bl, sa, co)) ?: return null
                 val w = argb[0]
@@ -2970,6 +3013,7 @@ class MainActivity : AppCompatActivity() {
     private var perfectBytes: ByteArray? = null            // 完美成片字节（非空 = 完美已应用）
     private var perfectStyle: LeicaEngine.Style? = null    // 完美成片所用风格
     private var perfectApplied = false                     // 完美档已应用（按钮高亮）
+    private var hdrBoost = false                           // HDR 输出开关：导出时合成 UltraHDR 增益图
 
     private val srListener: (SuperResTask.State) -> Unit = { st ->
         when (st) {
@@ -2984,6 +3028,7 @@ class MainActivity : AppCompatActivity() {
                 btnSuperRes.isEnabled = false
                 btnSuperResFast.isEnabled = false
                 btnPerfect.isEnabled = false
+                btnHdr.isEnabled = false
                 if (srStartedPerfect) {
                     btnPerfect.text = "完美处理中 ${st.progress}%"
                     DiagLog.i("Perfect", "完美档启动 ${st.progress}%")
@@ -3024,6 +3069,11 @@ class MainActivity : AppCompatActivity() {
                     originalBytes = st.jpeg
                     // 工作字节已被超分成片替换：200MP 全像素直通源与之不再对应，作废
                     clearFullRes()
+                    // 源增益图是原图尺寸，超分成片是 2× 且重新编码（不再有 HDR 容器），
+                    // rebake 已关闭无法重标定 → 保留会得到「主图放大、增益图原尺寸」的错配
+                    // （读端按 UltraHDR 渲染会发灰/高光断层）。直接作废，需要 HDR 时由按钮重新合成。
+                    pendingHdr = null
+                    updateHdrVisibility()
                     // 图已被替换为超分成片，完美态随之失效（避免重复套色/高亮错位）
                     perfectApplied = false
                     perfectBytes = null
@@ -3031,9 +3081,10 @@ class MainActivity : AppCompatActivity() {
                     setPerfectButton(false)
                     originalBitmap?.recycle()
                     originalBitmap = decodePreview(st.jpeg, 2048)
-                    // 源已是超分 JPEG，RAW 16-bit 窗口作废
+                    // 源已是超分 JPEG，RAW 16-bit 窗口与线性亮度基准一并作废
                     rawLin16 = null
                     rawPreviewJpeg = null
+                    rawLinearLuma = null
                     resultBitmap?.recycle()
                     resultBitmap = null
                     // 旧曝光版基于已回收/已替换的基图，随基图升级一并作废（同帧内换图，安全）
@@ -3098,13 +3149,14 @@ class MainActivity : AppCompatActivity() {
         if (show) btnPerfect.visible() else btnPerfect.gone()
     }
 
-    /** 画质三钮复位（启用 + 常态文案）。 */
+    /** 画质钮与 HDR 开关复位（启用 + 常态文案）。 */
     private fun resetQualityButtons() {
         btnSuperRes.isEnabled = true
         btnSuperRes.text = "光学超分"
         btnSuperResFast.isEnabled = true
         btnSuperResFast.text = "快速超分"
         btnPerfect.isEnabled = true
+        btnHdr.isEnabled = true
     }
 
     /** 完美按钮外观：已应用 = 亮底黑字 + ✓；未应用 = 常态玻璃底白字。 */
@@ -3118,6 +3170,171 @@ class MainActivity : AppCompatActivity() {
             btnPerfect.setTextColor(Color.WHITE)
             btnPerfect.text = "完美"
         }
+    }
+
+    // ---- HDR 输出（导出时合成 UltraHDR 增益图；纯算法，无模型）----
+
+    /**
+     * V2：取 RAW 线性亮度基准（必要时触发一次额外解码）。
+     *
+     * 提亮/强力档（level 1/2）在导入与 16bit 重放时已顺手抽过，直接复用；
+     * 标准档（level 0）走老 `nativeDecodeWithThr` 路径、完全没有线性数据，
+     * 这里重读源 DNG 解一次，**仅用于算增益，不改主图**（约 0.8~1.2s / 12.5MP）。
+     *
+     * 任何异常返回 null，调用方退回 V1 猜测式或纯 SDR —— 绝不影响导出本身。
+     */
+    private fun ensureRawLinearLuma(need: Boolean): RawToneMap.Luma16? {
+        if (!need || !sourceIsRaw) return null
+        rawLinearLuma?.let { return it }
+        val uri = sourceUri ?: return null
+        val t0 = System.currentTimeMillis()
+        return try {
+            val src = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+            val buf = RawDecoder.nativeDecodeLinearSrgb(src) ?: return null
+            try {
+                val luma = RawToneMap.renderLinearLuma(buf, RAW_LUMA_MAX_DIM)
+                rawLinearLuma = luma
+                DiagLog.i("HDR", "标准档补偿解码 ${luma?.w}x${luma?.h} 耗时 ${System.currentTimeMillis() - t0}ms")
+                luma
+            } finally {
+                RawDecoder.nativeFreeLinear(buf)
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("HDR", "标准档补偿解码失败：${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 导出收尾的 HDR 数据解析（工作版三站共用）：
+     * 源图自带增益图优先（按成品 SDR 重标定 C3）> HDR 开关（从成品 SDR 合成）> 无。
+     *
+     * 必须在工作线程内、对**最终 SDR 主图**调用：任何中途生成都会因后续色调变化而失配，
+     * 这正是 C3 重标定翻车的根因。HdrGainMap 内部吞异常返回 null，
+     * 调用方据此走 truncateToPrimary 退回纯 SDR（不新增任何失败模式）。
+     *
+     * @param srcHdr 源图自带增益图（pendingHdr / fullResHdr）
+     * @param srcSdr 源 SDR 工作字节，仅 rebake 需要（作增益图的分母来源）
+     * @param outSdr 成品 SDR（套色与滑杆之后）
+     * @param hdrOn 开关快照：由调用方在进线程前取，避免导出途中改 UI 导致半途变语义
+     * @param rawLuma RAW 线性亮度基准（V2）；非空时走真增益，null 走 V1 猜测式
+     */
+    private fun resolveHdrForExport(
+        srcHdr: HdrGainMap.HdrData?, srcSdr: ByteArray?, outSdr: ByteArray,
+        hdrOn: Boolean, rawLuma: RawToneMap.Luma16? = null
+    ): HdrGainMap.HdrData? {
+        if (srcHdr != null) {
+            return if (srcSdr != null) HdrGainMap.rebakeJpeg(srcSdr, outSdr, srcHdr) ?: srcHdr
+            else srcHdr
+        }
+        if (!hdrOn) return null
+        // V2 优先：RAW 有线性亮度基准时走真增益（实测压缩量），失败再退回 V1 猜测式
+        if (rawLuma != null) {
+            val lvl = SettingsStore.hdrBoostLevel(this)
+            val d = HdrGainMap.synthFromLinear(rawLuma, outSdr, SettingsStore.rawHdrStrength(lvl))
+            DiagLog.i(
+                "Export",
+                if (d != null) "HDR 合成(线性)成功 增益图 ${d.gainmapJpeg.size}B 区间[${d.minLog2},${d.maxLog2}]"
+                else "HDR 线性合成跳过（有效高光不足/几何不匹配）→ 退回 V1 猜测式"
+            )
+            if (d != null) return d
+        }
+        val d = HdrGainMap.synth(outSdr, SettingsStore.hdrBoostLevel(this))
+        DiagLog.i(
+            "Export",
+            if (d != null) "HDR 合成成功 增益图 ${d.gainmapJpeg.size}B 区间[${d.minLog2},${d.maxLog2}]"
+            else "HDR 合成跳过（高光不足或异常）→ 按纯 SDR 导出"
+        )
+        return d
+    }
+
+    /**
+     * HDR 按钮可见性：**只有源图自带 HDR 容器时隐藏**。
+     *
+     * 自带 HDR 时导出链已自动回嵌原增益图，再合成一张属于语义重复。
+     * RAW 自 V2 起放开：虽然工作字节是 8bit SDR，但导入期已抽好 16bit 线性亮度基准，
+     * 导出时用 `g = log2(L_lin/L_sdr)` 得到**真实**压缩量，而不是 V1 的直方图猜测。
+     */
+    private fun updateHdrVisibility() {
+        val hasSourceHdr = pendingHdr != null || fullResHdr != null
+        if (hasSourceHdr) btnHdr.gone() else btnHdr.visible()
+    }
+
+    /** HDR 按钮外观：已开启 = 亮底黑字 + ✓；未开启 = 常态玻璃底白字。 */
+    private fun setHdrButton(applied: Boolean) {
+        if (applied) {
+            btnHdr.setBackgroundResource(R.drawable.bg_pill_active)
+            btnHdr.setTextColor(Color.BLACK)
+            btnHdr.text = "HDR ✓"
+        } else {
+            btnHdr.setBackgroundResource(R.drawable.bg_pill)
+            btnHdr.setTextColor(Color.WHITE)
+            btnHdr.text = "HDR"
+        }
+    }
+
+    /**
+     * 点击 HDR：已开启 → 直接关闭；未开启 → **首次**弹说明，之后直接开启（不再打扰）。
+     * 「是否已看过说明」由 [SettingsStore.isHdrHintShown] 持久化，跨重启有效。
+     * 关闭是自己刚做的动作，任何时候都不弹窗。
+     */
+    private fun onHdrClicked() {
+        if (exporting) { toast("全像素导出进行中，请稍候"); return }
+        if (srBusy) { toast("处理中，请稍候"); return }
+        if (hdrBoost) {
+            hdrBoost = false
+            setHdrButton(false)
+            SettingsStore.setHdrDefaultOn(this, false)   // 记忆本次关闭
+            toast("HDR 输出已关闭")
+            return
+        }
+        if (SettingsStore.isHdrHintShown(this)) enableHdr() else confirmHdr()
+    }
+
+    /** 开启 HDR 的唯一出口：弹窗正按钮与「已看过说明」的快捷路径共用，避免两处状态漂移 */
+    private fun enableHdr() {
+        hdrBoost = true
+        setHdrButton(true)
+        SettingsStore.setHdrDefaultOn(this, true)        // 记忆本次开启，下次导入自动带 HDR
+        toast("已开启：导出时写入 HDR 数据")
+    }
+
+    /**
+     * HDR 说明弹窗：标题 + 首行红色提示 + 正文 + 「开启 / 取消」，
+     * 与 [confirmSuperRes] 完全同构（MaterialAlertDialogBuilder + SpannableString 染色）。
+     *
+     * 展示即标记已读（点「取消」也算）：用户要的是「只首次弹出」，
+     * 反复用同一段长文案拦人比缺少第二次说明更糟。
+     */
+    private fun confirmHdr() {
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("HDR 输出")
+            .setMessage(buildHdrMessage())
+            .setPositiveButton("开启") { _, _ -> enableHdr() }
+            .setNegativeButton("取消", null)
+            .show()
+        SettingsStore.markHdrHintShown(this)
+    }
+
+    /** HDR 说明正文：首行红色警示（超分那里是耗时警告，这里是「非对称预期」警告） */
+    private fun buildHdrMessage(): CharSequence {
+        val red = "仅支持的设备与相册能显示 HDR 效果，其他设备显示为普通照片\n"
+        val levelName = SettingsStore.hdrBoostLevelName(SettingsStore.hdrBoostLevel(this))
+        val rest = (if (sourceIsRaw) {
+            "源为 RAW：增益来自传感器线性数据，是真实还原，而非从成片估算。\n\n"
+        } else "") +
+            "导出时会在 JPG 里额外写入一张增益图（UltraHDR 标准）。\n" +
+            "支持的设备会按 HDR 显示：高光更通透、亮部层次更完整。\n\n" +
+            "主图与现在的导出完全一致，不改变色彩与影调。\n" +
+            "当前强度：$levelName（在「设置 → 导出 → HDR 强度」修改）\n" +
+            (if (sourceIsRaw) "RAW 的档位是对真实增益的整体缩放系数。\n" else "") +
+            "\n只对本次导出生效，换图后需重新开启。"
+        val ss = android.text.SpannableString(red + rest)
+        ss.setSpan(
+            android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
+            0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        return ss
     }
 
     private fun onPerfectClicked() {
@@ -3148,7 +3365,7 @@ class MainActivity : AppCompatActivity() {
             "转为后台处理，可回到桌面，通知栏显示进度。\n" +
             "完成后可手动导出，或继续做超分放大；再按一下「完美」可关闭。"
         val ss = android.text.SpannableString(red + rest)
-        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+        ss.setSpan(android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
             0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         return ss
     }
@@ -3166,6 +3383,7 @@ class MainActivity : AppCompatActivity() {
         SuperResTask.pendingPerfectDngUri = if (sourceIsRaw) sourceUri else null
         SuperResTask.pendingFast = false
         SuperResTask.pendingHdr = null                   // HDR 增益图在导出时回嵌
+        SuperResTask.pendingHdrBoost = false             // 完美档不自动导出，HDR 由 exportPerfect 处理
         SuperResTask.pendingBrightLevel = brightLevel
         SuperResTask.pendingExposure = exposureLevel
         SuperResTask.pendingHighlightLevel = highlightLevel
@@ -3222,7 +3440,7 @@ class MainActivity : AppCompatActivity() {
             "仅增强细节，不改变原有色彩。"
         val ss = android.text.SpannableString(red + rest)
         ss.setSpan(
-            android.text.style.ForegroundColorSpan(Color.RED),
+            android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
             0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
         )
         return ss
@@ -3237,7 +3455,7 @@ class MainActivity : AppCompatActivity() {
             "仅增强细节，不改变原有色彩。"
         val ss = android.text.SpannableString(red + rest)
         ss.setSpan(
-            android.text.style.ForegroundColorSpan(Color.RED),
+            android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
             0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
         )
         return ss
@@ -3261,6 +3479,8 @@ class MainActivity : AppCompatActivity() {
         SuperResTask.pendingPerfectStyle = null
         SuperResTask.pendingFast = fast
         SuperResTask.pendingHdr = pendingHdr
+        // 源图已有增益图时按钮本就隐藏；再与合成互斥，避免叠加两张增益图
+        SuperResTask.pendingHdrBoost = hdrBoost && pendingHdr == null
         SuperResTask.pendingBrightLevel = brightLevel
         SuperResTask.pendingExposure = exposureLevel
         SuperResTask.pendingHighlightLevel = highlightLevel
@@ -3390,6 +3610,8 @@ class MainActivity : AppCompatActivity() {
         val nameTag = customDef?.name?.let { sanitizeFileTag(it) } ?: styleId
         progress.visible()
         val gen = ++processingGeneration
+        // HDR 开关快照：导出期间用户仍可能点按钮，进线程前定死本次语义
+        val hdrOn = hdrBoost
         executor.execute {
             val t0 = System.currentTimeMillis()
             val brL = brightLevel
@@ -3400,6 +3622,8 @@ class MainActivity : AppCompatActivity() {
             val saL = satLevel
             val coL = contrastLevel
             val glL = glowLevel
+            // V2：RAW 线性亮度基准（标准档不产线性数据，这里会额外解码一次，仅用于算增益）
+            val rawLuma = ensureRawLinearLuma(hdrOn)
             // M5：被回收的版本先按 θ 快照重烘；失败就明确报错，不能导出原图冒充成片
             // M6 模型没有 LUT/param，跳过 ensure，走 renderModelNet
             if (customDef != null && customVer != null && !customDef.hasModelNet &&
@@ -3456,11 +3680,8 @@ class MainActivity : AppCompatActivity() {
                 DiagLog.i("Export", "亮度 ${brL}/曝光 ${evL}/高光 ${hlL}/阴影 ${shL}/黑色阶 ${blL}/饱和度 ${saL}/对比度 ${coL}/柔光 ${glL} 已烘焙 耗时 ${System.currentTimeMillis() - tL}ms")
             }
             DiagLog.i("Export", "${styleId} 处理完成 ${out.size}B 耗时 ${System.currentTimeMillis() - t0}ms")
-            // C3 增益图重标定：套过色调后 SDR 亮度分布已变，旧增益图的分母（原 SDR）失配
-            // → 用「原 SDR + 新 SDR」重算 g' = L_hdr / L_sdr_new，失败则沿用旧增益图
-            val hdrForExport = if (pendingHdr != null) {
-                HdrGainMap.rebakeJpeg(bytes, out, pendingHdr!!) ?: pendingHdr
-            } else null
+            // HDR 数据：源图自带增益图（C3 按新 SDR 重标定）> RAW 真增益 > 猜测式合成 > 无
+            val hdrForExport = resolveHdrForExport(pendingHdr, bytes, out, hdrOn, rawLuma)
             mainHandler.post {
                 progress.gone()
                 if (gen != processingGeneration) return@post
@@ -3528,6 +3749,8 @@ class MainActivity : AppCompatActivity() {
                                    nameTag: String, styleId: String) {
         progress.visible()
         val gen = ++processingGeneration
+        // HDR 开关快照（同 export：进线程前定死本次语义）
+        val hdrOn = hdrBoost
         executor.execute {
             val t0 = System.currentTimeMillis()
             val brL = brightLevel
@@ -3591,10 +3814,10 @@ class MainActivity : AppCompatActivity() {
             // 套了滤镜必须 rebake：增益图的分母是「源 SDR」，成品 SDR 亮度分布已变；
             // rebakeJpeg 内部把新旧 SDR 都缩到增益图尺寸，与输出主图尺寸无关（几何安全）。
             val outFinal = out
-            val hdrData = fullResHdr ?: pendingHdr
-            val hdrForExport = if (hdrData != null) {
-                HdrGainMap.rebakeJpeg(srcBytes, outFinal, hdrData) ?: hdrData
-            } else null
+            // 增益图来源：全像素直通有 fullResHdr（200MP 直通时 pendingHdr 恒 null），
+            // 否则按 HDR 开关从成品 SDR 合成
+            val hdrForExport = resolveHdrForExport(
+                fullResHdr ?: pendingHdr, srcBytes, outFinal, hdrOn, rawLinearLuma)
             mainHandler.post {
                 progress.gone()
                 if (gen != processingGeneration) return@post
@@ -3651,7 +3874,7 @@ class MainActivity : AppCompatActivity() {
         // 2 亿像素级（≥1 亿像素）：条带要跑数分钟，先讲清耗时与后台限制再开工
         val big = px >= BIG_EXPORT_PIXELS
         if (big && !confirmed) {
-            confirmBigExport(px, w0, h0, op != null) {
+            confirmBigExport(px, w0, h0) {
                 exportFullRes(
                     srcFile, op, nameTag, styleId,
                     confirmed = true, onFailure = onFailure
@@ -3659,13 +3882,18 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        progress.visible()
         if (big) {
             exporting = true
             startExportForeground()
+            // 大图分支用「环形进度 + 百分比」浮层替代普通转圈（与通知栏同源 ExportProgress）
+            showBigExportOverlay()
+        } else {
+            progress.visible()
         }
         val gen = ++processingGeneration
         val hdrSrc = fullResHdr
+        // HDR 开关快照：源图自带增益图时按钮本就隐藏，这里只可能是「无源 HDR + 开关开」
+        val hdrOn = hdrBoost && hdrSrc == null
         val exifHead = fullResExifHead
         val w = fullResWidth
         val h = fullResHeight
@@ -3676,7 +3904,11 @@ class MainActivity : AppCompatActivity() {
             if (Build.VERSION.SDK_INT <= 28 && !hasWritePermission()) {
                 exporting = false
                 ExportProgress.end(false, "缺少存储权限")
-                mainHandler.post { progress.gone(); requestWritePermission { export() } }
+                mainHandler.post {
+                    progress.gone()
+                    hideBigExportOverlay()
+                    requestWritePermission { export() }
+                }
                 return@execute
             }
             val tmp = File(cacheDir, "leica_fullres_${System.currentTimeMillis()}.jpg")
@@ -3705,6 +3937,7 @@ class MainActivity : AppCompatActivity() {
                     exporting = false
                     mainHandler.post {
                         progress.gone()
+                        hideBigExportOverlay()
                         if (gen != processingGeneration || isFinishing || isDestroyed) return@post
                         if (onFailure != null) onFailure()
                         else toast(
@@ -3729,9 +3962,28 @@ class MainActivity : AppCompatActivity() {
                         "堆 ${ImageUtils.heapUsageLabel()}")
                 // HDR 回嵌：徽章链会移除 XMP/MPF，必须在其后；无增益图时裁掉残留二次图防错配
                 // C3：全像素源若自带增益图且本次套了色（op != null），增益图按新 SDR 重标定
-                val hdrForExport = if (hdrSrc != null && op != null) {
-                    HdrGainMap.rebakeFiles(srcFile, tmp, hdrSrc, w, h) ?: hdrSrc
-                } else hdrSrc
+                val hdrForExport = when {
+                    hdrSrc != null && op != null ->
+                        HdrGainMap.rebakeFiles(srcFile, tmp, hdrSrc, w, h) ?: hdrSrc
+                    hdrSrc != null -> hdrSrc
+                    // 无源增益图 + 开关开：对成品主图算增益（按 inSampleSize 解码，
+                    // 200MP 源也绝不整图入堆）。RAW 优先走真增益，失败退回猜测式。
+                    hdrOn -> {
+                        val lvl = SettingsStore.hdrBoostLevel(this)
+                        val linear = rawLinearLuma?.let {
+                            HdrGainMap.synthFromLinearFile(it, tmp, SettingsStore.rawHdrStrength(lvl))
+                        }
+                        val d = linear ?: HdrGainMap.synthFile(tmp, lvl)
+                        DiagLog.i(
+                            "FullRes",
+                            if (d != null) "HDR 合成${if (linear != null) "（线性）" else ""}成功 " +
+                                "增益图 ${d.gainmapJpeg.size}B 区间[${d.minLog2},${d.maxLog2}]"
+                            else "HDR 合成跳过（高光不足或异常）→ 按纯 SDR 导出"
+                        )
+                        d
+                    }
+                    else -> null
+                }
                 val hdrChk = if (hdrForExport != null) HdrGainMap.embedFile(tmp, hdrForExport)
                     else HdrGainMap.truncateToPrimaryFile(tmp)
                 val diag = fileHeaderDiag(tmp) + " " + hdrChk.brief
@@ -3745,6 +3997,7 @@ class MainActivity : AppCompatActivity() {
                 exportSummary = "${w}×${h} · 用时 ${fmtDuration(elapsed)}"
                 mainHandler.post {
                     progress.gone()
+                    hideBigExportOverlay()
                     if (gen != processingGeneration || isFinishing || isDestroyed) return@post
                     // 柔光是空间算子不进条带链（半径 > 重叠带必带边不连续），全像素条带导出时明示
                     val glowNote = if (op != null && glowLevel != 0) " · 柔光未参与" else ""
@@ -3763,6 +4016,7 @@ class MainActivity : AppCompatActivity() {
                 exporting = false
                 mainHandler.post {
                     progress.gone()
+                    hideBigExportOverlay()
                     if (gen == processingGeneration && !isFinishing && !isDestroyed) {
                         if (onFailure != null) onFailure()
                         else toast("全像素导出失败：${t.javaClass.simpleName}")
@@ -3776,30 +4030,73 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---- 大图（≥1 亿像素）全像素导出：开工确认 / 用时弹窗 ----
+    // ---- 大图（≥1 亿像素）全像素导出：进度浮层 / 开工确认 / 用时弹窗 ----
+
+    /**
+     * 大图导出进度浮层：替代普通转圈，环形进度 + 百分比。数据源与通知栏一致
+     * （ExportProgress 单例，由条带 onProgress 写入），主线程 400ms 一拍轮询。
+     */
+    private fun showBigExportOverlay() {
+        progress.gone()
+        bigExportRing.isIndeterminate = true
+        bigExportPercent.text = "准备中"
+        bigExportHint.text = "全像素导出中 · 可退回桌面等待"
+        bigExportOverlay.visible()
+        mainHandler.removeCallbacks(exportOverlayTick)
+        mainHandler.post(exportOverlayTick)
+    }
+
+    /** 收浮层并停轮询：成功/失败/异常/权限回落各出口显式调用，轮询自身另有 !exporting 兜底 */
+    private fun hideBigExportOverlay() {
+        mainHandler.removeCallbacks(exportOverlayTick)
+        bigExportOverlay.gone()
+    }
+
+    /** 首拍立即执行：indeterminate 阶段转圈 +「准备中」，条带回调到达后切 determinate 显示百分比 */
+    private val exportOverlayTick = object : Runnable {
+        override fun run() {
+            if (!exporting) {
+                hideBigExportOverlay()
+                return
+            }
+            if (ExportProgress.indeterminate) {
+                if (!bigExportRing.isIndeterminate) bigExportRing.isIndeterminate = true
+                if (bigExportPercent.text.toString() != "准备中") bigExportPercent.text = "准备中"
+            } else {
+                if (bigExportRing.isIndeterminate) {
+                    bigExportRing.isIndeterminate = false
+                    bigExportRing.max = 100
+                }
+                val p = ExportProgress.percent
+                bigExportRing.setProgress(p)
+                bigExportPercent.text = "$p%"
+            }
+            mainHandler.postDelayed(this, 400)
+        }
+    }
 
     /** 开工前确认：耗时与「后台无限制」都要讲清楚，确认后才真正起前台服务 */
-    private fun confirmBigExport(px: Long, w: Int, h: Int, withColor: Boolean, onStart: () -> Unit) {
+    private fun confirmBigExport(px: Long, w: Int, h: Int, onStart: () -> Unit) {
         com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
             .setTitle("全像素导出")
-            .setMessage(buildBigExportMessage(px, w, h, withColor))
+            .setMessage(buildBigExportMessage(px, w, h))
             .setPositiveButton("开始导出") { _, _ -> onStart() }
             .setNegativeButton("取消", null)
             .show()
     }
 
     /** 确认文案：首行红字耗时 + 末段红字「后台无限制」指引 */
-    private fun buildBigExportMessage(px: Long, w: Int, h: Int, withColor: Boolean): CharSequence {
-        val red = "预计 ${estimateBandExportText(px, withColor)}，期间手机会持续发热\n"
+    private fun buildBigExportMessage(px: Long, w: Int, h: Int): CharSequence {
+        val red = "预计 ${estimateBandExportText()}，期间手机会持续发热\n"
         val rest = "全像素导出 ${w}×$h（${fmtPixels(px)}）：逐条带重编码，内存占用很低，但需要时间。\n" +
             "已挂前台服务并从通知栏显示进度，可以退回桌面等待；请勿在多任务里划掉本应用。\n" +
             "锁屏会降低系统调度、明显变慢，建议保持亮屏或直接切到桌面。\n\n"
         val warn = "若系统限制后台，长任务可能被冻结或中断 —— 请到 系统设置 → 应用管理 → L-Moment → 省电策略，改为「无限制」。"
         val ss = android.text.SpannableString(red + rest + warn)
-        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+        ss.setSpan(android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
             0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         val warnStart = (red + rest).length
-        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+        ss.setSpan(android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
             warnStart, ss.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         return ss
     }
@@ -3812,10 +4109,10 @@ class MainActivity : AppCompatActivity() {
             (if (hdrShort) "本次 HDR 增益图未完整保留（成片可用）。\n" else "") + "\n"
         val warn = "若等待期间系统提示过「应用在后台耗电」或任务被打断过，请把 L-Moment 的后台权限设为「无限制」，下次导出更稳。"
         val ss = android.text.SpannableString(red + rest + warn)
-        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+        ss.setSpan(android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
             0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         val warnStart = (red + rest).length
-        ss.setSpan(android.text.style.ForegroundColorSpan(Color.RED),
+        ss.setSpan(android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
             warnStart, ss.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
             .setTitle("全像素导出完成")
@@ -3824,15 +4121,8 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 条带耗时估算：200MP 直通实测约 256s（≈1.28 s/MP），套色算子再乘 1.6，给区间更诚实 */
-    private fun estimateBandExportText(px: Long, withColor: Boolean): String {
-        var sec = (px / 1_000_000.0 * 1.28).toInt()
-        if (withColor) sec = (sec * 1.6).toInt()
-        if (sec < 30) sec = 30
-        val lo = (sec * 0.8 / 60.0).toInt().coerceAtLeast(1)
-        val hi = (sec * 1.6 / 60.0).toInt().coerceAtLeast(lo + 1)
-        return "约 $lo~$hi 分钟"
-    }
+    /** 条带耗时口径：不再按像素线性外推，统一定为「1~5 分钟」（200MP 直通/套色实测均落在此区间） */
+    private fun estimateBandExportText(): String = "1~5 分钟"
 
     private fun fmtPixels(px: Long): String {
         if (px >= 100_000_000L) {
@@ -3910,6 +4200,8 @@ class MainActivity : AppCompatActivity() {
         progress.visible()
         val gen = ++processingGeneration
         val styleId = perfectStyle?.id ?: "M9"
+        // HDR 开关快照（完美成片导出与工作版同口径）
+        val hdrOn = hdrBoost
         executor.execute {
             val t0 = System.currentTimeMillis()
             val brL = brightLevel
@@ -3925,10 +4217,9 @@ class MainActivity : AppCompatActivity() {
                 out = Shadows.applyStackToJpeg(out, brL, evL, hlL, shL, blL, saL, coL, glL)
             }
             DiagLog.i("Export", "完美成片导出 $styleId ${out.size}B 耗时 ${System.currentTimeMillis() - t0}ms")
-            // C3：完美档同样是「套了色调的 SDR」，增益图需按新 SDR 重标定
-            val hdrForExport = if (pendingHdr != null && originalBytes != null) {
-                HdrGainMap.rebakeJpeg(originalBytes!!, out, pendingHdr!!) ?: pendingHdr
-            } else null
+            // 完美档同样是「套了色调的 SDR」：增益图按新 SDR 重标定，无源图则按开关合成
+            val hdrForExport = resolveHdrForExport(
+                pendingHdr, originalBytes, out, hdrOn, rawLinearLuma)
             mainHandler.post {
                 progress.gone()
                 if (gen != processingGeneration) return@post

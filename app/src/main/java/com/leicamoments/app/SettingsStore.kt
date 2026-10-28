@@ -30,6 +30,9 @@ object SettingsStore {
     private const val KEY_FULL_RES = "full_res_export"
     private const val KEY_M9_HIRES = "m9_hires_export"
     private const val KEY_LEICA_BADGE = "leica_badge"
+    private const val KEY_HDR_BOOST = "hdr_boost_level"
+    private const val KEY_HDR_HINT = "hdr_hint_shown"
+    private const val KEY_HDR_DEFAULT_ON = "hdr_default_on"
 
     /** 「记忆上次」在 default_category 里的取值 */
     const val VALUE_LAST = "last"
@@ -174,6 +177,32 @@ object SettingsStore {
         prefs(c).edit().putBoolean(KEY_RAW_HINT, true).apply()
     }
 
+    /**
+     * HDR 说明弹窗是否已展示过（全局一次，跨重启有效）。
+     *
+     * 语义是「**展示即标记**」：无论用户点开启还是取消，只要弹窗出现过就不再重复，
+     * 与 [isRawHintShown] / 引导页同款（不区分用户是否确认）。
+     * 之后点击 HDR 按钮直接进入开启态，不再被长文案拦一次。
+     */
+    fun isHdrHintShown(c: Context): Boolean = prefs(c).getBoolean(KEY_HDR_HINT, false)
+
+    fun markHdrHintShown(c: Context) {
+        prefs(c).edit().putBoolean(KEY_HDR_HINT, true).apply()
+    }
+
+    /**
+     * HDR 开关的**记忆值**（跨重启 + 换图都保持），默认关（零回归）。
+     *
+     * 语义边界：这是「用户上次手动选择的状态」，只在用户点按钮时写入。
+     * 导入一张**自带 HDR 增益图**的图时不得写它（那类图按钮本就隐藏、本次强制关闭），
+     * 否则「开过一次 → 导一张徕卡直出 → 再导普通图」就会把用户的「开」冲掉。
+     */
+    fun hdrDefaultOn(c: Context): Boolean = prefs(c).getBoolean(KEY_HDR_DEFAULT_ON, false)
+
+    fun setHdrDefaultOn(c: Context, on: Boolean) {
+        prefs(c).edit().putBoolean(KEY_HDR_DEFAULT_ON, on).apply()
+    }
+
     // ---- 全像素导出（C4）----
 
     /**
@@ -221,5 +250,40 @@ object SettingsStore {
 
     fun setLeicaBadgeEnabled(c: Context, enabled: Boolean) {
         prefs(c).edit().putBoolean(KEY_LEICA_BADGE, enabled).apply()
+    }
+
+    /**
+     * HDR 输出强度（只影响导出时合成增益图的幅度）：
+     * 0=轻 1.5EV（默认）/ 1=标准 2.0EV / 2=强 2.5EV。
+     *
+     * 2026-10-28 用户拍板默认改「轻」：默认观感更克制、更不易察觉。
+     * 迁移语义：SharedPreferences 仅在键不存在时返回默认值，故 V1/V2 期间手动选过档位的
+     * 用户继续读其存储值，只有从未操作过的用户落到「轻」，无需迁移代码。
+     *
+     * 与「徕卡徽章」开关正交：徽章管元数据，这里管增益图幅度；
+     * 两者都不改变主图像素与不支持 HDR 设备的显示。
+     */
+    fun hdrBoostLevel(c: Context): Int = prefs(c).getInt(KEY_HDR_BOOST, 0)
+
+    fun setHdrBoostLevel(c: Context, level: Int) {
+        prefs(c).edit().putInt(KEY_HDR_BOOST, level.coerceIn(0, 2)).apply()
+    }
+
+    /** 档位显示名（主界面弹窗与设置页共用，避免两处各写一份 when 后漂移） */
+    fun hdrBoostLevelName(level: Int): String = when (level) {
+        0 -> "轻"
+        2 -> "强"
+        else -> "标准"
+    }
+
+    /**
+     * RAW 的档位是**强度系数**而非绝对上限：真实增益由线性数据决定
+     * （大光比场景可能到 3~4EV），档位只整体缩放，既保持用户可控、
+     * 又不靠人为上限压制真实动态范围。
+     */
+    fun rawHdrStrength(level: Int): Float = when (level) {
+        0 -> 0.6f
+        2 -> 1.4f
+        else -> 1.0f
     }
 }

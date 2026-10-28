@@ -56,6 +56,19 @@ public final class RawDecoder {
      */
     public static native java.nio.ByteBuffer nativeDecodeLinearSrgb(byte[] data);
 
+    /**
+     * 线性 sRGB 解码（探针版，仅 debug 诊断用）：与 {@link #nativeDecodeLinearSrgb} 同参数，
+     * 但把 LibRaw 的 highlight 与 adjust_maximum_thr 暴露出来，用于验证「超白点是否被 clip」。
+     *
+     * <p>产品链固定调用 {@link #nativeDecodeLinearSrgb}，本方法不参与任何出图路径。
+     *
+     * @param highlight dcraw 高光模式：0=clip（现状）、2=Blend、5/6=Recon 类
+     * @param amt       adjust_maximum_thr：0.75 默认（自动拉白点）、1.0 关闭自动调整
+     * @return 与前两者同格式的 direct ByteBuffer，<b>用完必须 {@link #nativeFreeLinear} 释放</b>
+     */
+    public static native java.nio.ByteBuffer nativeDecodeLinearSrgbEx(
+            byte[] data, int highlight, float amt);
+
     /** 释放 nativeDecodeLinear 返回的堆外缓冲。 */
     public static native void nativeFreeLinear(java.nio.ByteBuffer buffer);
 }

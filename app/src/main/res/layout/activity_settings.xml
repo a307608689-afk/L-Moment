@@ -322,6 +322,63 @@
         android:textSize="12sp" />
 
     <LinearLayout
+        android:id="@+id/rowHdrBoost"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_settings_row"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="HDR 强度"
+            android:textColor="#E8E8EA"
+            android:textSize="15sp" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/txtHdrBoostValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="标准"
+            android:textColor="#8E8E93"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="›"
+            android:textColor="#5A5A5E"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/txtHdrBoostHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:paddingStart="32dp"
+        android:paddingEnd="32dp"
+        android:text="只影响之后导出的 HDR 数据幅度：轻 1.5EV / 标准 2.0EV / 强 2.5EV\n需在主界面开启「HDR」按钮才会写入；不支持 HDR 的设备显示不变"
+        android:textColor="#5A5A5E"
+        android:textSize="12sp" />
+
+    <LinearLayout
         android:id="@+id/rowFullRes"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

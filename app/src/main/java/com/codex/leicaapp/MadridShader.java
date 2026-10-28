@@ -102,9 +102,18 @@ public final class MadridShader {
     }
 
     /**
-     * 解码 JPEG → apply（含暗角强度）→ 重新编码（P3：4:4:4，q94）。失败返回原字节。
+     * 解码 JPEG → apply（含暗角强度）→ 重新编码（4:4:4，质量=JpegEnc 默认档）。失败返回原字节。
      */
     public static byte[] applyToJpeg(byte[] jpeg, float density, float vignetteStrength) {
+        return applyToJpeg(jpeg, density, vignetteStrength,
+                com.leicamoments.app.JpegEnc.DEFAULT_QUALITY);
+    }
+
+    /**
+     * 质量显式版。M10R 主链（含各级降级）收尾钉 95（JpegEnc.M9_FAMILY_QUALITY），
+     * 不随全局默认变化。
+     */
+    public static byte[] applyToJpeg(byte[] jpeg, float density, float vignetteStrength, int quality) {
         try {
             BitmapFactory.Options opts = new BitmapFactory.Options();
             opts.inMutable = true;
@@ -112,7 +121,7 @@ public final class MadridShader {
             Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, opts);
             if (bmp == null) return jpeg;
             apply(bmp, density, vignetteStrength);
-            byte[] encoded = com.leicamoments.app.JpegEnc.encode(bmp);
+            byte[] encoded = com.leicamoments.app.JpegEnc.encode(bmp, quality);
             bmp.recycle();
             // 回填源 JPEG 的 APP1(Exif) 段：机型/拍摄参数/GPS 位置随链路整体保留。
             // 链路上游（MadridLegendary/LegendaryPostProcessor/AlexaLut/PortraitFilm）均已 copyExif 传递，

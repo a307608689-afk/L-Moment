@@ -41,6 +41,9 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var rowLeicaBadge: LinearLayout
     private lateinit var txtLeicaBadgeValue: TextView
     private lateinit var txtLeicaBadgeHint: TextView
+    private lateinit var rowHdrBoost: LinearLayout
+    private lateinit var txtHdrBoostValue: TextView
+    private lateinit var txtHdrBoostHint: TextView
 
     /**
      * RAW 解码亮度档位（id, 标题, 副标题）。id 与 [SettingsStore.rawThrLevel] 的存储值一一对应。
@@ -88,12 +91,16 @@ class SettingsActivity : AppCompatActivity() {
         rowLeicaBadge = findViewById(R.id.rowLeicaBadge)
         txtLeicaBadgeValue = findViewById(R.id.txtLeicaBadgeValue)
         txtLeicaBadgeHint = findViewById(R.id.txtLeicaBadgeHint)
+        rowHdrBoost = findViewById(R.id.rowHdrBoost)
+        txtHdrBoostValue = findViewById(R.id.txtHdrBoostValue)
+        txtHdrBoostHint = findViewById(R.id.txtHdrBoostHint)
         findViewById<TextView>(R.id.btnBack).setOnClickListener { finish() }
         rowDefault.setOnClickListener { showDefaultPicker() }
         rowRaw.setOnClickListener { showRawPicker() }
         rowFullRes.setOnClickListener { showFullResPicker() }
         rowM9Hires.setOnClickListener { showM9HiresPicker() }
         rowLeicaBadge.setOnClickListener { showLeicaBadgePicker() }
+        rowHdrBoost.setOnClickListener { showHdrBoostPicker() }
         rowBackup.setOnClickListener { startBackup() }
         rowImport.setOnClickListener { startImport() }
         rowShareImport.setOnClickListener { startShareImport() }
@@ -102,6 +109,7 @@ class SettingsActivity : AppCompatActivity() {
         renderRawValue()
         renderFullRes()
         renderLeicaBadge()
+        renderHdrBoost()
         renderPinnedCross()
         renderBackupSummary()
     }
@@ -288,6 +296,39 @@ class SettingsActivity : AppCompatActivity() {
         ) { item ->
             SettingsStore.setLeicaBadgeEnabled(this, item.id == "on")
             renderLeicaBadge()
+        }
+    }
+
+    /**
+     * HDR 输出强度：只影响导出时合成增益图的幅度，不改主图与色彩影调。
+     * 与「徕卡徽章」正交；是否写 HDR 由主界面「HDR」按钮决定，这里只调幅度。
+     */
+    private fun renderHdrBoost() {
+        val level = SettingsStore.hdrBoostLevel(this)
+        txtHdrBoostValue.text = SettingsStore.hdrBoostLevelName(level)
+        txtHdrBoostHint.text = hdrBoostLevelHint(level) +
+                "\n需在主界面开启「HDR」按钮才会写入；不支持 HDR 的设备显示不变"
+    }
+
+    private fun hdrBoostLevelHint(level: Int): String = when (level) {
+        0 -> "轻（默认）：1.5EV，最保守，只抬最亮部"
+        2 -> "强：2.5EV，幅度最大，渐变带风险更高"
+        else -> "标准：2.0EV，高光通透且自然"
+    }
+
+    private fun showHdrBoostPicker() {
+        CategoryPopup.show(
+            anchor = rowHdrBoost,
+            items = listOf(
+                CategoryPopup.Item("0", "轻（默认）", "1.5EV · 最保守"),
+                CategoryPopup.Item("1", "标准", "2.0EV · 高光更明显"),
+                CategoryPopup.Item("2", "强", "2.5EV · 渐变带风险")
+            ),
+            selectedId = SettingsStore.hdrBoostLevel(this).toString(),
+            centerOnAnchor = false
+        ) { item ->
+            SettingsStore.setHdrBoostLevel(this, item.id.toIntOrNull() ?: 0)
+            renderHdrBoost()
         }
     }
 

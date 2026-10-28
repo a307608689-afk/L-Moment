@@ -19,17 +19,29 @@ import java.io.ByteArrayOutputStream
  * 逐档实测（最不利组合 = 双编码 + 强色度的 M13）：
  *   q95/4:4:4 +41.5% / q94 +28.9% / q93 +17.6% / q92 +8.8%，判据 ≤ +15%。
  * 而 q93 与 q92 的色度收益几乎相同（blkb8 −0.2% vs −1.9%，边缘彩边同为 +1.35×），
- * 故取 [DEFAULT_QUALITY] = 92。L-M9 单道编码，取 95（实测 +11.0~13.5%，≥ 判据内）。
+ * 故曾取 [DEFAULT_QUALITY] = 92。L-M9 单道编码，取 95（实测 +11.0~13.5%，≥ 判据内）。
+ *
+ * 2026-10-27 回调：v1.4.0 真机对比（同图 M9，15 Ultra）显示 q92 的亮度 DCT 量化在
+ * 天空/云-天过渡带等低对比平滑渐变处 banding 明显、细节损失可辨（HDR 渲染下还被
+ * 增益图再放大），体积仅省 ~6%。用户拍板全局回到 95（对齐 v1.3.0 的 q95 语义，
+ * 4:4:4 色度收益保留）；体积判据让位于渐变带观感。
  */
 object JpegEnc {
 
     private const val TAG = "JpegEnc"
 
-    /** 常规链出口质量（4:4:4 口径，见类注释的真机 A/B 依据）。 */
-    const val DEFAULT_QUALITY = 92
+    /** 常规链出口质量（4:4:4 口径；2026-10-27 由 92 回 95，见类注释）。 */
+    const val DEFAULT_QUALITY = 95
 
     /** L-M9（Lm9Stats）出口质量：单道编码，相对其旧 q98/4:2:0 体积 +11~14%。 */
     const val LM9_QUALITY = 95
+
+    /**
+     * M9/M9P/M10R 主链出口质量（钉 95）：LegendaryPostProcessor.encode /
+     * boostSaturationContrast / MadridShader 的 M10R 收尾显式引用本常量，
+     * 不随 [DEFAULT_QUALITY] 变化。云-天过渡带 banding 的教训档位。
+     */
+    const val M9_FAMILY_QUALITY = 95
 
     /**
      * 仅供 A/B 的强制回落开关：true 时走旧的 `Bitmap.compress`（4:2:0），

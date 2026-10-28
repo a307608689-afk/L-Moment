@@ -116,6 +116,13 @@ class BatchTestActivity : Activity() {
             return
         }
 
+        // V2 探针：RAW 高光余量（highlight × adjust_maximum_thr 矩阵）
+        if (mode == "linprobe") {
+            val dump = intent.getBooleanExtra("dump", false)
+            Thread { runLinProbeSuite(File(indir), File(outdir).apply { mkdirs() }, limit, dump) }.start()
+            return
+        }
+
         // B0 接缝基线：恒等算子应「零接缝」，故意错位算子必须被 meas 出接缝（判据灵敏度自检）
         if (mode == "seam") {
             Thread { runSeamSuite(File(indir), File(outdir).apply { mkdirs() }, limit) }.start()
@@ -343,6 +350,156 @@ class BatchTestActivity : Activity() {
         File(outdir, "_c3_report.txt").writeText(sb.toString())
         Log.i(tag, "c3 done -> ${outdir.absolutePath}/_c3_report.txt")
         finish()
+    }
+
+    // ==================== V2 探针：RAW 高光余量（--es mode linprobe） ====================
+
+    /**
+     * (highlight, adjust_maximum_thr) 矩阵。
+     *
+     * `amt=0.75` 是 LibRaw 默认（按直方图自动拉白点）；`1.0` 关闭自动调整 → 使用相机白点，
+     * **只有这一维才可能让超过白点的原始数据留下来**。历史 §5.1 的「Blend ≡ Clip」是在
+     * 默认 amt 下测的，本探针第一次把 amt 作为自变量。
+     */
+    private val linProbeMatrix = listOf(
+        Triple(0, 0.75f, "A_clip_auto"),
+        Triple(0, 1.0f, "B_clip_fixed"),
+        Triple(2, 0.75f, "C_blend_auto"),
+        Triple(2, 1.0f, "D_blend_fixed"),
+        Triple(5, 1.0f, "E_recon5_fixed"),
+        Triple(6, 1.0f, "F_recon6_fixed")
+    )
+
+    /**
+     * RAW 高光余量探针：判定 LibRaw 是否还留有「超过相机白点」的原始高光，
+     * 决定 V2b（RAW 真 HDR 的超白点还原）是否值得做。
+     *
+     * 每组输出：几何、亮度最大值、p99/p99.9/p99.99、顶格占比、高光末端 6 段分布。
+     * `--ez dump true` 时额外把线性数据落盘（8 字节 int w/h + u16 RGB，本机字节序），
+     * 供 PC 端 `m9_fb_work/linprobe_stats.py` 做空间分析；默认只出报告
+     * （200MP × 6 组约 1.8GB，不默认写盘）。
+     *
+     * adb:
+     *   am start -n com.leicamoments.app/.BatchTestActivity --es mode linprobe \
+     *     --es indir /sdcard/LeicaTestIn --es outdir /sdcard/LeicaTestOut
+     */
+    private fun runLinProbeSuite(indir: File, outdir: File, limit: Int, dump: Boolean) {
+        val sb = StringBuilder()
+        try {
+            val files = indir.listFiles { f ->
+                f.isFile && f.extension.lowercase() == "dng"
+            }?.sortedBy { it.name } ?: emptyList()
+            val use = if (limit > 0) files.take(limit) else files
+            sb.append("mode=linprobe files=${use.size}/${files.size} dump=$dump\n")
+            sb.append("matrix: ").append(linProbeMatrix.joinToString { it.third }).append('\n')
+            use.forEachIndexed { idx, f ->
+                sb.append("\n== ${f.name} ${f.length()}B\n")
+                val bytes = runCatching { f.readBytes() }.getOrNull()
+                if (bytes == null) {
+                    sb.append("  READ_FAIL\n")
+                    return@forEachIndexed
+                }
+                for ((hl, amt, name) in linProbeMatrix) {
+                    val t0 = System.currentTimeMillis()
+                    val buf = try {
+                        RawDecoder.nativeDecodeLinearSrgbEx(bytes, hl, amt)
+                    } catch (t: Throwable) {
+                        Log.e(tag, "linprobe $name 解码异常", t)
+                        null
+                    }
+                    if (buf == null) {
+                        sb.append("  $name hl=$hl amt=$amt DECODE_FAIL ${System.currentTimeMillis() - t0}ms\n")
+                        continue
+                    }
+                    try {
+                        if (dump) {
+                            val dst = File(outdir, "${f.nameWithoutExtension}_${name}.lin")
+                            runCatching {
+                                // 分块搬运：200MP 线性约 300MB，不能整块进 Java 堆
+                                dst.outputStream().use { os ->
+                                    buf.rewind()
+                                    val chunk = ByteArray(1 shl 20)
+                                    while (buf.remaining() > 0) {
+                                        val n = minOf(buf.remaining(), chunk.size)
+                                        buf.get(chunk, 0, n)
+                                        os.write(chunk, 0, n)
+                                    }
+                                }
+                            }.onFailure { sb.append("  $name DUMP_FAIL ${it.message}\n") }
+                        }
+                        sb.append("  $name hl=$hl amt=$amt ")
+                            .append(probeStats(buf))
+                            .append(" ${System.currentTimeMillis() - t0}ms\n")
+                    } finally {
+                        RawDecoder.nativeFreeLinear(buf)
+                    }
+                }
+                Log.i(tag, "linprobe ${idx + 1}/${use.size} ${f.name} done")
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "linprobe suite 失败", t)
+            sb.append("FATAL ${t.javaClass.simpleName}: ${t.message}\n")
+        }
+        runCatching { File(outdir, "_linprobe_report.txt").writeText(sb.toString()) }
+        runCatching { File(outdir, "_linprobe_done.txt").writeText("done\n") }
+        Log.i(tag, "linprobe done -> ${outdir.absolutePath}/_linprobe_report.txt")
+        finish()
+    }
+
+    /**
+     * 线性缓冲统计：BT.709 亮度 65536 桶直方图，按像素数自适应步进采样
+     * （200MP 也秒级）。指标语义：
+     *
+     * - `max` / `p9999`：线性值上界（归一化到 65535），若 amt=1.0 组明显低于基线，
+     *   说明白点没被拉满、超白点有机会保留；
+     * - `capped`：亮度 ≥ 65500 的像素占比 —— 直接反映「被顶到上界」的比例，
+     *   这是 clip 的直接证据；
+     * - `tail`：64000→65535 分 6 段的万分比分布，尖峰=被削平，平缓=有动态余量。
+     */
+    private fun probeStats(buf: java.nio.ByteBuffer): String {
+        val bb = buf.order(java.nio.ByteOrder.nativeOrder())
+        val w = bb.getInt(0)
+        val h = bb.getInt(4)
+        if (w <= 0 || h <= 0) return "BAD_DIM ${w}x$h"
+        val shorts = bb.asShortBuffer()
+        val count = w * h
+        val step = if (count > 12_000_000) 8 else if (count > 3_000_000) 4 else 1
+        val hist = IntArray(65536)
+        var n = 0L
+        var i = 4
+        val end = 4 + count * 3
+        val inc = 3 * step
+        while (i + 2 < end) {
+            val r = shorts.get(i).toInt() and 0xFFFF
+            val g = shorts.get(i + 1).toInt() and 0xFFFF
+            val b = shorts.get(i + 2).toInt() and 0xFFFF
+            hist[(r * 77 + g * 150 + b * 29) shr 8]++
+            n++
+            i += inc
+        }
+        if (n == 0L) return "EMPTY"
+        fun q(p: Double): Int {
+            val target = (p * n).toLong().coerceAtLeast(1L)
+            var acc = 0L
+            for (k in hist.indices) {
+                acc += hist[k]
+                if (acc >= target) return k
+            }
+            return 65535
+        }
+        var capped = 0L
+        for (k in 65500..65535) capped += hist[k]
+        val tail = IntArray(6)
+        for (k in 0 until 6) {
+            val from = 64000 + k * 256
+            var s = 0L
+            for (x in from until from + 256) if (x < 65536) s += hist[x]
+            tail[k] = (s * 10000 / n).toInt()
+        }
+        return "w=$w h=$h step=$step max=${q(1.0)} " +
+                "p99=${q(0.99)} p999=${q(0.999)} p9999=${q(0.9999)} " +
+                "capped=" + String.format(java.util.Locale.US, "%.3f", capped * 100.0 / n) + "% " +
+                "tail=" + tail.joinToString(",")
     }
 
     private fun runOneC3(f: File, outdir: File, styles: List<String>): String {

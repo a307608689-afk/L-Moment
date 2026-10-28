@@ -62,6 +62,13 @@ object SuperResTask {
     @Volatile
     var pendingHdr: HdrGainMap.HdrData? = null
 
+    /**
+     * HDR 输出开关快照（主界面「HDR」按钮）。
+     * 仅在 [pendingHdr] 为 null（源图无增益图）时生效：按设置档位从成品 SDR 合成。
+     */
+    @Volatile
+    var pendingHdrBoost: Boolean = false
+
     /** 亮度档（±10，0=不调） */
     @Volatile
     var pendingBrightLevel: Int = 0
@@ -205,9 +212,20 @@ object SuperResTask {
                 // 未回嵌则裁掉 EOI 之后的残留二次图（增益图与超分后的主图尺寸必然不匹配）
                 // C3 增益图重标定：套色后的 SDR 已不是原图，旧增益图的分母失配 → 按新 SDR 重算
                 // （用超分前的工作版 SDR 作为新 SDR：色调与成品一致，尺寸小、解码便宜）
-                val hdrSrc = if (pendingHdr != null && work !== bytes) {
-                    HdrGainMap.rebakeJpeg(bytes, work, pendingHdr!!) ?: pendingHdr
-                } else pendingHdr
+                // 源增益图（按新 SDR 重标定）> HDR 开关合成（对超分前的工作版 SDR：
+                // 色调与成品一致、尺寸小、解码便宜）> 无
+                val hdrSrc = if (pendingHdr != null) {
+                    if (work !== bytes) HdrGainMap.rebakeJpeg(bytes, work, pendingHdr!!) ?: pendingHdr
+                    else pendingHdr
+                } else if (pendingHdrBoost) {
+                    val d = HdrGainMap.synth(work, SettingsStore.hdrBoostLevel(app))
+                    DiagLog.i(
+                        "SuperRes",
+                        if (d != null) "HDR 合成成功 增益图 ${d.gainmapJpeg.size}B 区间[${d.minLog2},${d.maxLog2}]"
+                        else "HDR 合成跳过（高光不足或异常）→ 按纯 SDR 导出"
+                    )
+                    d
+                } else null
                 val exported = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
                     else HdrGainMap.truncateToPrimary(marked)
                 // 装配结果自检（detail 里的比例/容器结构进 DiagLog）

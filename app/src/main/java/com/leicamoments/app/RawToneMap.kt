@@ -179,6 +179,67 @@ object RawToneMap {
     /** 降采样后的线性 16-bit 小图（调档预览基准） */
     class Lin16 internal constructor(val data: ShortArray, val w: Int, val h: Int)
 
+    /**
+     * 降采样后的**线性亮度**基准（u16 单通道，BT.601 加权，与 [histogram] 同源）。
+     *
+     * 用途：RAW 真 HDR（V2）在导出末尾算 `g = log2((L_lin+off)/(L_sdr+off))`，
+     * 需要一张与最终 SDR 同几何的低分辨率线性亮度图作为分子。
+     */
+    class Luma16 internal constructor(val data: ShortArray, val w: Int, val h: Int)
+
+    /**
+     * 抽一张低分辨率线性亮度图（box 平均降采样，线性域平均是正确的降采样）。
+     *
+     * **必须在 [renderWithBase] / [renderWithTone] / [mapLinear16] 之前调用**：
+     * 这几步经 `mapInPlace` 原地把线性值改写成 SDR 亮度，之后取到的就不是原始线性数据了。
+     *
+     * 权重 `(r*77 + g*150 + b*29) shr 8` 与 [histogram] 完全一致 —— 分子（线性亮度）与
+     * 分母（SDR 亮度）必须同一定义，否则比值会系统性偏移。
+     *
+     * @param maxDim 长边上限。建议 1024：约 1.5MB，与增益图同一量级
+     * @return null = 缓冲非法或尺寸异常
+     */
+    fun renderLinearLuma(buf: ByteBuffer, maxDim: Int): Luma16? {
+        val bb = buf.order(ByteOrder.nativeOrder())
+        val w = bb.getInt(0)
+        val h = bb.getInt(4)
+        if (w <= 0 || h <= 0 || maxDim <= 0) return null
+        val sb = bb.asShortBuffer()
+        val scale = Math.max(w, h).toFloat() / maxDim
+        val nw = if (scale <= 1f) w else Math.max(1, (w / scale).toInt())
+        val nh = if (scale <= 1f) h else Math.max(1, (h / scale).toInt())
+        val data = ShortArray(nw * nh)
+        for (y in 0 until nh) {
+            val y0 = (y.toLong() * h / nh).toInt()
+            val y1 = Math.max(y0 + 1, ((y + 1).toLong() * h / nh).toInt())
+            for (x in 0 until nw) {
+                val x0 = (x.toLong() * w / nw).toInt()
+                val x1 = Math.max(x0 + 1, ((x + 1).toLong() * w / nw).toInt())
+                var sr = 0L
+                var sg = 0L
+                var sbv = 0L
+                var n = 0L
+                var sy = y0
+                while (sy < y1) {
+                    var i = 4 + (sy * w + x0) * 3
+                    var sx = x0
+                    while (sx < x1) {
+                        sr += (sb.get(i).toInt() and 0xFFFF).toLong()
+                        sg += (sb.get(i + 1).toInt() and 0xFFFF).toLong()
+                        sbv += (sb.get(i + 2).toInt() and 0xFFFF).toLong()
+                        n++
+                        sx++
+                        i += 3
+                    }
+                    sy++
+                }
+                val luma = if (n == 0L) 0L else (sr * 77 + sg * 150 + sbv * 29) / (n * 256)
+                data[y * nw + x] = luma.coerceIn(0L, 65535L).toShort()
+            }
+        }
+        return Luma16(data, nw, nh)
+    }
+
     private class Prep(val sb: java.nio.ShortBuffer, val w: Int, val h: Int, val total: Int)
 
     private fun prepare(buf: ByteBuffer): Prep? {

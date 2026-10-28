@@ -291,7 +291,7 @@ object LeicaEngine {
         val out = M9Perfect.run(app, work, denoise, ev, warmth, warmBin, onProgress) ?: return null
         return when (style) {
             Style.M9P -> boostSaturationContrast(out, M9P_BOOST_SATURATION, M9P_BOOST_CONTRAST, M9P_BOOST_WARM)
-            Style.M10R -> MadridShader.applyToJpeg(out, 0.3f)
+            Style.M10R -> MadridShader.applyToJpeg(out, 0.3f, 1f, JpegEnc.M9_FAMILY_QUALITY)
             else -> out
         }
     }
@@ -365,7 +365,7 @@ object LeicaEngine {
             // 一次「解码→矩阵→编码」的重量化点：蒸馏链上游的抖色在这里会被抹掉，必须在
             // 编码前补一次（幅度 1.0 LSB，与 M9Distill 出口同口径）。
             Dither.tpdf(out, 1.0f)
-            val encoded = JpegEnc.encode(out)
+            val encoded = JpegEnc.encode(out, JpegEnc.M9_FAMILY_QUALITY)
             out.recycle()
             MadridLegendary.copyExif(jpeg, encoded)
         } catch (t: Throwable) {
@@ -385,13 +385,13 @@ object LeicaEngine {
             val cpu = if (allowCpuFallback) M9CpuFallback.run(app, lut) else null
             if (cpu != null) {
                 DiagLog.w("Engine", "M10R styletrans 失败，CPU 补丁链接管")
-                return MadridShader.applyToJpeg(cpu, 0.3f)
+                return MadridShader.applyToJpeg(cpu, 0.3f, 1f, JpegEnc.M9_FAMILY_QUALITY)
             }
             // 降级 1.25：蒸馏微网（m10r 暖调 bin）+ 暗角
             M9Distill.run(app, lut, 0.6f, -0.95f, 0.3f,
                 warmBin = "leica_filter_param_m10r_snapshot.bin")?.let {
                 DiagLog.w("Engine", "M10R 蒸馏微网链接管")
-                return MadridShader.applyToJpeg(it, 0.3f)
+                return MadridShader.applyToJpeg(it, 0.3f, 1f, JpegEnc.M9_FAMILY_QUALITY)
             }
             // 降级 1.5：ORT 神经网络降级链（m10r 暖调 bin）+ 暗角
             if (distillSkipHeavy()) {
@@ -400,7 +400,7 @@ object LeicaEngine {
                 M9OrtFallback.run(app, lut, 0.6f, -0.95f, 0.3f,
                     warmBin = "leica_filter_param_m10r_snapshot.bin")?.let {
                     DiagLog.w("Engine", "M10R ORT 降级链接管")
-                    return MadridShader.applyToJpeg(it, 0.3f)
+                    return MadridShader.applyToJpeg(it, 0.3f, 1f, JpegEnc.M9_FAMILY_QUALITY)
                 }
             }
             // 降级 2：纯 LUT + 暗角
@@ -408,7 +408,7 @@ object LeicaEngine {
             onFallback?.invoke(Style.M10R)
         }
         // 3. 暗角 + 颗粒
-        return MadridShader.applyToJpeg(ai ?: lut, 0.3f)
+        return MadridShader.applyToJpeg(ai ?: lut, 0.3f, 1f, JpegEnc.M9_FAMILY_QUALITY)
     }
 
     /**
@@ -497,6 +497,7 @@ object LeicaEngine {
     private fun processLP9(app: Context, jpeg: ByteArray, onFallback: ((Style) -> Unit)?): ByteArray {
         // L-P9「P9 鲜艳」：测量式拟合 65³ 3D LUT（离线烘焙）
         // v2：pre 域色度清理（P9Post）——治"云斑显形"（LUT 饱和增益把云 vs 蓝天色度差放大 ×1.5）
+        // 2026-10-28：回退到 v1.4.0 语义（用户验收版本：无门控全域清理 + 双次编码）
         val out = AlexaLut.process(app, jpeg, "lut_p9vibrant.bin", P9Post.get())
         if (out === jpeg) {
             // LUT 失败：整链降级，回原图
