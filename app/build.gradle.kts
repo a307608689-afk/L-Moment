@@ -11,8 +11,8 @@ android {
         applicationId = "com.leicamoments.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 10400
-        versionName = "1.4.0"
+        versionCode = 10410
+        versionName = "1.4.1"
         ndk {
             abiFilters.add("arm64-v8a")
         }
