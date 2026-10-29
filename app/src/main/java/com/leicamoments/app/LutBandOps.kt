@@ -72,6 +72,11 @@ internal object LutBandOps {
         LeicaEngine.Style.FNN -> Recipe(AlexaLut.LUT_FUJI_NN, 0.12f, 0.45f)
         LeicaEngine.Style.FPNH -> Recipe(AlexaLut.LUT_FUJI_PNH, 0.10f, 0.40f)
         LeicaEngine.Style.FACROS -> Recipe(AlexaLut.LUT_FUJI_ACROS, 0.15f, 0.60f)
+        // K-胶片家族（颗粒/暗角与 LeicaEngine.process 逐项对齐，漏一项即预览与全像素不一致）
+        LeicaEngine.Style.KP400 -> Recipe(AlexaLut.LUT_KODAK_400, 0.12f, 0.45f)
+        LeicaEngine.Style.KG200 -> Recipe(AlexaLut.LUT_KODAK_200, 0.20f, 0.55f)
+        LeicaEngine.Style.KE100 -> Recipe(AlexaLut.LUT_KODAK_100, 0.10f, 0.38f)
+        LeicaEngine.Style.KC64 -> Recipe(AlexaLut.LUT_KODAK_64, 0.13f, 0.50f)
         else -> null
     }
 

@@ -176,7 +176,17 @@ class BatchTestActivity : Activity() {
                             File(outDir, "${stem}_raw_l${level}.jpg").writeBytes(work)
                         } else {
                             for (st in styles) {
-                                val style = LeicaEngine.Style.fromId(st)
+                                // 严格匹配：fromId() 未知 id 会静默回落 M9，
+                                // 传 label（如 K400）而非 id（KP400）时会跑错风格并把
+                                // 结果写成 _M9.jpg，验收结论直接错位。宁可 SKIP 也不猜。
+                                val style = LeicaEngine.Style.values()
+                                    .firstOrNull { it.id.equals(st, true) }
+                                if (style == null) {
+                                    Log.w(tag, "BATCH 未知风格 id=$st，跳过；可用 id: " +
+                                        LeicaEngine.Style.values().joinToString(",") { it.id })
+                                    summary.append("SKIP 未知风格 $st\n")
+                                    continue
+                                }
                                 val out = LeicaEngine.process(this, work, style, null)
                                 File(outDir, "${stem}_${style.id}.jpg").writeBytes(out)
                             }

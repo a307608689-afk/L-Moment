@@ -41,6 +41,9 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var rowLeicaBadge: LinearLayout
     private lateinit var txtLeicaBadgeValue: TextView
     private lateinit var txtLeicaBadgeHint: TextView
+    private lateinit var rowPseudoLinear: LinearLayout
+    private lateinit var txtPseudoLinearValue: TextView
+    private lateinit var txtPseudoLinearHint: TextView
     private lateinit var rowHdrBoost: LinearLayout
     private lateinit var txtHdrBoostValue: TextView
     private lateinit var txtHdrBoostHint: TextView
@@ -91,6 +94,9 @@ class SettingsActivity : AppCompatActivity() {
         rowLeicaBadge = findViewById(R.id.rowLeicaBadge)
         txtLeicaBadgeValue = findViewById(R.id.txtLeicaBadgeValue)
         txtLeicaBadgeHint = findViewById(R.id.txtLeicaBadgeHint)
+        rowPseudoLinear = findViewById(R.id.rowPseudoLinear)
+        txtPseudoLinearValue = findViewById(R.id.txtPseudoLinearValue)
+        txtPseudoLinearHint = findViewById(R.id.txtPseudoLinearHint)
         rowHdrBoost = findViewById(R.id.rowHdrBoost)
         txtHdrBoostValue = findViewById(R.id.txtHdrBoostValue)
         txtHdrBoostHint = findViewById(R.id.txtHdrBoostHint)
@@ -100,6 +106,7 @@ class SettingsActivity : AppCompatActivity() {
         rowFullRes.setOnClickListener { showFullResPicker() }
         rowM9Hires.setOnClickListener { showM9HiresPicker() }
         rowLeicaBadge.setOnClickListener { showLeicaBadgePicker() }
+        rowPseudoLinear.setOnClickListener { showPseudoLinearPicker() }
         rowHdrBoost.setOnClickListener { showHdrBoostPicker() }
         rowBackup.setOnClickListener { startBackup() }
         rowImport.setOnClickListener { startImport() }
@@ -109,6 +116,7 @@ class SettingsActivity : AppCompatActivity() {
         renderRawValue()
         renderFullRes()
         renderLeicaBadge()
+        renderPseudoLinear()
         renderHdrBoost()
         renderPinnedCross()
         renderBackupSummary()
@@ -300,6 +308,39 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     /**
+     * 高位深工作域（伪 RAW，JPG/HEIF，**默认关**）：
+     * 开 = 导入时建立 16-bit 线性基准，七档影调在 16 位域运算（预览与导出同源）；
+     * 关 = 维持既有 8-bit 链路。只影响之后导入的图，不影响真 RAW 与 EXIF。
+     */
+    private fun renderPseudoLinear() {
+        val on = SettingsStore.pseudoLinearEnabled(this)
+        txtPseudoLinearValue.text = if (on) "开" else "关"
+        txtPseudoLinearHint.text = if (on) {
+            "JPG / HEIF 的影调在 16 位域运算，暗部过渡更连续\n" +
+                "仅在常规导出（长边 ≤4096）生效；全像素直通与 M9 超高分辨率走各自链路\n" +
+                "不影响 RAW、色彩风格与 EXIF（机型/参数/GPS 均保留）"
+        } else {
+            "关闭时 JPG / HEIF 走 8 位链路，与原版一致\n" +
+                "真 RAW、全像素与 M9 超高分辨率导出均不受本开关影响"
+        }
+    }
+
+    private fun showPseudoLinearPicker() {
+        CategoryPopup.show(
+            anchor = rowPseudoLinear,
+            items = listOf(
+                CategoryPopup.Item("off", "关闭（默认）", "8 位链路，与改前完全一致"),
+                CategoryPopup.Item("on", "开启", "七档在 16 位域运算，暗部更连续")
+            ),
+            selectedId = if (SettingsStore.pseudoLinearEnabled(this)) "on" else "off",
+            centerOnAnchor = false
+        ) { item ->
+            SettingsStore.setPseudoLinearEnabled(this, item.id == "on")
+            renderPseudoLinear()
+        }
+    }
+
+    /**
      * HDR 输出强度：只影响导出时合成增益图的幅度，不改主图与色彩影调。
      * 与「徕卡徽章」正交；是否写 HDR 由主界面「HDR」按钮决定，这里只调幅度。
      */
@@ -311,18 +352,18 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun hdrBoostLevelHint(level: Int): String = when (level) {
-        0 -> "轻（默认）：1.5EV，最保守，只抬最亮部"
-        2 -> "强：2.5EV，幅度最大，渐变带风险更高"
-        else -> "标准：2.0EV，高光通透且自然"
+        0 -> "轻（默认）：1.0EV，全画幅轻微提亮，最保守"
+        2 -> "强：2.5EV，幅度最大，可能超出设备峰值亮度"
+        else -> "标准：1.6EV，对齐相机直出的 HDR 量级"
     }
 
     private fun showHdrBoostPicker() {
         CategoryPopup.show(
             anchor = rowHdrBoost,
             items = listOf(
-                CategoryPopup.Item("0", "轻（默认）", "1.5EV · 最保守"),
-                CategoryPopup.Item("1", "标准", "2.0EV · 高光更明显"),
-                CategoryPopup.Item("2", "强", "2.5EV · 渐变带风险")
+                CategoryPopup.Item("0", "轻（默认）", "1.0EV · 最保守"),
+                CategoryPopup.Item("1", "标准", "1.6EV · 对齐相机直出"),
+                CategoryPopup.Item("2", "强", "2.5EV · 幅度最大")
             ),
             selectedId = SettingsStore.hdrBoostLevel(this).toString(),
             centerOnAnchor = false

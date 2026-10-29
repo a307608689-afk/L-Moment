@@ -1,7 +1,7 @@
 package com.leicamoments.app
 
 /**
- * 全像素（200MP 级）导出进度单例：Activity 写、前台服务轮询读。
+ * 全像素（≥45MP：50MP / 200MP）导出进度单例：Activity 写、前台服务轮询读。
  *
  * 不走 Intent 传状态：导出本身仍在 Activity 的线程池里跑，服务只负责
  *   1) 把进程优先级拉到前台（切后台不被冻结/杀）

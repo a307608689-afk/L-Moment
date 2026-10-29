@@ -30,6 +30,7 @@ object SettingsStore {
     private const val KEY_FULL_RES = "full_res_export"
     private const val KEY_M9_HIRES = "m9_hires_export"
     private const val KEY_LEICA_BADGE = "leica_badge"
+    private const val KEY_PSEUDO_LINEAR = "pseudo_linear_work"
     private const val KEY_HDR_BOOST = "hdr_boost_level"
     private const val KEY_HDR_HINT = "hdr_hint_shown"
     private const val KEY_HDR_DEFAULT_ON = "hdr_default_on"
@@ -250,6 +251,26 @@ object SettingsStore {
 
     fun setLeicaBadgeEnabled(c: Context, enabled: Boolean) {
         prefs(c).edit().putBoolean(KEY_LEICA_BADGE, enabled).apply()
+    }
+
+    // ---- 高位深工作域（伪 RAW，JPG/HEIF）----
+
+    /**
+     * 高位深工作域开关（**默认关**，零回归）。
+     *
+     * 开 = 非 RAW 输入导入时建立 16-bit 线性基准，七档调节在 16 位域运算（预览与导出同源）；
+     * 关 = 完全维持既有 8-bit 链路。
+     *
+     * 语义边界：
+     * - 只是「允许」，实际仅在七档/柔光非零时启用；全零仍走原链路（JPG 保持原字节直通）。
+     * - 只影响**之后导入**的图；导入时快照，导出途中改设置不影响当前图。
+     * - 不影响真 RAW（它本身就有 16-bit 线性解码，走 [rawThrLevel]）。
+     * - 不影响 EXIF：机型/拍摄参数/GPS 由各重编码站的 copyExif 保证，与开关无关。
+     */
+    fun pseudoLinearEnabled(c: Context): Boolean = prefs(c).getBoolean(KEY_PSEUDO_LINEAR, false)
+
+    fun setPseudoLinearEnabled(c: Context, enabled: Boolean) {
+        prefs(c).edit().putBoolean(KEY_PSEUDO_LINEAR, enabled).apply()
     }
 
     /**

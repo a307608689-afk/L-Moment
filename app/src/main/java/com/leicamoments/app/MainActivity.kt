@@ -50,8 +50,8 @@ import androidx.core.content.FileProvider
 import androidx.core.content.IntentCompat
 import androidx.core.view.WindowCompat
 import com.codex.leicaapp.AlexaLut
-import com.codex.leicaapp.IccProfile
 import com.codex.leicaapp.LeicaMark
+import com.codex.leicaapp.MadridLegendary
 import com.codex.leicaapp.StyleA
 import com.codex.leicaapp.StyleAFit
 import com.leicamoments.app.AdaptiveColorNet.toMono
@@ -66,8 +66,14 @@ class MainActivity : AppCompatActivity() {
         const val MEM_PARAM_REF = "mem:enhance_par"
         const val MEM_LUT_REF = "mem:enhance_lut"
 
-        /** ≥1 亿像素（2 亿级）才走「耗时确认 + 前台服务 + 用时弹窗」，50MP 不打扰 */
-        const val BIG_EXPORT_PIXELS = 100_000_000L
+        /**
+         * 全像素「长任务通道」下限：与 ImageUtils.FULLRES_MIN_PIXELS（45MP）同口径。
+         *
+         * 只要走了全像素直通（50MP / 200MP），一律「耗时确认 + 前台服务 + 百分比浮层
+         * + 完成弹窗」。2026-10-29 用户拍板：50MP 不再静默处理——原门槛 1 亿像素时，
+         * 50MP 只有普通转圈、无前台服务保护，切后台不保证继续。
+         */
+        const val BIG_EXPORT_PIXELS = 45_000_000L
 
         /**
          * 弹窗警示文字色：Material 暗色主题官方 error 红（#CF6679）。
@@ -78,9 +84,12 @@ class MainActivity : AppCompatActivity() {
 
         /**
          * RAW 线性亮度基准的长边上限（V2 真 HDR 的分子）。
-         * 1024 约 0.8MP / 1.5MB，与增益图同一量级；再大不会提升增益精度。
+         *
+         * 2026-10-28 由 1024 提到 2048，与增益图的 1/2 分辨率对齐 —— 两者必须同尺寸
+         * （[HdrGainMap.synthFromLinear] 按 luma 尺寸缩 SDR 并校验几何，不一致会直接退回
+         * V1 猜测式）。约 3.1MP / 6.3MB。
          */
-        private const val RAW_LUMA_MAX_DIM = 1024
+        private const val RAW_LUMA_MAX_DIM = 2048
     }
 
     private lateinit var imgPreview: ZoomableImageView
@@ -108,6 +117,21 @@ class MainActivity : AppCompatActivity() {
     private lateinit var filterScroll: HorizontalScrollView
     private var sourceUri: Uri? = null                 // 导入源（完美档 RAW 完整管线需重读 DNG）
     private var sourceIsRaw = false
+    /**
+     * 伪 RAW（JPG/HEIF 高位深工作域）开关快照。
+     *
+     * 导入时定死：开关只影响「之后导入的图」，导出途中去设置里改开关不会让当前图语义漂移。
+     * 真正是否进 16-bit 域还要再看 [rawLin16Level]（构建失败时为 0 → 自动回落 8-bit 链）。
+     */
+    private var pseudoLinearAllowed = false
+
+    /**
+     * 当前图的伪线性缓冲是否来自 HEIF 直通解码（而非工作字节反编码）。
+     *
+     * true 时导出会用 [PseudoRawLinear.fromHeif] 重新解码源容器：HEIF 常为 10-bit，
+     * 这是伪 RAW 唯一能拿到真实位深的路径；解码失败自动退回工作字节线性化。
+     */
+    private var pseudoLinearFromHeif = false
     private lateinit var adjPanel: LinearLayout
     // P3：七档调节滑杆（进度 0..20 ↔ 档位 -10..+10；拖动调档，双击标签复位到 0）
     private lateinit var sbBright: SeekBar
@@ -1298,7 +1322,11 @@ class MainActivity : AppCompatActivity() {
                 val displayName = queryDisplayName(uri)?.lowercase()
                 val isRaw = displayName != null && RAW_EXTS.any { displayName.endsWith(it) }
                 val isJpeg = !isRaw && (mime.contains("jpeg") || mime.contains("jpg") || isJpegBytes(bytes))
-                DiagLog.i("Import", "读取 ${bytes.size}B mime=$mime raw=$isRaw jpeg=$isJpeg")
+                // 伪 RAW 开关快照（真 RAW 不走这条路：它本身就有 16-bit 线性解码）
+                pseudoLinearAllowed = !isRaw && SettingsStore.pseudoLinearEnabled(this)
+                pseudoLinearFromHeif = false
+                DiagLog.i("Import", "读取 ${bytes.size}B mime=$mime raw=$isRaw jpeg=$isJpeg " +
+                    "pseudo=${pseudoLinearAllowed}")
 
                 // 动态照片（MVIMG/MotionPhoto）截断为纯静态 JPEG：丢掉主图 EOI 之后的视频数据，
                 // 避免相册按复合照片路径读取容器元数据导致相机标记失效
@@ -1360,6 +1388,7 @@ class MainActivity : AppCompatActivity() {
                 val workBytes: ByteArray
                 // 新导入作废旧 RAW 16-bit 基准（RAW 提亮档成功后于 decodeRaw 内重登记）
                 rawLin16 = null
+                rawLin16Level = 0          // 档位必须一起清：否则上一张伪 RAW 的 3 会残留到本张
                 rawPreviewJpeg = null
                 rawLinearLuma = null
                 if (isRaw) {
@@ -1408,6 +1437,33 @@ class MainActivity : AppCompatActivity() {
                             (if (rawSize != null) "（源 ${rawSize[0]}x${rawSize[1]} 超限）" else "（$mime）"))
                         // 小图（长边 ≤1600）scaleBitmap 直接返回 work 自身，此时它就是 preview，不能回收
                         if (pv !== work) work.recycle()
+                    }
+                }
+
+                // 伪 RAW（JPG/HEIF 高位深工作域）：复用刚得到的预览位图建 16-bit 线性基准。
+                // 只登记基准，**不改 workBytes**——JPG 仍原字节直通（零重编码、原生 EXIF），
+                // HEIF 仍走既有重编码入径；导出是否真进 16-bit 域由「七档是否非零」再判一次，
+                // 全零时仍走原链（零性能损失、JPG 不会白掉一代编码）。
+                if (pseudoLinearAllowed) {
+                    // HEIF/HEIC：优先走 10-bit 直通（线性扩展现色域 → RGBA_F16 → u16）。
+                    // 厂商解码器不支持时内部自动退回 8-bit 线性化；整条 HEIF 路径失败再用预览位图。
+                    val isHeif = mime.contains("heif") || mime.contains("heic") ||
+                        displayName?.endsWith(".heif") == true || displayName?.endsWith(".heic") == true
+                    var base = if (isHeif) PseudoRawLinear.previewBaseFromHeif(this, uri) else null
+                    if (base != null) {
+                        pseudoLinearFromHeif = true
+                        DiagLog.i("PSEUDO", "基准来源=HEIF 直通解码")
+                    } else {
+                        base = PseudoRawLinear.buildPreviewBase(preview)
+                    }
+                    if (base != null) {
+                        rawLin16 = base
+                        rawLin16Level = RawToneMap.PSEUDO_LEVEL
+                        // 刻意不写 rawPreviewJpeg：伪 RAW 与「内嵌预览」同源，分位匹配恒等，无意义
+                        // 刻意不写 rawLinearLuma：伪线性算不出物理增益，HDR 仍走 V1 猜测式/源图增益图
+                        DiagLog.i("PSEUDO", "基准就绪 ${base.w}x${base.h} level=$rawLin16Level")
+                    } else {
+                        DiagLog.w("PSEUDO", "基准构建失败 → 本次按 8bit 链处理（无感降级）")
                     }
                 }
 
@@ -1545,7 +1601,11 @@ class MainActivity : AppCompatActivity() {
             DiagLog.w("Import", "RAW ${w}x${h} 超引擎上限（横置口径 长≤4096 短≤3072），工作字节缩到 ${nw}x${nh}")
         }
         val p = scaleBitmap(base, 1600)
-        val work = ImageUtils.toJpeg(base, 95)
+        // EXIF：RAW 工作字节从 Bitmap 重编码，天然没有 APP1；必须从源 DNG 逐 tag 抄一份。
+        // 不回填的后果（2026-10-29 核实）：本工作字节后续所有 copyExif 的源头都是空元数据 →
+        // 导出丢机型/拍摄参数/GPS，且 LeicaMark 因找不到 APP1 连徽章 tag 都无处追加。
+        // Orientation 强制 1：像素已由 LibRaw 摆正，沿用源值会让 normalizeExifOrientation 二次旋转。
+        val work = ExifTransplant.copy(this, bytes, ImageUtils.toJpeg(base, 95), "1")
         if (p !== base) base.recycle()
         // P2：登记 16-bit 基准、解码档位与内嵌预览（导出重放校验用）；非提亮档为 null
         rawLin16 = lin16
@@ -1596,15 +1656,43 @@ class MainActivity : AppCompatActivity() {
     private fun raw16TonedWorkBytes(br: Int, ev: Int, hl: Int, sh: Int, bl: Int,
                                     sa: Int, co: Int, gl: Int = 0): ByteArray? {
         val level = rawLin16Level
-        val preview = rawPreviewJpeg
-        val uri = sourceUri ?: return null
-        if (level == 0 || !RawToneMap.isEnabled(level) || preview == null) return null
+        if (level == 0) return null
+        // PSEUDO_LEVEL（JPG/HEIF 伪 RAW）：paramsOf(3)==null → mapInPlace 首行直接返回 false，
+        // 不做 RAW 提亮曲线、也不做内嵌预览分位匹配（对已成片两者都无意义），
+        // 只在 16-bit 线性域套七档 —— 这正是伪 RAW 想要的部分。
+        val pseudo = level == RawToneMap.PSEUDO_LEVEL
+        if (!pseudo && (!RawToneMap.isEnabled(level) || rawPreviewJpeg == null)) return null
         return try {
-            val src = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
-            val buf = RawDecoder.nativeDecodeLinearSrgb(src) ?: return null
+            // 源的取法按来源分叉：
+            // · 伪 RAW：用内存里的 originalBytes（已方向归一 + 带 GPS）。**禁止重读 sourceUri**
+            //   ——会拿到未归一方向的字节（伴生 JPG 横存竖拍直接横竖错），且裸 openInputStream
+            //   在 Android 10+ 可能绕过 setRequireOriginal 拿到系统脱敏副本，回填时丢 GPS。
+            // · 真 RAW：DNG 必须由 LibRaw 原生重解，工作字节里没有线性原始数据。
+            val src: ByteArray
+            val buf: java.nio.ByteBuffer
+            val preview: ByteArray?
+            if (pseudo) {
+                src = originalBytes ?: return null
+                // HEIF 源：重解码一次拿真实位深（省掉「源→JPEG→再解码」的一代损失与 8-bit 量化）。
+                // 失败（厂商解码器差异 / 内存不足）退回工作字节线性化；两条都失败才整体回落 8-bit 链。
+                val heifBuf = if (pseudoLinearFromHeif) {
+                    sourceUri?.let { PseudoRawLinear.fromHeif(this, it) }
+                } else null
+                buf = heifBuf ?: PseudoRawLinear.fromWorkBytes(src) ?: return null
+                DiagLog.i("PSEUDO",
+                    "导出缓冲来源=${if (heifBuf != null) "HEIF 直通" else "工作字节线性化"}")
+                preview = null
+            } else {
+                src = ImageUtils.readBytes(this, sourceUri ?: return null)
+                buf = RawDecoder.nativeDecodeLinearSrgb(src) ?: return null
+                preview = rawPreviewJpeg
+            }
             try {
-                // V2：重解一次的同时刷新线性亮度基准（必须在 renderWithTone 之前）
-                rawLinearLuma = RawToneMap.renderLinearLuma(buf, RAW_LUMA_MAX_DIM)
+                // V2 真 HDR 增益只对真 RAW：伪线性与成品 SDR 的比值恒等 1，写进去只会让
+                // synthFromLinear 白跑一遍再返回 null（等于把「无增益」当「解码失败」）。
+                if (!pseudo) {
+                    rawLinearLuma = RawToneMap.renderLinearLuma(buf, RAW_LUMA_MAX_DIM)
+                }
                 val argb = RawToneMap.renderWithTone(
                     buf, level, preview, ToneCurve.of(br, ev, hl, sh, bl, sa, co)) ?: return null
                 val w = argb[0]
@@ -1612,12 +1700,29 @@ class MainActivity : AppCompatActivity() {
                 val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                 bmp.setPixels(argb, 2, w, 0, 0, w, h)
                 if (gl != 0) SoftGlow.applyInPlace(bmp, gl)
-                try { ImageUtils.toJpeg(bmp, 95) } finally { bmp.recycle() }
+                // 伪 RAW 输出重建：M4 detail 重建 → M6 色度去振铃 → M3 蓝噪声抖动。
+                // 只对伪 RAW 生效（真 RAW 有 16-bit 数据，套这些补偿算子属于画蛇添足）；
+                // 预览链 recomputeAdjAsync 调用同一函数与同一组参数，保证预览与成片同源。
+                if (pseudo) {
+                    PseudoRawPostProcess.apply(
+                        bmp, PseudoRawPostProcess.estimateGain(br, ev, sh)
+                    )
+                }
+                val jpeg = try { ImageUtils.toJpeg(bmp, 95) } finally { bmp.recycle() }
+                // EXIF：toJpeg 从 Bitmap 重编码不写 APP1；不回填则下游 copyExif 的源头是空元数据，
+                // 导出丢机型/拍摄参数/GPS，且 LeicaMark 找不到 APP1 连徽章 tag 也无处追加。
+                // 源优先用 originalBytes（已方向归一 + 带 GPS），真 RAW 兜底用重读的 DNG 字节；
+                // Orientation 强制 1（像素已摆正）。
+                MadridLegendary.patchExifOrientationToOne(
+                    MadridLegendary.copyExif(originalBytes ?: src, jpeg))
             } finally {
-                RawDecoder.nativeFreeLinear(buf)
+                // 只有 LibRaw 的线性缓冲需要显式释放；伪 RAW 的 direct buffer 交给 GC
+                if (!pseudo) RawDecoder.nativeFreeLinear(buf)
             }
         } catch (t: Throwable) {
-            DiagLog.e("Export", "RAW 16bit 七档重放失败，回落 8bit 链", t)
+            DiagLog.e("Export",
+                (if (pseudo) "伪 RAW 16bit 七档重放失败，回落 8bit 链"
+                else "RAW 16bit 七档重放失败，回落 8bit 链"), t)
             null
         }
     }
@@ -2887,6 +2992,14 @@ class MainActivity : AppCompatActivity() {
                     lo.setPixels(px, 0, lin.w, 0, 0, lin.w, lin.h)
                     // 柔光是空间算子，不进 16-bit 曲线域——降 8-bit 后叠加（与导出链同口径）
                     if (gl != 0) SoftGlow.applyInPlace(lo, gl)
+                    // 与导出链同源：伪 RAW 时套同一套输出重建（M4→M6→M3）。
+                    // 不同步会出现「拖动滑杆时预览一个样、导出后另一个样」，这是最容易被当成 bug 的形态。
+                    val cur = lo
+                    if (cur != null && rawLin16Level == RawToneMap.PSEUDO_LEVEL) {
+                        PseudoRawPostProcess.apply(
+                            cur, PseudoRawPostProcess.estimateGain(br, ev, sh)
+                        )
+                    }
                 } catch (t: Throwable) {
                     DiagLog.e("Lum", "RAW 16bit 调整失败，回落 8bit", t)
                     lo?.recycle(); lo = null
@@ -3083,8 +3196,11 @@ class MainActivity : AppCompatActivity() {
                     originalBitmap = decodePreview(st.jpeg, 2048)
                     // 源已是超分 JPEG，RAW 16-bit 窗口与线性亮度基准一并作废
                     rawLin16 = null
+                    rawLin16Level = 0
                     rawPreviewJpeg = null
                     rawLinearLuma = null
+                    // 成片与源容器已无尺寸对应，禁止导出时再按 HEIF 源重解码
+                    pseudoLinearFromHeif = false
                     resultBitmap?.recycle()
                     resultBitmap = null
                     // 旧曝光版基于已回收/已替换的基图，随基图升级一并作废（同帧内换图，安全）
@@ -3871,7 +3987,7 @@ class MainActivity : AppCompatActivity() {
         val w0 = fullResWidth
         val h0 = fullResHeight
         val px = w0.toLong() * h0
-        // 2 亿像素级（≥1 亿像素）：条带要跑数分钟，先讲清耗时与后台限制再开工
+        // 全像素（≥45MP）：条带要跑半分钟以上，先讲清耗时与后台限制再开工
         val big = px >= BIG_EXPORT_PIXELS
         if (big && !confirmed) {
             confirmBigExport(px, w0, h0) {
@@ -3885,7 +4001,7 @@ class MainActivity : AppCompatActivity() {
         if (big) {
             exporting = true
             startExportForeground()
-            // 大图分支用「环形进度 + 百分比」浮层替代普通转圈（与通知栏同源 ExportProgress）
+            // 长任务通道用「环形进度 + 百分比」浮层替代普通转圈（与通知栏同源 ExportProgress）
             showBigExportOverlay()
         } else {
             progress.visible()
@@ -3950,15 +4066,16 @@ class MainActivity : AppCompatActivity() {
                 // 全像素直通只接受 Orientation=1（见 ImageUtils.decideFullRes），故固定写 1
                 val exifOk = exifHead != null && ExifTransplant.copyInPlace(this, exifHead, tmp, "1")
                 DiagLog.i("FullRes", "EXIF 回填${if (exifOk) "完成" else "跳过"} 堆 ${ImageUtils.heapUsageLabel()}")
-                // §22 P1：源图 ICC 色彩档案随导出走（纯字节搬运，不改像素；读失败静默跳过）
-                val iccBlocks = IccProfile.readBlocks(srcFile)
+                // A1（2026-10-29）：源图 ICC 不再随导出走。全链解码都请求 sRGB
+                // （inPreferredColorSpace = SRGB），像素已是 sRGB 数值；再贴源的 Display P3
+                // 档案等于「sRGB 数值 + P3 标签」，色彩管理的查看器会外扩 → 整体偏艳偏蓝
+                // （v1.4.x 相比 v1.3.0 的「M9 更饱和失真」根因）。无 ICC 标签 = sRGB 约定。
                 val badgeOn = SettingsStore.leicaBadgeEnabled(this)
-                val badgeOk = LeicaMark.markFile(tmp, iccBlocks, badgeOn)
+                val badgeOk = LeicaMark.markFile(tmp, null, badgeOn)
                 val badgeMsg = if (badgeOn) "徽章写入${if (badgeOk) "完成" else "失败（保留原样）"}"
                 else "徽章关闭（剥离徽章元数据）${if (badgeOk) "完成" else "失败（保留原样）"}"
                 DiagLog.i("FullRes",
-                    "$badgeMsg · " +
-                        "ICC ${if (iccBlocks != null) "${iccBlocks.size}B" else "源图无"} " +
+                    "$badgeMsg · ICC 不搬运(A1 sRGB) " +
                         "堆 ${ImageUtils.heapUsageLabel()}")
                 // HDR 回嵌：徽章链会移除 XMP/MPF，必须在其后；无增益图时裁掉残留二次图防错配
                 // C3：全像素源若自带增益图且本次套了色（op != null），增益图按新 SDR 重标定
@@ -4030,7 +4147,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---- 大图（≥1 亿像素）全像素导出：进度浮层 / 开工确认 / 用时弹窗 ----
+    // ---- 全像素（≥45MP）导出：进度浮层 / 开工确认 / 用时弹窗 ----
 
     /**
      * 大图导出进度浮层：替代普通转圈，环形进度 + 百分比。数据源与通知栏一致
@@ -4087,7 +4204,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 确认文案：首行红字耗时 + 末段红字「后台无限制」指引 */
     private fun buildBigExportMessage(px: Long, w: Int, h: Int): CharSequence {
-        val red = "预计 ${estimateBandExportText()}，期间手机会持续发热\n"
+        val red = "预计 ${estimateBandExportText(px)}，期间手机会持续发热\n"
         val rest = "全像素导出 ${w}×$h（${fmtPixels(px)}）：逐条带重编码，内存占用很低，但需要时间。\n" +
             "已挂前台服务并从通知栏显示进度，可以退回桌面等待；请勿在多任务里划掉本应用。\n" +
             "锁屏会降低系统调度、明显变慢，建议保持亮屏或直接切到桌面。\n\n"
@@ -4121,8 +4238,14 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 条带耗时口径：不再按像素线性外推，统一定为「1~5 分钟」（200MP 直通/套色实测均落在此区间） */
-    private fun estimateBandExportText(): String = "1~5 分钟"
+    /**
+     * 条带耗时口径（分档，不按像素线性外推）：
+     * - 50MP（8192×6144，512 行一带共 12 带）约 1 分钟级；
+     * - 200MP（直通/套色实测）落 1~5 分钟。
+     * 只影响确认弹窗首行文案，不参与任何预算/超时判定。
+     */
+    private fun estimateBandExportText(px: Long): String =
+        if (px >= 100_000_000L) "1~5 分钟" else "约 1 分钟"
 
     private fun fmtPixels(px: Long): String {
         if (px >= 100_000_000L) {

@@ -1073,18 +1073,53 @@ object HdrGainMap {
         }
     }
 
-    /** 三档强度 → 增益上限（log2 域，1 EV = 亮度翻倍）。档位只改这一个常数，算法不分叉 */
+    /**
+     * 三档强度 → 增益上限（log2 域，1 EV = 亮度翻倍）。档位只改这一个常数，算法不分叉。
+     *
+     * 2026-10-29 标准档改为 **1.585 EV**：这是相机直出 UltraHDR 实测的 `GainMapMax`
+     * （`IMG_20261027_235440.jpg`，小米 15 Ultra 原生 HDR），对齐原生量级。
+     */
     private fun boostMaxLog2(level: Int): Float = when (level) {
-        0 -> 1.5f
+        0 -> 1.0f
         2 -> 2.5f
-        else -> 2.0f
+        else -> 1.585f
     }
 
-    /** 增益图长边上限：增益图本就是低分辨率单通道数据，1024 足够且两次遍历成本可忽略 */
-    private const val SYNTH_GAIN_MAX_DIM = 1024
+    /**
+     * 暗部基底增益（EV）。相机直出的增益图是**全画幅覆盖**的：
+     * 实测暗部（L<0.005）均值 0.138 EV、中位 0.441 EV、最亮 1.394 EV。
+     *
+     * 这一点推翻了我们此前的「只提亮高光」思路：原生 HDR 并不做高光门控，
+     * 而是给整幅图一个从暗到亮线性递增的增益。只有整幅图都进入 HDR 域，
+     * 系统渲染时参考白才统一，才不会出现「部分像素留在 SDR 域」导致的发灰/脏边。
+     */
+    private const val SYNTH_BASE_EV = 0.14f
 
-    /** 高光起点分位：低于它的像素增益恒为 0（SDR 语义完全不变） */
-    private const val SYNTH_T0_Q = 0.90f
+    /**
+     * 增益图长边上限。
+     *
+     * 2026-10-28 由 1024 提到 2048（对应主图 1/2）：真机样张的「轮廓黑影」来自增益图
+     * 4x4 降采样 + 上采样错位（过渡带约 20px），提到 1/2 后过渡带减半到约 10px。
+     * **增益幅度不受影响** —— 这是它与「局部化」方案（P1）的关键差别：后者实测让亮区
+     * 平均增益从 0.402 掉到 0.192，HDR 效果腰斩。
+     *
+     * 代价：2048x1536 的 float 场约 12.5MB/个，滤波总耗时 +300ms 量级，
+     * 增益图 JPEG 约 250~400KB（原 50~90KB）。
+     */
+    private const val SYNTH_GAIN_MAX_DIM = 2048
+
+    /**
+     * 增益曲线的低端锚点分位（1%）。
+     *
+     * 2026-10-29 由 0.94 改为 **0.01**，对齐相机直出的全画幅覆盖：
+     * 原生增益图实测暗部（L<0.005）均值 0.138 EV、中位 0.441 EV、最亮 1.394 EV ——
+     * **它不做高光门控**，而是整幅图按亮度线性递增地提亮。
+     *
+     * 此前「只在最亮 6% 给增益」的写法，会让 94% 的像素停留在 SDR 域，
+     * 被系统渲染时区别对待（截图实测暗部被抬 10~12 级），
+     * 这才是怎么调 q 分位/分辨率/平滑都「还有黑影」的根源。
+     */
+    private const val SYNTH_T0_Q = 0.01f
 
     /** 满增益锚点分位：99.9%（C3 用 99.5% 曾把云层高光钳出台阶） */
     private const val SYNTH_T1_Q = 0.999f
@@ -1092,13 +1127,12 @@ object HdrGainMap {
     /** 高光区过窄判定（0..255 域）：分位跨度不足即放弃，宁可不做也不制造阶跃 */
     private const val SYNTH_MIN_SPAN = 0.02f
 
-    /** 平滑半径（增益图像素） */
-    private const val SYNTH_SMOOTH_R = 2
 
-    /** 增益图目标尺寸：长边 min(1024, 源长边/4)，下限 64 */
+
+    /** 增益图目标尺寸：长边 min(2048, 源长边/2)，下限 64 */
     private fun gainTargetSize(w: Int, h: Int): IntArray {
         val longEdge = Math.max(w, h)
-        val target = Math.min(SYNTH_GAIN_MAX_DIM, Math.max(64, longEdge / 4))
+        val target = Math.min(SYNTH_GAIN_MAX_DIM, Math.max(64, longEdge / 2))
         val scale = target.toFloat() / longEdge.coerceAtLeast(1)
         return intArrayOf(
             Math.max(8, (w * scale).toInt()),
@@ -1149,27 +1183,28 @@ object HdrGainMap {
             return null
         }
 
-        // 3) 归一化增益场：smoothstep 后再平方，中段更保守，只有真高光吃满
+        // 3) 增益场：**全画幅线性递增**（2026-10-29 复刻相机直出）。
+        //
+        //    相机直出实测（`IMG_20261027_235440.jpg`）：暗部 0.138 EV → 中位 0.441 →
+        //    最亮 1.394，**连续覆盖全部亮度区间、不做高光门控**。
+        //    此前我们只在最亮 6% 给增益，94% 的像素停在 SDR 域被系统区别对待，
+        //    无论怎么调分位/分辨率/平滑都会「轮廓发脏」。
+        //
+        //    norm 线性映射：[baseNorm, 1]，解码后 g = maxL2 * norm，
+        //    故暗部实际增益 = SYNTH_BASE_EV（≈0.14 EV），最亮 = maxL2。
+        val baseNorm = (SYNTH_BASE_EV / maxL2).coerceIn(0f, 0.9f)
         val span = q1 - q0
         val norm = FloatArray(total)
-        var boosted = 0L
         for (i in 0 until total) {
-            val v = lum[i]
-            if (v <= q0) continue
-            var r = (v - q0) / span
-            if (r > 1f) r = 1f
-            val s = r * r * (3f - 2f * r)
-            norm[i] = s * s
-            boosted++
-        }
-        // 有效高光像素不足 0.5%：说明画面几乎没有亮部，做了也看不出，跳过以省时间
-        if (boosted * 200 < total) {
-            DiagLog.i("HdrGainMap", "增益合成跳过：高光像素过少 $boosted/$total（level=$level）")
-            return null
+            var r = (lum[i] - q0) / span
+            r = r.coerceIn(0f, 1f)
+            norm[i] = baseNorm + (1f - baseNorm) * r
         }
 
-        // 4) 编码前空间平滑 —— C3 天空色带的唯一解法，不可省
-        smoothBox(norm, gw, gh, SYNTH_SMOOTH_R)
+        // 4) 轻平滑（r=1）：只压掉 8bit 量化产生的等值线。
+        //    原生增益图的边缘梯度实测（|grad g| p95=0.808）比我们还大，说明它没有做额外平滑；
+        //    我们的增益由亮度线性映射而来、空间上本就连续，重平滑只会把高光摊进暗部。
+        smoothBox(norm, gw, gh, 1)
 
         // 5) 量化 8bit 灰度并编码（与 rebakeCore 同口径 JPEG95）
         val out = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
@@ -1192,13 +1227,15 @@ object HdrGainMap {
         DiagLog.i(
             "HdrGainMap",
             "增益图合成 level=$level ${gw}x${gh} ${bytes.size}B " +
-                "区间[$fMin,$fMax] 锚点 t0=$q0 t1=$q1 提亮占比 ${pct(boosted, total.toLong())} " +
+                "区间[$fMin,$fMax] 锚点 t0=$q0 t1=$q1 基底 ${SYNTH_BASE_EV}EV " +
                 "用时 ${System.currentTimeMillis() - t0ms}ms"
         )
+        // 复刻相机直出：OffsetSDR/OffsetHDR 均为 0（原生实测 0.00000），
+        // 公式退化为纯乘法 L_hdr = L_sdr × 2^g，没有 offset 带来的基底抬升。
         // sourceXmp=null：primaryXmp()/secondaryXmp() 都不读该字段（仅取证用），安全
         return HdrData(
             bytes, fMin, fMax, "1",
-            DEFAULT_OFFSET, DEFAULT_OFFSET, fMin, fMax, null
+            "0", "0", fMin, fMax, null
         )
     }
 
@@ -1272,21 +1309,34 @@ object HdrGainMap {
         val s = strength.coerceIn(0.1f, 3f)
         val off = DEFAULT_OFFSET.toFloatOrNull() ?: 0.015625f
 
-        // 1) 逐像素真实增益（log2）
-        val gain = FloatArray(total)
+        // 1) 真实增益（log2）+ 相机直出式基底（2026-10-29）。
+        //
+        //    `g = real × strength + SYNTH_BASE_EV`
+        //    - real = log2(L_lin / L_sdr)：RAW 独占的真实压缩比（被风格压暗了多少）
+        //    - base：全画幅基底（见 [SYNTH_BASE_EV]），让整幅图都进入 HDR 域
+        //
+        //    不再做高光门控：V1 的多轮实测已证明「只提亮高光」会让大部分像素留在 SDR 域，
+        //    被系统渲染时区别对待（截图实测暗部被抬 10~12 级），这才是「轮廓发脏」的根源。
         val row = IntArray(gw)
-        var valid = 0L
+        val sdrLum = FloatArray(total)
         for (y in 0 until gh) {
             sdr.getPixels(row, 0, gw, 0, y, gw, 1)
             val base = y * gw
             for (x in 0 until gw) {
-                val lli = (luma.data[base + x].toInt() and 0xFFFF) / 65535f
-                val lsdr = SRGB_TO_LINEAR[lumaIndex(row[x])]
-                val raw = (Math.log(((lli + off) / (lsdr + off)).toDouble()) / LN2).toFloat()
-                val gv = (raw * s).coerceIn(0f, MAX_TOTAL_SPAN_LOG2)
-                gain[base + x] = gv
-                if (gv > 0.15f) valid++
+                sdrLum[base + x] = SRGB_TO_LINEAR[lumaIndex(row[x])]
             }
+        }
+
+        val gain = FloatArray(total)
+        var valid = 0L
+        for (i in 0 until total) {
+            val lsdr = sdrLum[i]
+            val lli = (luma.data[i].toInt() and 0xFFFF) / 65535f
+            val real = (Math.log(((lli + off) / (lsdr + off)).toDouble()) / LN2).toFloat()
+            val gv = (real * s + SYNTH_BASE_EV).coerceIn(0f, MAX_TOTAL_SPAN_LOG2)
+            gain[i] = gv
+            // 只有「基底之上的真实增益」才算有效，纯 base 的平光场景仍判为无光可还原
+            if (gv > SYNTH_BASE_EV + 0.06f) valid++
         }
         if (valid * 200 < total) {
             DiagLog.i("HdrGainMap", "线性增益跳过：有效像素 ${pct(valid, total.toLong())} < 0.5%")
@@ -1308,10 +1358,10 @@ object HdrGainMap {
         val maxL2 = (bin.toFloat() / (bins - 1) * MAX_TOTAL_SPAN_LOG2)
             .coerceIn(0.2f, MAX_TOTAL_SPAN_LOG2)
 
-        // 3) 归一化 → 平滑 → 8bit → JPEG95（与 V1 同一出口）
+        // 3) 归一化 → 轻平滑 → 8bit → JPEG95（与 V1 同一出口；理由见 V1 第 4 步）
         val norm = FloatArray(total)
         for (i in 0 until total) norm[i] = (gain[i] / maxL2).coerceIn(0f, 1f)
-        smoothBox(norm, gw, gh, SYNTH_SMOOTH_R)
+        smoothBox(norm, gw, gh, 1)
 
         val out = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
         val pRow = IntArray(gw)
@@ -1335,7 +1385,8 @@ object HdrGainMap {
             "增益图合成(线性) ${gw}x${gh} ${bytes.size}B 区间[$fMin,$fMax] " +
                 "强度 $s 有效 ${pct(valid, total.toLong())} 用时 ${System.currentTimeMillis() - t0ms}ms"
         )
-        return HdrData(bytes, fMin, fMax, "1", DEFAULT_OFFSET, DEFAULT_OFFSET, fMin, fMax, null)
+        // offset 同为 0（复刻相机直出）：渲染退化为纯乘法 L_hdr = L_sdr × 2^g
+        return HdrData(bytes, fMin, fMax, "1", "0", "0", fMin, fMax, null)
     }
 
     /** 256 桶直方图 → 分位所在的亮度级（0..255） */
@@ -1374,6 +1425,43 @@ object HdrGainMap {
                     sum += tmp[(if (k < 0) 0 else if (k >= h) h - 1 else k) * w + x]
                 }
                 a[y * w + x] = sum * inv
+            }
+        }
+    }
+
+    /**
+     * 分离式最小值滤波（就地）。**当前未启用**（2026-10-28 撤出产品链），保留备查。
+     *
+     * 曾用于「暗侧收缩」：把增益从亮/暗交界收回亮区内部，抵消降采样时亮部增益被
+     * 平均进暗部的泄漏。实测（真机样张）：亮区均值仅降 18%，却把孤立高光
+     * （反光点、白栏杆）几乎吃光（超亮区均值 0.17→0.11），收益不足复杂度，故移除。
+     *
+     * 若将来重启：在**增益域**收缩比把降采样改成取分位安全得多 —— 后者要重写
+     * [decodeScaledBytes] 与 [RawToneMap.renderLinearLuma] 的采样路径
+     * （V2 的 16bit 精度依赖那条路径）。
+     */
+    private fun minFilter(a: FloatArray, w: Int, h: Int, r: Int) {
+        if (r <= 0) return
+        val tmp = FloatArray(a.size)
+        for (y in 0 until h) {
+            val base = y * w
+            for (x in 0 until w) {
+                var m = Float.MAX_VALUE
+                for (k in (x - r)..(x + r)) {
+                    val v = a[base + (if (k < 0) 0 else if (k >= w) w - 1 else k)]
+                    if (v < m) m = v
+                }
+                tmp[base + x] = m
+            }
+        }
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                var m = Float.MAX_VALUE
+                for (k in (y - r)..(y + r)) {
+                    val v = tmp[(if (k < 0) 0 else if (k >= h) h - 1 else k) * w + x]
+                    if (v < m) m = v
+                }
+                a[y * w + x] = m
             }
         }
     }

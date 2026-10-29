@@ -265,6 +265,63 @@
         android:textSize="13sp" />
 
     <LinearLayout
+        android:id="@+id/rowPseudoLinear"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_settings_row"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="高位深工作域"
+            android:textColor="#E8E8EA"
+            android:textSize="15sp" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/txtPseudoLinearValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="关"
+            android:textColor="#8E8E93"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="›"
+            android:textColor="#5A5A5E"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/txtPseudoLinearHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:paddingStart="32dp"
+        android:paddingEnd="32dp"
+        android:text="开 = JPG / HEIF 的影调在 16 位域运算，暗部过渡更连续\n仅在常规导出（长边 ≤4096）生效；全像素直通与 M9 超高分辨率走各自链路\n不影响 RAW、色彩风格与 EXIF（机型/参数/GPS 均保留）"
+        android:textColor="#5A5A5E"
+        android:textSize="12sp" />
+
+    <LinearLayout
         android:id="@+id/rowLeicaBadge"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

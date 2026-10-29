@@ -58,13 +58,20 @@ object LeicaEngine {
         FNN("FNN", "怀旧负片", "琥珀暖调 · 柔和褪色"),
         FPNH("FPNH", "人像负片·高", "人像高对比 · 肤色优先"),
         FACROS("FACROS", "细腻黑白", "深黑细粒 · 平滑灰阶"),
+        // K-胶片家族：同一套解析式烘焙（kodak_bake.py），65³（33³ 在 HSV 管线的
+        // min 通道角落插值误差偏大）。命名走中性化口径：速度号即型号，不出现品牌。
+        KP400("KP400", "K400", "人像奶油 · 暖柔"),
+        KG200("KG200", "K200", "金黄怀旧 · 蓝天压暗"),
+        KE100("KE100", "K100", "浓彩风光 · 锐利"),
+        KC64("KC64", "K64", "浓红反转 · 实黑"),
         // A 路线：Lab 仿射 + 逐通道节点 LUT，参数由参考图闭式解出（无训练）
         SA("SA", "Style A", "闭式拟合 · 参考图直算");
 
         companion object {
             /** 仅「assets 3D LUT 查表」单链的风格：LUT 加载失败即输出原图。 */
             private val LUT_ONLY = setOf(M4, LP9, A709, REVEAL, DUNE, LALALAND, JOKER,
-                FCHROME, FCNEG, FNN, FPNH, FACROS)
+                FCHROME, FCNEG, FNN, FPNH, FACROS,
+                KP400, KG200, KE100, KC64)
 
             /** CCD 家族（SepLUT 链路）：降级诊断走详情弹窗，其余档走 toast。 */
             private val CCD_FAMILY = setOf(M13, CCDP, CCDW)
@@ -126,6 +133,16 @@ object LeicaEngine {
                 AlexaLut.LUT_FUJI_PNH, 0.10f, 0.40f, onFallback)
             Style.FACROS -> processArriLut(app, input, Style.FACROS,
                 AlexaLut.LUT_FUJI_ACROS, 0.15f, 0.60f, onFallback)
+            // K-胶片家族：复用 ARRI 单链（assets LUT 查表 + 颗粒/暗角），
+            // 配方与 kodak_bake.py 对齐；颗粒/暗角必须与 LutBandOps.recipeOf 逐项相同
+            Style.KP400 -> processArriLut(app, input, Style.KP400,
+                AlexaLut.LUT_KODAK_400, 0.12f, 0.45f, onFallback)
+            Style.KG200 -> processArriLut(app, input, Style.KG200,
+                AlexaLut.LUT_KODAK_200, 0.20f, 0.55f, onFallback)
+            Style.KE100 -> processArriLut(app, input, Style.KE100,
+                AlexaLut.LUT_KODAK_100, 0.10f, 0.38f, onFallback)
+            Style.KC64 -> processArriLut(app, input, Style.KC64,
+                AlexaLut.LUT_KODAK_64, 0.13f, 0.50f, onFallback)
             Style.SA -> processSA(app, input, onFallback)
         }
     }

@@ -44,7 +44,21 @@ public final class MadridLegendary {
         }
     }
 
-    /** 把源 JPEG 的 APP1(Exif) 段回填到输出 JPEG 的 SOI 之后。 */
+    /**
+     * 把源 JPEG 的 APP1(Exif) 段回填到输出 JPEG 的 SOI 之后。
+     *
+     * <p><b>A1（2026-10-29）：不再搬运源图的 ICC 色彩档案。</b>全链解码都显式请求
+     * {@code inPreferredColorSpace = SRGB}（LegendaryPostProcessor.decode / ImageUtils /
+     * AlexaLut / MadridLegendary / StyleA），像素早在解码时就是 sRGB 数值；若再把源图的
+     * Display P3 ICC 原样贴回成品，就构成「sRGB 数值 + P3 标签」，做色彩管理的查看器
+     * （小米相册 / Windows 照片 / 浏览器）会把数值当 P3 坐标外扩 → 整体偏艳偏蓝，这正是
+     * v1.4.x 相比 v1.3.0「M9 更饱和失真」的根因（ICC 搬运是 10-20 P1 批次才加的，
+     * v1.3.0 没有）。现在成品不带 ICC（无标签即 sRGB 约定），与 v1.3.0 的 Skia sRGB
+     * 标签同口径。</p>
+     *
+     * <p>要改回广色域路线（A2）必须成套：先去掉所有解码处的 sRGB 请求，再恢复 ICC 搬运，
+     * 只改一边就会重现这次的色偏。</p>
+     */
     public static byte[] copyExif(byte[] srcJpeg, byte[] outJpeg) {
         if (srcJpeg.length >= 4 && outJpeg.length >= 4
                 && (srcJpeg[0] & 255) == 255 && (srcJpeg[1] & 255) == 216) {
@@ -52,7 +66,6 @@ public final class MadridLegendary {
             bos.write(outJpeg, 0, 2); // SOI
             int pos = 2;
             boolean copied = false;
-            ByteArrayOutputStream icc = null;
             while (true) {
                 if (pos + 4 > srcJpeg.length || (srcJpeg[pos] & 255) != 255) break;
                 int marker = srcJpeg[pos + 1] & 255;
@@ -65,23 +78,10 @@ public final class MadridLegendary {
                         && srcJpeg[pos + 8] == 0 && srcJpeg[pos + 9] == 0) {
                     bos.write(srcJpeg, pos, len + 2); // 只回填第一个 Exif（动态照片 MVIMG 会有第二个空壳帧 EXIF，相册读到它会导致标记失效）
                     copied = true;
-                } else if (marker == 226 && IccProfile.isIccPayload(srcJpeg, pos + 4, len - 2)) {
-                    // §22 P1：源图的 ICC 色彩档案（Display P3 等）必须跟着走，否则查看器按
-                    // sRGB 解释 P3 数值 → 红/绿方向过饱和。纯字节搬运，不改像素。
-                    if (icc == null) icc = new ByteArrayOutputStream(4096);
-                    icc.write(srcJpeg, pos, len + 2);
                 }
                 pos += len + 2;
             }
-            if (icc != null) {
-                bos.write(icc.toByteArray(), 0, icc.size());
-                // 替换语义：outJpeg 里 Skia 自带的 456 B sRGB profile 必须剔除，否则两段 ICC
-                // 并存（seq 都是 1/1）会让解码器整体放弃色彩档案。源图无 ICC 时保持原样
-                // （Skia 的 sRGB 标签对 sRGB 内容是对的）。
-                IccProfile.copyWithoutIcc(bos, outJpeg);
-            } else {
-                bos.write(outJpeg, 2, outJpeg.length - 2);
-            }
+            bos.write(outJpeg, 2, outJpeg.length - 2);
             return bos.toByteArray();
         }
         return outJpeg;

@@ -25,7 +25,8 @@ import java.util.HashMap;
  *  - lut_arrijoker.bin  : Joker 绿调阴郁（同上，33³）
  *  - lut_p9vibrant.bin  : L-P9「P9 鲜艳」色彩还原（测量式拟合）
  *  - lut_fuji_*.bin     : F-胶片家族五档（经典铬/经典负片/怀旧负片/人像负片·高/细腻黑白，
- *                         解析式烘焙，33³）</p>
+ *                         解析式烘焙，33³）
+ *  - lut_kodak_*.bin    : K-胶片家族四档（K400/K200/K100/K64，解析式烘焙，65³）</p>
  *
  * <p>自定义 LUT（运行时由 Kotlin 侧烘焙，落在 filesDir/luts/）：以 {@link #FILE_PREFIX}
  * 开头的引用读取，如 {@code "file:lut_u1729_v3.bin"}。</p>
@@ -64,6 +65,17 @@ public final class AlexaLut {
     public static final String LUT_FUJI_PNH = "lut_fuji_pnh.bin";
     /** assets 内置：F-胶片 细腻黑白（33³）。 */
     public static final String LUT_FUJI_ACROS = "lut_fuji_acros.bin";
+
+    // K-胶片家族：解析式烘焙（kodak_bake.py），65³（33³ 的插值误差在 HSV 管线的
+    // min 通道角落偏大，实测 p90 0.0040 → 0.0013），显示名同样走中性化口径
+    /** assets 内置：K-胶片 K400 人像奶油（65³）。 */
+    public static final String LUT_KODAK_400 = "lut_kodak_400.bin";
+    /** assets 内置：K-胶片 K200 金黄怀旧（65³）。 */
+    public static final String LUT_KODAK_200 = "lut_kodak_200.bin";
+    /** assets 内置：K-胶片 K100 浓彩风光（65³）。 */
+    public static final String LUT_KODAK_100 = "lut_kodak_100.bin";
+    /** assets 内置：K-胶片 K64 浓红反转（65³）。 */
+    public static final String LUT_KODAK_64 = "lut_kodak_64.bin";
 
     /** 自定义 LUT 引用前缀：{@code file:<name>} → filesDir/luts/<name>。 */
     public static final String FILE_PREFIX = "file:";

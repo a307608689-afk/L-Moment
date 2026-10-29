@@ -40,6 +40,18 @@ object RawToneMap {
     /** 预览用于统计的最大像素数（超采样后统计，直方图精度足够） */
     private const val PREVIEW_MAX_PIXELS = 2_000_000
 
+    /**
+     * 伪 RAW（JPG/HEIF）直通档。
+     *
+     * 语义：`paramsOf(3) == null` → [mapInPlace] 首行即 `return false`，**完全跳过** RAW 提亮曲线
+     * 与内嵌预览分位匹配（这两项对已成片没有意义：分位匹配的输入与目标同源，比值恒等）。
+     * 管线随后只在 16-bit 线性域套 [ToneCurve] 七档，这正是伪 RAW 想要的部分。
+     *
+     * 刻意不让 [isEnabled] 包含 3：`decodeRaw` 用它决定是否走「线性解码 + 软肩曲线」，
+     * 伪 RAW 不应把 RAW 分支带偏。
+     */
+    const val PSEUDO_LEVEL = 3
+
     /** 档位 → (Q 分位, 额外增益)。标准档返回 null，调用方应走原 thr 路径。 */
     private fun paramsOf(level: Int): FloatArray? = when (level) {
         1 -> floatArrayOf(98f, 1.0f)

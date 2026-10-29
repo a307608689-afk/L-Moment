@@ -12,6 +12,11 @@ import java.io.FileInputStream;
  * 把源 JPEG 的 APP2/{@code ICC_PROFILE} 段原样取出、原样嵌进输出容器头，<b>像素零改动</b>。</p>
  *
  * <p>纪律：任何异常/无 ICC 一律返回原样/null，调用方静默跳过——色彩档案写失败不能丢图。</p>
+ *
+ * <p><b>2026-10-29 A1 起本类没有调用点</b>：全链解码统一到 sRGB（所有解码处
+ * {@code inPreferredColorSpace = SRGB}），成品不再搬运源 ICC，见
+ * {@link MadridLegendary#copyExif}。若日后启用 A2 广色域路线，必须「去掉解码处的 sRGB
+ * 请求 + 恢复 ICC 搬运」成套执行，只改一边会重现 sRGB 数值被贴 P3 标签的过饱和。</p>
  */
 public final class IccProfile {
 

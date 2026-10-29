@@ -27,9 +27,9 @@ gradle assembleDebug
 
 ## 资产
 
-`app/src/main/assets/` 中随仓库分发的二进制共 22 个，均为本项目自产：
+`app/src/main/assets/` 中随仓库分发的二进制共 26 个，均为本项目自产：
 
-- LUT：`lut_alexa`、`lut_p9vibrant`、`lut_arri709`、`lut_arrireveal`、`lut_arridune`、`lut_arrilala`、`lut_arrijoker`，以及 F-胶片家族 `lut_fuji_acros`、`lut_fuji_chrome`、`lut_fuji_cneg`、`lut_fuji_nn`、`lut_fuji_pnh`
+- LUT：`lut_alexa`、`lut_p9vibrant`、`lut_arri709`、`lut_arrireveal`、`lut_arridune`、`lut_arrilala`、`lut_arrijoker`，F-胶片家族 `lut_fuji_acros`、`lut_fuji_chrome`、`lut_fuji_cneg`、`lut_fuji_nn`、`lut_fuji_pnh`，以及 K-胶片家族 `lut_kodak_400`、`lut_kodak_200`、`lut_kodak_100`、`lut_kodak_64`
 - 风格参数表：`styleA_s0` ~ `styleA_s5`
 - 蒸馏/网络模型：`m9_distill.onnx`、`lm9_net.onnx`，以及模型色彩两段网络 `m7_stage1.onnx`、`m7_stage2.onnx`
 
