@@ -1,5 +1,8 @@
 package com.codex.leicaapp;
 
+import android.os.Build;
+import android.util.Log;
+
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -37,27 +40,27 @@ public final class LeicaMark {
             "{\"mirror\":false,\"sensorType\":\"rear\",\"Hdr\":\"off\",\"OpMode\":0,"
                     + "\"smallPicture\":false,\"AIScene\":0,\"filterId\":66048,"
                     + "\"zoomMultiple\":4.300000190734863}";
-    // 0x889E XiaomiAuxiliaryInfo 的格式约定值
-    private static final String XIAOMI_AUX_LEICA =
-            "{\"buildDevice\":\"xuanyuan\",\"customize\":\"\",\"cvLensName\":\"\","
-                    + "\"deviceType\":1,\"filterName\":\"??\",\"livephotoInfo\":\"\","
-                    + "\"series\":\"\",\"variant\":\"\",\"version\":4,"
-                    + "\"waterLogo\":\"XIAOMI\",\"waterName\":\"15 Ultra\"}";
+    /**
+     * 设备标识写入档位（由导出调用方按设置传入）：
+     * <ul>
+     *   <li>{@link #MODE_SOURCE}：跟随源图 EXIF 的真实机型（默认）；</li>
+     *   <li>{@link #MODE_FIXED_LEICA}：固定写 Xiaomi 15 Ultra（历史行为，兼容相册徽章判定）；</li>
+     *   <li>{@link #MODE_LOCAL}：写当前手机型号（{@link Build}）。</li>
+     * </ul>
+     *
+     * <p>只影响展示型字段（FFE4 的 10f/110/9a00/889e.waterName 与 EXIF 0x889E.waterName）；
+     * 徽章指纹字段（889d/88b0/a661/filterId/buildDevice/889f）一律保持格式约定值——
+     * 相册归类依赖它们，机型字段是否参与判定尚未验证，故改动面收到最小。</p>
+     */
+    public static final int MODE_SOURCE = 0;
+    public static final int MODE_FIXED_LEICA = 1;
+    public static final int MODE_LOCAL = 2;
 
-    // XIAOMI_CUSTOMIZE JSON（14 字段，含设备标识）× 格式约定值
-    private static final String CUSTOMIZE_JSON =
-            "{\"8895\":\"0\",\"10f\":\"Xiaomi\",\"88a3\":\"{}\",\"version\":\"32\","
-                    + "\"110\":\"Xiaomi 15 Ultra\",\"889d\":\"Madrid\",\"889a\":\"0\","
-                    + "\"9a00\":\"Xiaomi 15 Ultra\",\"9aaa\":\"\",\"88b0\":\"1\","
-                    + "\"889e\":\"{\\\"buildDevice\\\":\\\"xuanyuan\\\",\\\"customize\\\":\\\"\\\","
-                    + "\\\"cvLensName\\\":\\\"\\\",\\\"deviceType\\\":1,\\\"filterName\\\":\\\"??\\\","
-                    + "\\\"livephotoInfo\\\":\\\"\\\",\\\"series\\\":\\\"\\\",\\\"variant\\\":\\\"\\\","
-                    + "\\\"version\\\":4,\\\"waterLogo\\\":\\\"XIAOMI\\\",\\\"waterName\\\":\\\"15 Ultra\\\"}\","
-                    + "\"889f\":\"???\","
-                    + "\"9999\":\"{\\\"mirror\\\":false,\\\"sensorType\\\":\\\"rear\\\",\\\"Hdr\\\":\\\"off\\\","
-                    + "\\\"OpMode\\\":0,\\\"smallPicture\\\":false,\\\"AIScene\\\":0,"
-                    + "\\\"filterId\\\":66048,\\\"zoomMultiple\\\":1}\","
-                    + "\"a661\":\"256\"}";
+    private static final String TAG = "LeicaMark";
+
+    /** 固定档机型，也是解析全部失败时的最后兜底（与历史版本逐字节一致）。 */
+    private static final String FALLBACK_MAKE = "Xiaomi";
+    private static final String FALLBACK_MODEL = "Xiaomi 15 Ultra";
 
     private LeicaMark() {
     }
@@ -78,6 +81,15 @@ public final class LeicaMark {
      * <p>任何异常返回原字节。</p>
      */
     public static byte[] mark(byte[] jpeg, boolean badge) {
+        return mark(jpeg, badge, MODE_SOURCE);
+    }
+
+    /**
+     * 带设备标识档位的完整入口。
+     *
+     * @param deviceMode {@link #MODE_SOURCE} / {@link #MODE_FIXED_LEICA} / {@link #MODE_LOCAL}
+     */
+    public static byte[] mark(byte[] jpeg, boolean badge, int deviceMode) {
         if (jpeg == null || jpeg.length < 4
                 || (jpeg[0] & 0xFF) != 0xFF || (jpeg[1] & 0xFF) != 0xD8) {
             return jpeg;
@@ -88,9 +100,13 @@ public final class LeicaMark {
             // 2) 删除多余的 FFE1 Exif 段（动态照片嵌入帧空壳）
             byte[] cleaned = stripCompositeMeta(stripExtraExif(jpeg));
             if (!badge) {
+                // 不写徽章 → 也不需要设备标识（省一次 APP1 解析）
                 return stripBadge(cleaned);
             }
-            return markCustomize(markExif(cleaned));
+            DeviceIdentity id = resolveIdentity(cleaned, deviceMode);
+            Log.i(TAG, "device mode=" + modeName(deviceMode) + " origin=" + id.origin
+                    + " make=" + id.make + " model=" + id.model);
+            return markCustomize(markExif(cleaned, id), id);
         } catch (Throwable t) {
             return jpeg;
         }
@@ -247,7 +263,7 @@ public final class LeicaMark {
 
     // ---- EXIF APP1 ----
 
-    private static byte[] markExif(byte[] jpeg) {
+    private static byte[] markExif(byte[] jpeg, DeviceIdentity id) {
         int pos = 2;
         int app1DataStart = -1;
         int app1DataLen = 0;
@@ -272,7 +288,8 @@ public final class LeicaMark {
 
         ByteArrayOutputStream bos = new ByteArrayOutputStream(jpeg.length + 64);
         if (app1DataStart < 0) {
-            byte[] minimal = minimalExifPayload();
+            // 源图完全没有 EXIF（截图/转存图）：自建模板，机型用真实 identity 而非固定 15 Ultra
+            byte[] minimal = minimalExifPayload(id);
             int len = minimal.length + 2;
             bos.write(jpeg, 0, 2);
             bos.write(0xFF);
@@ -285,10 +302,13 @@ public final class LeicaMark {
         }
 
         byte[] payload = Arrays.copyOfRange(jpeg, app1DataStart, app1DataStart + app1DataLen);
-        byte[] marked = writeTags(payload);
+        byte[] marked = writeTags(payload, id);
         if (marked == null || !verifyTags(marked)) {
-            // 源 EXIF 结构异常（重建后解析不出标记）→ 回退自建完整模板
-            marked = minimalExifPayload();
+            // 源 EXIF 里加不进徽章 tag（结构变体）：**不再整段替换成模板**——那会把源机型、
+            // 快门/ISO、GPS 一并抹掉，正是「任何手机导出的机型都变 Xiaomi 15 Ultra」的成因之一。
+            // 这里保留源 APP1 原样，徽章由随后的 FFE4 XIAOMI_CUSTOMIZE 段承担。
+            Log.w(TAG, "EXIF 徽章 tag 写入失败（源结构异常），保留源 EXIF 不替换模板");
+            return jpeg;
         }
         int len = marked.length + 2;
         if (len > 0xFFFF) return jpeg;
@@ -305,9 +325,9 @@ public final class LeicaMark {
 
     // ---- FFE4 XIAOMI_CUSTOMIZE ----
 
-    private static byte[] markCustomize(byte[] jpeg) {
-        // 构造 FFE4 段：FF E4 + len + magic + json
-        byte[] jsonBytes = CUSTOMIZE_JSON.getBytes(StandardCharsets.UTF_8);
+    private static byte[] markCustomize(byte[] jpeg, DeviceIdentity id) {
+        // 构造 FFE4 段：FF E4 + len + magic + json（机型字段随 identity，其余为格式约定值）
+        byte[] jsonBytes = buildCustomizeJson(id).getBytes(StandardCharsets.UTF_8);
         int payloadLen = CUSTOMIZE_MAGIC.length + jsonBytes.length;
         int segLen = payloadLen + 2;
         byte[] seg = new byte[segLen + 2];
@@ -419,38 +439,107 @@ public final class LeicaMark {
 
     // ---- EXIF tag 写入 ----
 
-    private static byte[] writeTags(byte[] data) {
-        if (data.length < 14) return data;
+    private static byte[] writeTags(byte[] data, DeviceIdentity id) {
+        if (data.length < 14) return null;
         boolean le = data[6] == 'I' && data[7] == 'I';
-        if (!le && !(data[6] == 'M' && data[7] == 'M')) return data;
+        if (!le && !(data[6] == 'M' && data[7] == 'M')) return null;
         long ifd0 = integer(data, 10, 4, le) + 6L;
-        if (ifd0 < 14L || ifd0 > data.length - 2L) return data;
+        if (ifd0 < 14L || ifd0 > data.length - 2L) return null;
         int count = (int) integer(data, (int) ifd0, 2, le);
+        if (count < 0 || ifd0 + 6L + (long) count * 12L > data.length) return null;
         for (int i = 0; i < count; i++) {
-            long p = ifd0 + 2L + i * 12L;
-            if (p > data.length - 12L) break;
-            int e = (int) p;
-            if (integer(data, e, 2, le) == TAG_EXIF_IFD_POINTER
-                    && integer(data, e + 2, 2, le) == 4L
-                    && integer(data, e + 4, 4, le) == 1L) {
-                int exifIfd = (int) (integer(data, e + 8, 4, le) + 6L);
-                if (exifIfd < 14 || exifIfd > data.length - 4) return null;
-                // 删除动态照片标记 tag（0x8897=1）：处理链只保留主 EXIF 不保留容器元数据，
-                // 残留的动态标记会让相册按复合照片路径判定而忽略相机标记
-                removeEntryInPlace(data, le, exifIfd, 0x8897);
-                removeEntryInPlace(data, le, (int) ifd0, 0x8897);
-                byte[] afterExif = writeInExifIfd(data, le, e, exifIfd);
-                // 把设备拍摄模式记录（XiaomiComment/AuxiliaryInfo）替换为目标值：
-                // 相册徽章判定读 EXIF 本体的 filterId，普通图的 filterId 会导致判定失败
-                // （华为等外来图没有这些 tag → 无操作，走宽松判定 → 有徽章）
-                afterExif = writeReplaceAscii(afterExif, le, exifIfd, 0x9999, XIAOMI_COMMENT_LEICA);
-                afterExif = writeReplaceAscii(afterExif, le, exifIfd, 0x889E, XIAOMI_AUX_LEICA);
-                byte[] afterIfd0 = writeInIfd0(afterExif, le);
-                long ifd0b = integer(afterIfd0, 10, 4, le) + 6L;
-                return writeReplaceAscii(afterIfd0, le, (int) ifd0b, 0x9999, XIAOMI_COMMENT_LEICA);
-            }
+            int e = (int) (ifd0 + 2L + i * 12L);
+            if (integer(data, e, 2, le) != TAG_EXIF_IFD_POINTER) continue;
+            int exifIfd = (int) (integer(data, e + 8, 4, le) + 6L);
+            if (exifIfd < 14 || exifIfd > data.length - 4) break; // 指针越界 → 走补建
+            // 源图把指针写成 SHORT/非法 count 时（部分厂商变体），就地修正为标准 LONG×1，
+            // 否则后续严格解析器会跳过它，等于没有 ExifIFD。
+            if (integer(data, e + 2, 2, le) != 4L) writeInt(data, e + 2, 4L, 2, le);
+            if (integer(data, e + 4, 4, le) != 1L) writeInt(data, e + 4, 1L, 4, le);
+            // 删除动态照片标记 tag（0x8897=1）：处理链只保留主 EXIF 不保留容器元数据，
+            // 残留的动态标记会让相册按复合照片路径判定而忽略相机标记
+            removeEntryInPlace(data, le, exifIfd, 0x8897);
+            removeEntryInPlace(data, le, (int) ifd0, 0x8897);
+            byte[] afterExif = writeInExifIfd(data, le, e, exifIfd);
+            // 把设备拍摄模式记录（XiaomiComment/AuxiliaryInfo）替换为目标值：
+            // 相册徽章判定读 EXIF 本体的 filterId，普通图的 filterId 会导致判定失败
+            // （华为等外来图没有这些 tag → 无操作，走宽松判定 → 有徽章）
+            afterExif = writeReplaceAscii(afterExif, le, exifIfd, 0x9999, XIAOMI_COMMENT_LEICA);
+            afterExif = writeReplaceAscii(afterExif, le, exifIfd, 0x889E, buildAuxJson(id));
+            byte[] afterIfd0 = writeInIfd0(afterExif, le);
+            long ifd0b = integer(afterIfd0, 10, 4, le) + 6L;
+            return writeReplaceAscii(afterIfd0, le, (int) ifd0b, 0x9999, XIAOMI_COMMENT_LEICA);
         }
-        return null;
+        // IFD0 里没有可用的 ExifIFD 指针（外来机型的结构变体）：补建一个后重试，
+        // 而不是返回 null 让上层把整段源 EXIF 换成模板。
+        byte[] rebuilt = ensureExifIfdPointer(data, le);
+        if (rebuilt == data) return null;
+        return writeTags(rebuilt, id);
+    }
+
+    /**
+     * 给 IFD0 补建 ExifIFD 指针 + 一个只含徽章三 tag 的新 ExifIFD。
+     *
+     * <p>手法与 {@link #writeInIfd0} 一致：把 IFD0 表整体搬到 payload 末尾（避免原地插入
+     * 破坏后面所有数据的相对偏移），更新 TIFF 头的 IFD0 offset，新 ExifIFD 紧跟其表尾。
+     * 原 IFD0 的 next-IFD 指针（缩略图 IFD1）原样保留。</p>
+     *
+     * @return 重建后的 payload；无法重建时返回原数组（调用方据此判定失败）
+     */
+    private static byte[] ensureExifIfdPointer(byte[] data, boolean le) {
+        try {
+            int ifd0 = (int) integer(data, 10, 4, le) + 6;
+            if (ifd0 < 14 || ifd0 > data.length - 2) return data;
+            int count = (int) integer(data, ifd0, 2, le);
+            if (count < 0 || ifd0 + 6L + (long) count * 12L > data.length) return data;
+
+            int base = (data.length + 1) & ~1;
+            int newCount = count + 1;
+            // 绝对索引：count(2) + newCount 条 entry(12) + next-IFD 指针(4)
+            int exifOff = base + 6 + newCount * 12;
+            int dataOff = exifOff + 2 + 3 * 12 + 4;
+            long total = (long) dataOff + 8; // "Madrid\0" 7 字节 + 1 对齐
+            if (total > 65533L) return data;
+
+            byte[] out = Arrays.copyOf(data, (int) total);
+            writeInt(out, 10, base - 6L, 4, le);
+            writeInt(out, base, newCount, 2, le);
+            int w = base + 2;
+            boolean ptrWritten = false;
+            for (int i = 0; i < count; i++) {
+                int e = ifd0 + 2 + i * 12;
+                int tag = (int) integer(data, e, 2, le);
+                if (tag == TAG_EXIF_IFD_POINTER) continue; // 旧指针已损坏，丢弃
+                if (!ptrWritten && TAG_EXIF_IFD_POINTER < tag) {
+                    w = writeExifIfdPointer(out, w, le, exifOff);
+                    ptrWritten = true;
+                }
+                System.arraycopy(data, e, out, w, 12);
+                w += 12;
+            }
+            if (!ptrWritten) w = writeExifIfdPointer(out, w, le, exifOff);
+            System.arraycopy(data, ifd0 + 2 + count * 12, out, w, 4);
+
+            int e2 = exifOff;
+            out[e2] = 3;
+            int ew = e2 + 2;
+            ew = writeTheme(out, ew, le, dataOff);
+            ew = writeLegend(out, ew, le);
+            ew = writeMode(out, ew, le);
+            writeInt(out, ew, 0, 4, le);
+            Log.i(TAG, "源 EXIF 缺 ExifIFD 指针，已补建（保留原 IFD0 条目 " + count + " 条）");
+            return out;
+        } catch (Throwable t) {
+            return data;
+        }
+    }
+
+    private static int writeExifIfdPointer(byte[] b, int off, boolean le, int exifOff) {
+        writeInt(b, off, TAG_EXIF_IFD_POINTER, 2, le);
+        writeInt(b, off + 2, 4L, 2, le);
+        writeInt(b, off + 4, 1L, 4, le);
+        writeInt(b, off + 8, exifOff - 6L, 4, le);
+        return off + 12;
     }
 
     /** IFD0 确保 themeCustomize="Madrid"（样张在 IFD0 与 ExifIFD 各有一处，相册可能读 IFD0 的）。 */
@@ -591,9 +680,10 @@ public final class LeicaMark {
      * IFD0{Make, Model, themeCustomize="Madrid", →ExifIFD}
      * ExifIFD{themeCustomize="Madrid", legendmode=1, mode="256"}
      */
-    private static byte[] minimalExifPayload() {
-        byte[] make = asciiZ("Xiaomi");
-        byte[] model = asciiZ("Xiaomi 15 Ultra");
+    private static byte[] minimalExifPayload(DeviceIdentity id) {
+        // 机型来自 identity（源图 → 本机 → 兜底），不再固定冒充 Xiaomi 15 Ultra
+        byte[] make = asciiZ(id.make);
+        byte[] model = asciiZ(id.model);
         byte[] madrid = asciiZ("Madrid");
 
         final int ifd0Off = 8;
@@ -757,7 +847,7 @@ public final class LeicaMark {
      * @param iccBlocks 源图的 APP2/ICC_PROFILE 段（含段头，可能多段）；null/空 = 不处理
      */
     public static boolean markFile(File file, byte[] iccBlocks) {
-        return markFileImpl(file, iccBlocks, true);
+        return markFileImpl(file, iccBlocks, true, MODE_SOURCE);
     }
 
     /**
@@ -767,10 +857,15 @@ public final class LeicaMark {
      * @return 是否处理成功（失败时原文件保持不变）
      */
     public static boolean markFile(File file, byte[] iccBlocks, boolean badge) {
-        return markFileImpl(file, iccBlocks, badge);
+        return markFileImpl(file, iccBlocks, badge, MODE_SOURCE);
     }
 
-    private static boolean markFileImpl(File file, byte[] iccBlocks, boolean badge) {
+    /** 带设备标识档位的文件级入口（200MP 直通用）。 */
+    public static boolean markFile(File file, byte[] iccBlocks, boolean badge, int deviceMode) {
+        return markFileImpl(file, iccBlocks, badge, deviceMode);
+    }
+
+    private static boolean markFileImpl(File file, byte[] iccBlocks, boolean badge, int deviceMode) {
         if (file == null || !file.isFile() || file.length() < 4) return false;
         File tmp = null;
         RandomAccessFile in = null;
@@ -778,7 +873,7 @@ public final class LeicaMark {
         try {
             byte[] header = readHeader(file);
             if (header == null) return false;
-            byte[] marked = mark(header, badge);
+            byte[] marked = mark(header, badge, deviceMode);
             if (marked == null || marked.length < 4) return false;
             if (iccBlocks != null && iccBlocks.length > 0) {
                 marked = IccProfile.embed(marked, iccBlocks);
@@ -885,5 +980,226 @@ public final class LeicaMark {
             p = end;
         }
         return null;
+    }
+
+    // ---- 设备标识解析（导出机型跟随源图，2026-11-02）----
+
+    /**
+     * 一次导出解析出的设备标识。
+     *
+     * <p>{@code origin} 只用于日志定位：{@code source}=源图 EXIF、{@code build}=本机、
+     * {@code fixed}=固定档、{@code fallback}=全部失败的历史兜底值。</p>
+     */
+    private static final class DeviceIdentity {
+        final String make;
+        final String model;
+        final String waterName;
+        final String origin;
+
+        DeviceIdentity(String make, String model, String origin) {
+            this.make = sanitizeAscii(make);
+            this.model = sanitizeAscii(model);
+            this.waterName = deriveWaterName(this.make, this.model);
+            this.origin = origin;
+        }
+    }
+
+    /**
+     * 按档位解析设备标识。
+     *
+     * <p>源图档的回落顺序：源 EXIF IFD0 的 Make/Model → 本机 {@link Build} → 历史兜底值。
+     * 只要源图能读出 Model，就绝不使用本机/固定值（这正是"别的手机拍的图被写成 15 Ultra"的修复点）。</p>
+     */
+    private static DeviceIdentity resolveIdentity(byte[] jpeg, int mode) {
+        if (mode == MODE_FIXED_LEICA) {
+            return new DeviceIdentity(FALLBACK_MAKE, FALLBACK_MODEL, "fixed");
+        }
+        if (mode == MODE_LOCAL) {
+            DeviceIdentity local = localIdentity();
+            return local != null ? local : fallbackIdentity();
+        }
+        DeviceIdentity src = sourceIdentity(jpeg);
+        if (src != null) return src;
+        DeviceIdentity local = localIdentity();
+        return local != null ? local : fallbackIdentity();
+    }
+
+    private static DeviceIdentity fallbackIdentity() {
+        return new DeviceIdentity(FALLBACK_MAKE, FALLBACK_MODEL, "fallback");
+    }
+
+    private static DeviceIdentity localIdentity() {
+        try {
+            String man = Build.MANUFACTURER == null ? "" : Build.MANUFACTURER.trim();
+            String model = Build.MODEL == null ? "" : Build.MODEL.trim();
+            if (model.isEmpty()) return null;
+            if (man.isEmpty()) man = firstToken(model);
+            return new DeviceIdentity(man, model, "build");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 从 JPEG 的第一个 APP1 Exif 的 IFD0 读 Make/Model；读不到返回 null。 */
+    private static DeviceIdentity sourceIdentity(byte[] jpeg) {
+        try {
+            int dataOff = findExifPayloadStart(jpeg);
+            if (dataOff < 0) return null;
+            int tiff = dataOff + 6;
+            if (tiff + 8 > jpeg.length) return null;
+            boolean le = jpeg[tiff] == 'I' && jpeg[tiff + 1] == 'I';
+            if (!le && !(jpeg[tiff] == 'M' && jpeg[tiff + 1] == 'M')) return null;
+            int ifd0 = tiff + (int) integer(jpeg, tiff + 4, 4, le);
+            if (ifd0 < tiff + 8 || ifd0 + 2 > jpeg.length) return null;
+            int count = (int) integer(jpeg, ifd0, 2, le);
+            if (count < 0 || ifd0 + 6L + (long) count * 12L > jpeg.length) return null;
+
+            String make = null;
+            String model = null;
+            for (int i = 0; i < count; i++) {
+                int e = ifd0 + 2 + i * 12;
+                int tag = (int) integer(jpeg, e, 2, le);
+                if (tag != 0x010F && tag != 0x0110) continue;
+                String v = readAsciiValue(jpeg, e, tiff, le);
+                if (v == null || v.isEmpty()) continue;
+                if (tag == 0x010F) make = v;
+                else model = v;
+            }
+            if (model == null || model.isEmpty()) return null;
+            if (make == null || make.isEmpty()) make = firstToken(model);
+            DeviceIdentity id = new DeviceIdentity(make, model, "source");
+            return id.model.isEmpty() ? null : id;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 定位第一个 APP1 "Exif\0\0" 段的数据起点（指向 "Exif" 的 'E'）。 */
+    private static int findExifPayloadStart(byte[] jpeg) {
+        if (jpeg == null || jpeg.length < 4) return -1;
+        int pos = 2;
+        while (pos + 4 <= jpeg.length && (jpeg[pos] & 0xFF) == 0xFF) {
+            int marker = jpeg[pos + 1] & 0xFF;
+            if (marker == 0xDA || marker == 0xD9) break;
+            if (marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) { pos += 2; continue; }
+            int segLen = ((jpeg[pos + 2] & 0xFF) << 8) | (jpeg[pos + 3] & 0xFF);
+            if (segLen < 2 || pos + 2 + segLen > jpeg.length) break;
+            if (marker == 0xE1 && segLen >= 10
+                    && jpeg[pos + 4] == 'E' && jpeg[pos + 5] == 'x'
+                    && jpeg[pos + 6] == 'i' && jpeg[pos + 7] == 'f'
+                    && jpeg[pos + 8] == 0 && jpeg[pos + 9] == 0) {
+                return pos + 4;
+            }
+            pos += 2 + segLen;
+        }
+        return -1;
+    }
+
+    /** 读一条 ASCII/UNDEFINED 类型的 IFD 条目值（≤4 字节内联，否则相对 TIFF 头取偏移）。 */
+    private static String readAsciiValue(byte[] b, int entry, int tiff, boolean le) {
+        try {
+            int type = (int) integer(b, entry + 2, 2, le);
+            long cnt = integer(b, entry + 4, 4, le);
+            if (cnt <= 0 || cnt > 512) return null;
+            if (type != 2 && type != 7) return null;
+            int size = (int) cnt;
+            int off = size <= 4 ? entry + 8 : tiff + (int) integer(b, entry + 8, 4, le);
+            if (off < 0 || off + size > b.length) return null;
+            int end = off;
+            while (end < off + size && b[end] != 0) end++;
+            return new String(b, off, end - off, StandardCharsets.ISO_8859_1).trim();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String firstToken(String s) {
+        if (s == null) return "";
+        int sp = s.indexOf(' ');
+        return sp > 0 ? s.substring(0, sp) : s;
+    }
+
+    /**
+     * 水印名：机型去掉厂商前缀（"Xiaomi 15 Ultra" → "15 Ultra"）。
+     *
+     * <p>与历史常量一致（waterName="15 Ultra"）；去掉前缀失败时回落到完整机型，
+     * 保证非小米图不会出现"Xiaomi iPhone 15 Pro"这类拼接。</p>
+     */
+    private static String deriveWaterName(String make, String model) {
+        if (model == null || model.isEmpty()) return "";
+        if (make != null && !make.isEmpty() && model.length() > make.length()
+                && model.regionMatches(true, 0, make, 0, make.length())) {
+            String rest = model.substring(make.length()).trim();
+            if (!rest.isEmpty()) return rest;
+        }
+        return model;
+    }
+
+    /** EXIF ASCII 只能承载可打印 ASCII：其余替换为 '?'，避免写入非法字节。 */
+    private static String sanitizeAscii(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            sb.append(c >= 32 && c <= 126 ? c : '?');
+        }
+        return sb.toString().trim();
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 0x889E XiaomiAuxiliaryInfo：只有 waterName 随机型，其余为格式约定值。 */
+    private static String buildAuxJson(DeviceIdentity id) {
+        return "{\"buildDevice\":\"xuanyuan\",\"customize\":\"\",\"cvLensName\":\"\","
+                + "\"deviceType\":1,\"filterName\":\"??\",\"livephotoInfo\":\"\","
+                + "\"series\":\"\",\"variant\":\"\",\"version\":4,"
+                + "\"waterLogo\":\"XIAOMI\",\"waterName\":\"" + jsonEscape(id.waterName) + "\"}";
+    }
+
+    /**
+     * FFE4 XIAOMI_CUSTOMIZE 的 JSON。
+     *
+     * <p>只把设备展示字段（10f/110/9a00 与内嵌 889e.waterName）替换为 identity；
+     * 徽章指纹（889d/889a/88b0/889f/9999.filterId/a661）逐字符保持格式约定值。</p>
+     *
+     * <p>默认 identity（Xiaomi / Xiaomi 15 Ultra）下，输出与历史常量完全一致。</p>
+     */
+    private static String buildCustomizeJson(DeviceIdentity id) {
+        String aux = jsonEscape(buildAuxJson(id));
+        return "{\"8895\":\"0\",\"10f\":\"" + jsonEscape(id.make)
+                + "\",\"88a3\":\"{}\",\"version\":\"32\","
+                + "\"110\":\"" + jsonEscape(id.model) + "\",\"889d\":\"Madrid\",\"889a\":\"0\","
+                + "\"9a00\":\"" + jsonEscape(id.model) + "\",\"9aaa\":\"\",\"88b0\":\"1\","
+                + "\"889e\":\"" + aux + "\","
+                + "\"889f\":\"???\","
+                + "\"9999\":\"{\\\"mirror\\\":false,\\\"sensorType\\\":\\\"rear\\\",\\\"Hdr\\\":\\\"off\\\","
+                + "\\\"OpMode\\\":0,\\\"smallPicture\\\":false,\\\"AIScene\\\":0,"
+                + "\\\"filterId\\\":66048,\\\"zoomMultiple\\\":1}\","
+                + "\"a661\":\"256\"}";
+    }
+
+    private static String modeName(int mode) {
+        switch (mode) {
+            case MODE_FIXED_LEICA: return "fixed";
+            case MODE_LOCAL: return "local";
+            default: return "source";
+        }
     }
 }

@@ -44,6 +44,15 @@ object LeicaEngine {
         DUNE("DUNE", "Dune", "沙漠哑光 · 冷蓝砂橙"),
         LALALAND("LALALAND", "LaLaLand", "黄昏绚丽 · 霓虹饱和"),
         JOKER("JOKER", "Joker", "绿调阴郁 · 低饱和"),
+        // H 色彩家族：HNCS 式自然还原，LUT 查表 + 极轻颗粒/暗角（hassel_bake.py 解析式烘焙）
+        HN("HN", "H·自然", "自然还原 · 通透"),
+        HB("HB", "H·蓝", "天空深青 · 层次"),
+        HG("HG", "H·绿", "橄榄绿植 · 不荧光"),
+        HP("HP", "H·人像", "肤色金黄 · 柔调"),
+        HW("HW", "H·暖阳", "黄昏金调 · 浓郁"),
+        HS("HS", "H·灰", "低饱和 · 高级灰"),
+        HM("HM", "H·黑白", "平滑灰阶 · 干净"),
+        HC("HC", "H·冷调", "青灰冷调 · 通透"),
         M13("M13", "CCD·冷白", "冷白胶片"),
         // CCD 家族：同一条 SepLUT 链路，差异只在 PortraitFilm.Profile（粉/暖为初值，待真机迭代）
         CCDP("CCDP", "CCD·粉", "粉白通透"),
@@ -71,7 +80,8 @@ object LeicaEngine {
             /** 仅「assets 3D LUT 查表」单链的风格：LUT 加载失败即输出原图。 */
             private val LUT_ONLY = setOf(M4, LP9, A709, REVEAL, DUNE, LALALAND, JOKER,
                 FCHROME, FCNEG, FNN, FPNH, FACROS,
-                KP400, KG200, KE100, KC64)
+                KP400, KG200, KE100, KC64,
+                HN, HB, HG, HP, HW, HS, HM, HC)
 
             /** CCD 家族（SepLUT 链路）：降级诊断走详情弹窗，其余档走 toast。 */
             private val CCD_FAMILY = setOf(M13, CCDP, CCDW)
@@ -115,6 +125,24 @@ object LeicaEngine {
             Style.DUNE -> processDune(app, input, onFallback)
             Style.LALALAND -> processLaLaLand(app, input, onFallback)
             Style.JOKER -> processJoker(app, input, onFallback)
+            // H 色彩家族：复用 ARRI 单链（assets LUT 查表 + 极轻颗粒/暗角），
+            // 颗粒/暗角必须与 LutBandOps.recipeOf 逐项相同
+            Style.HN -> processArriLut(app, input, Style.HN,
+                AlexaLut.LUT_HASSEL_HN, 0.09f, 0.45f, onFallback)
+            Style.HB -> processArriLut(app, input, Style.HB,
+                AlexaLut.LUT_HASSEL_HB, 0.08f, 0.55f, onFallback)
+            Style.HG -> processArriLut(app, input, Style.HG,
+                AlexaLut.LUT_HASSEL_HG, 0.10f, 0.45f, onFallback)
+            Style.HP -> processArriLut(app, input, Style.HP,
+                AlexaLut.LUT_HASSEL_HP, 0.07f, 0.40f, onFallback)
+            Style.HW -> processArriLut(app, input, Style.HW,
+                AlexaLut.LUT_HASSEL_HW, 0.14f, 0.70f, onFallback)
+            Style.HS -> processArriLut(app, input, Style.HS,
+                AlexaLut.LUT_HASSEL_HS, 0.14f, 0.40f, onFallback)
+            Style.HM -> processArriLut(app, input, Style.HM,
+                AlexaLut.LUT_HASSEL_HM, 0.14f, 0.50f, onFallback)
+            Style.HC -> processArriLut(app, input, Style.HC,
+                AlexaLut.LUT_HASSEL_HC, 0.07f, 0.38f, onFallback)
             // CCD 家族三档：同一条 SepLUT 链路，差异只在 PortraitFilm.Profile
             Style.M13 -> processCcd(app, input, PortraitFilm.Profile.COOL, onFallback)
             Style.CCDP -> processCcd(app, input, PortraitFilm.Profile.PINK, onFallback)
@@ -527,11 +555,19 @@ object LeicaEngine {
     }
 
     /**
-     * L-M9「一瞬 M9」：M9Net 蒸馏微网（1.16MB int8；512 分块 + 64px 羽化重叠，全分辨率直出）。
+     * L-M9「一瞬 M9」：主路径 = Lm9Stats 统计对齐链（三区域软权重 + 三档 1D 曲线，
+     * PC 对拍台 lm9v2_work/m2/stats_ref.py）；次路径 = Lm9Net 蒸馏微网（1.12MB int8，
+     * 512 分块 + 64px 羽化重叠）；两条都不可用才回落 M9 正常链。
      *
-     * 取代旧的「65³ LUT + Lm9Post 局部算子」链——旧链形态错了：LUT 逐像素同映射，表达不了真机
-     * M9 的 lux/CCT 条件化与空间自适应，只能靠手搓天空/肤色掩码补丁去凑，补丁互相打架。
-     * 现链：监督来自离线真机管线（offlinem9_ref）的双档成对渲染，微网只学风格层那一段。
+     * 历史：更早的「65³ LUT + Lm9Post 局部算子」链已废弃——LUT 逐像素同映射，
+     * 表达不了 M9 的 lux/CCT 条件化与空间自适应，只能靠手搓天空/肤色掩码补丁去凑。
+     *
+     * v16 起统计链带两层护栏（治灰白薄雾/云的絮状硬边色块）：
+     *   1) 中性亮部归天空（NEUTRAL_ENABLED）：低饱和 + 中高亮的雾/云/白墙权重恒 1.0，
+     *      不再被 other 档压暗 24~28%，分类方差归零；
+     *   2) 权重场空间化（FIELD_ENABLED）：权重在探测图上算后高斯平滑再上采样，
+     *      逐像素项只占 25%，消除类内噪声驱动的摆动。
+     * 旧 skyDomain 单等效曲线补丁已停用（SKY_DOMAIN_ENABLED=false）。
      *
      * 无暗角无颗粒（M9 直出干净）。失败（OOM/资产缺失/推理异常）→ 回落 M9 正常链并提醒用户。
      */

@@ -15,7 +15,6 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
@@ -42,6 +41,8 @@ import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -55,11 +56,16 @@ import com.codex.leicaapp.MadridLegendary
 import com.codex.leicaapp.StyleA
 import com.codex.leicaapp.StyleAFit
 import com.leicamoments.app.AdaptiveColorNet.toMono
+import android.view.ViewGroup
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), AiUiHost {
 
     private companion object {
         /** 增强预览注册的内存产物（不落盘），弹窗关闭时释放。 */
@@ -90,6 +96,15 @@ class MainActivity : AppCompatActivity() {
          * V1 猜测式）。约 3.1MP / 6.3MB。
          */
         private const val RAW_LUMA_MAX_DIM = 2048
+
+        /**
+         * 单批导入上限。
+         *
+         * 不是系统限制（Photo Picker 允许更多），而是内存/磁盘预算：热数据 LRU 3 之外
+         * 的图只留 uri，但 50MP/200MP 的直通源是 cache 文件（20~90MB/张），30 张已接近
+         * 1~2GB，再多就该提示用户分两批了。
+         */
+        const val MAX_BATCH = 30
     }
 
     private lateinit var imgPreview: ZoomableImageView
@@ -114,6 +129,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var imgTitleArrow: ImageView
     private lateinit var btnSettings: TextView
     private lateinit var txtCoach: TextView
+    // 批量切换 UI（单张导入时全部 gone）
+    private lateinit var btnPrev: ImageView
+    private lateinit var btnNext: ImageView
+    private lateinit var txtBatchIndex: TextView
+    // 批量导出进度浮层（底板复用大图导出浮层）
+    private lateinit var batchOverlay: View
+    private lateinit var batchRing: com.google.android.material.progressindicator.CircularProgressIndicator
+    private lateinit var batchMain: TextView
+    private lateinit var batchSub: TextView
+    private lateinit var btnBatchStop: TextView
     private lateinit var filterScroll: HorizontalScrollView
     private var sourceUri: Uri? = null                 // 导入源（完美档 RAW 完整管线需重读 DNG）
     private var sourceIsRaw = false
@@ -234,14 +259,69 @@ class MainActivity : AppCompatActivity() {
     /** 上次同步的「置顶跨分类」开关：设置页改了开关回这里，按新口径重建滤镜条 */
     private var seenPinnedCross: Boolean? = null
 
+    // ---- AI 调色助手（会话级，不落任何用户设置） ----
+    private var aiSheet: AiSheetDialog? = null
+    /** 参考图拟合出的临时色彩：只在本次编辑内有效，用户点保存才入库 */
+    private var aiRefStyle: AdaptiveColorNet.Style? = null
+    private var aiRefPreview: Bitmap? = null
+    /** 结果胶囊文案（如「AI · 3 项」）：AI 调过参数后显示在入口卡上，关面板也不丢成果 */
+    private var aiResultHint: String? = null
+    /** 上滑手势的按下点是否落在色彩卡区域 */
+    private var aiSwipeArmed = false
+    private var aiSwipeStartY = 0f
+    private var aiSwipeStartX = 0f
+    private var aiSwipeTriggered = false
+
     /** 分享码自动识别：本次会话里已被用户点「取消」的指令，不再重复打扰 */
     private var declinedShareSig: String? = null
     /** 正在导入的指令：确认框关闭会立刻触发一次焦点回调，用它挡住重复弹框 */
     private var importingShareSig: String? = null
     private var sharePromptShowing = false
 
-    private val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) onImagePicked(uri)
+    // ---- 批量（多图）编辑会话 ----
+    /**
+     * 本批导入的图。单张导入时 size == 1，多选时 2..[MAX_BATCH]。
+     * 只有 [batchIndex] 指向的那张是「装进当前字段」的活动图，其余只保 uri + 设置。
+     */
+    private val batchItems = mutableListOf<EditItem>()
+    /** 当前活动项下标；-1 = 没有批次 */
+    private var batchIndex = -1
+    /** 切图代次：连点箭头会排队多次加载，落地时校验，防旧请求覆盖新图 */
+    private var switchSeq = 0
+    /** 批量导出进行中（比 exporting 更强的互斥：禁止切图/导入/超分/完美/调节） */
+    private var batchExportRunning = false
+    /** 批量导出被用户点「停止」：当前这张导完后收尾 */
+    private var batchCancel = false
+    /** 导出完成回调：非批量时为 null（空操作），单张导出路径零行为变化 */
+    private var exportDoneHook: ((Boolean) -> Unit)? = null
+    /** 本批「配方」= 用户最近一次手动设置；未单独调整的图切过去时自动套用（预览即导出结果） */
+    private val batchRecipe = Recipe()
+    /**
+     * 程序性装载期间为 true（切图恢复 / 静默导出装载）。
+     *
+     * 这类路径也会走 onFilterSelected / 滑杆回写，但那**不是**用户调整：不能把图标记成
+     * touched，否则每切一次就"污染"一张，继承语义全废。
+     */
+    private var applyingSession = false
+
+    /**
+     * 导入入口：系统相册多选（上限 [MAX_BATCH]）。
+     *
+     * Android 13+ 走系统 Photo Picker（原生多选）；低版本由 contract 自动回落
+     * ACTION_OPEN_DOCUMENT + EXTRA_ALLOW_MULTIPLE，长按多选、单选照旧。
+     * 只选 1 张时走原来的单图路径（清批次 + 普通导入）——行为与改前完全一致。
+     */
+    private val pickImages = registerForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_BATCH)
+    ) { uris ->
+        when {
+            uris.isNullOrEmpty() -> Unit
+            uris.size == 1 -> {
+                clearBatch()
+                onImagePicked(uris[0])
+            }
+            else -> beginBatch(uris)
+        }
     }
 
     // 增强（S4）：在游标版本的基础上追加参考图，先预览强度再落盘
@@ -280,10 +360,38 @@ class MainActivity : AppCompatActivity() {
         applyImmersiveBars()
         bindViews()
         setupCategoryEntry()
-        btnImport.setOnClickListener { requestMediaLocationThen { pickImage.launch("image/*") } }
-        btnExport.setOnClickListener { export() }
-        imgPreview.onCompareEnter = { if (hasColor()) originalBitmap?.let { imgPreview.setImageBitmap(it) } }
-        imgPreview.onCompareExit = { if (hasColor()) refreshPreviewImage() }
+        btnImport.setOnClickListener {
+            // 位置权限与导入解耦：拒绝也照常导入，只是导出无 GPS（沿用既有口径）
+            requestMediaLocationThen {
+                pickImages.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }
+        }
+        btnExport.setOnClickListener { onExportClicked() }
+        // 批量切图：首尾循环（与相册左右滑动同语义，不给出"点不动"的死角）
+        btnPrev.setOnClickListener { switchTo(stepBatchIndex(-1)) }
+        btnNext.setOnClickListener { switchTo(stepBatchIndex(1)) }
+        btnBatchStop.setOnClickListener {
+            batchCancel = true
+            batchSub.text = "正在停止 · 当前这张完成后结束"
+        }
+        // 批量导出中按返回：退到桌面继续跑（不能 finish —— onDestroy 会关掉导出线程池，
+        // 这正是"切后台还在、一按返回就断"的根源）
+        onBackPressedDispatcher.addCallback(this) {
+            if (batchExportRunning) {
+                toast("导出继续在后台进行，完成后会通知你")
+                moveTaskToBack(true)
+            } else {
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+            }
+        }
+        // 长按对比：选了色彩、或只是调过参数（AI 常停在「原图」卡上只调八档）都应生效
+        imgPreview.onCompareEnter = {
+            if (hasColor() || hasAdjustments()) originalBitmap?.let { imgPreview.setImageBitmap(it) }
+        }
+        imgPreview.onCompareExit = {
+            if (hasColor() || hasAdjustments()) refreshPreviewImage()
+        }
         btnSuperRes.setOnClickListener { confirmSuperRes(false) }
         btnSuperResFast.setOnClickListener { confirmSuperRes(true) }
         btnPerfect.setOnClickListener { onPerfectClicked() }
@@ -302,6 +410,35 @@ class MainActivity : AppCompatActivity() {
         if (savedInstanceState == null) handleSharedIntent(intent)
         if (savedInstanceState == null) applyDebugAutoImport()
         if (!SettingsStore.isCoachShown(this)) showCoach()
+    }
+
+    private fun isInFilterBar(rawX: Float, rawY: Float): Boolean {
+        if (!this::filterScroll.isInitialized) return false
+        val loc = IntArray(2)
+        try {
+            filterScroll.getLocationOnScreen(loc)
+        } catch (t: Throwable) {
+            return false
+        }
+        val left = loc[0]
+        val top = loc[1]
+        return rawX >= left && rawX <= left + filterScroll.width &&
+            rawY >= top && rawY <= top + filterScroll.height
+    }
+
+    private fun openAiSheet() {
+        if (aiSheet == null) aiSheet = AiSheetDialog(this)
+        aiSheet?.show()
+    }
+
+    /** 更新到本版本后第一次载入图片时弹一次引导（生命周期内只弹一次）。 */
+    private fun maybeShowAiOnboarding() {
+        if (AiProviderStore.onboardingShown(this)) return
+        AiProviderStore.setOnboardingShown(this)
+        mainHandler.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            AiOnboardingDialog.show(this) { openAiSheet() }
+        }, 600)
     }
 
     /** debug：从 Intent 直接喂一张工作图并选中模型，绕过相册（release 不触发）。 */
@@ -402,12 +539,50 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 气泡可见时，点屏幕任意处只关气泡（消费本次按下，避免误触到下面的控件） */
+    /**
+     * 全局触摸旁听：①新手引导点一下消失；②色彩卡区域上滑打开 AI 抽屉。
+     *
+     * AI 手势在 Activity 层旁听，而不是给 filterScroll 挂 OnTouchListener——卡片子 View
+     * 会消费自己的点击/横滑，父容器监听收不到。这里**只看不消费**（始终交给
+     * super.dispatchTouchEvent），因此对既有横滑浏览、点按选色零影响。
+     */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         if (coachVisible && ev.actionMasked == MotionEvent.ACTION_DOWN) {
             hideCoach()
             return true
         }
+        trackAiSwipe(ev)
         return super.dispatchTouchEvent(ev)
+    }
+
+    /** 上滑判定：按下点在滤镜条内 + 竖向位移 >80dp + 竖向明显大于横向。 */
+    private fun trackAiSwipe(ev: MotionEvent) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                aiSwipeStartX = ev.rawX
+                aiSwipeStartY = ev.rawY
+                aiSwipeTriggered = false
+                aiSwipeArmed = isInFilterBar(ev.rawX, ev.rawY)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (aiSwipeArmed && !aiSwipeTriggered) {
+                    val dy = ev.rawY - aiSwipeStartY
+                    val dx = ev.rawX - aiSwipeStartX
+                    if (dy < -dp(80) && kotlin.math.abs(dy) > kotlin.math.abs(dx) * 1.4f) {
+                        aiSwipeTriggered = true
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                if (aiSwipeArmed && aiSwipeTriggered) openAiSheet()
+                aiSwipeArmed = false
+                aiSwipeTriggered = false
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                aiSwipeArmed = false
+                aiSwipeTriggered = false
+            }
+        }
     }
 
     override fun onResume() {
@@ -460,13 +635,25 @@ class MainActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(coachAutoHide)
         mainHandler.removeCallbacks(exportOverlayTick)
         SuperResTask.removeListener(srListener)
+        // Vulkan 设备与已加载的 ncnn 权重是进程级常驻资源，页面销毁时主动还回去
+        GpuNet.release()
+        aiSheet?.release()               // AI 在途请求随页面销毁一起停止
         // 全像素导出线程随 Activity 线程池关闭：让前台服务拿到结局通知并收尾（免得常驻 30 分钟）
         if (exporting) ExportProgress.end(false, "已退出应用，导出中断")
+        // 批量：进程真要走了也要给通知栏一个结论，不能一直挂在"进行中"
+        if (batchExportRunning) ExportProgress.end(false, "应用被关闭，批量导出已中断")
+        // 停掉看门狗与推进链，避免销毁后仍有 postDelayed 回调
+        batchExportRunning = false
+        batchCancel = true
+        cancelBatchWatchdog()
         executor.shutdownNow()
         // 不在 onDestroy 回收位图：可能仍被 ImageView 持有，销毁到 detach 间的一帧绘制
         // 会触发 "Canvas: trying to use a recycled bitmap" 崩溃；交给 GC 兜底（预览尺寸无收益）
         // 200MP 直通源是 cache 文件，进程退出不再需要，主动删掉不占用户存储
         runCatching { fullResFile?.delete() }
+        // 批量：逐张的直通源与超分成片同样是 cache，一并清掉（30 张可能上 GB）
+        batchItems.forEach { it.releaseDisk() }
+        batchItems.clear()
     }
 
     private fun bindViews() {
@@ -478,6 +665,14 @@ class MainActivity : AppCompatActivity() {
         bigExportRing = findViewById(R.id.bigExportRing)
         bigExportPercent = findViewById(R.id.bigExportPercent)
         bigExportHint = findViewById(R.id.bigExportHint)
+        btnPrev = findViewById(R.id.btnPrev)
+        btnNext = findViewById(R.id.btnNext)
+        txtBatchIndex = findViewById(R.id.txtBatchIndex)
+        batchOverlay = findViewById(R.id.batchOverlay)
+        batchRing = findViewById(R.id.batchRing)
+        batchMain = findViewById(R.id.batchMain)
+        batchSub = findViewById(R.id.batchSub)
+        btnBatchStop = findViewById(R.id.btnBatchStop)
         filterContainer = findViewById(R.id.filterContainer)
         btnImport = findViewById(R.id.btnImport)
         btnExport = findViewById(R.id.btnExport)
@@ -537,6 +732,356 @@ class MainActivity : AppCompatActivity() {
      * 按分类重建滤镜条：原图恒在首位，其后是置顶区，再给该分类的内置色彩。
      * 重建不触碰图片/工作字节；跨分类时当前风格可能不在列表内（此时无卡片高亮）。
      */
+    // ===================== AI 调色助手（AiUiHost 实现） =====================
+    //
+    // 安全边界（与计划一致）：这一整块只做「读风格目录 / 读统计 / 改当前会话八档 /
+    // 出预览 / 搜参考图 / 拟合临时色彩」。**没有任何写 SettingsStore 的路径**，
+    // 参考色彩只有用户点「保存」才会新增一条 CustomStyleDef（只增不改）。
+
+    private fun currentDisplayBitmap(): Bitmap? =
+        liftedResult ?: resultBitmap ?: liftedOriginal ?: originalBitmap
+
+    /** 主线程同步执行（AI 线程调用工具时用），超时返回 null，绝不阻塞过久。 */
+    private fun <T> onMainSync(timeoutMs: Long = 6000, block: () -> T): T? {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        val latch = CountDownLatch(1)
+        var out: T? = null
+        mainHandler.post {
+            try {
+                out = block()
+            } catch (t: Throwable) {
+                DiagLog.w("AiHost", "主线程工具执行失败：${t.message}")
+            } finally {
+                latch.countDown()
+            }
+        }
+        return try {
+            if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) null else out
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    override fun hasImage(): Boolean = originalBitmap != null
+
+    override fun styleCatalog(): JSONArray {
+        val arr = JSONArray()
+        LeicaEngine.Style.UI_VISIBLE.forEach { s ->
+            arr.put(JSONObject().apply {
+                put("id", s.id)
+                put("label", s.label)
+                put("desc", s.desc)
+                put("kind", "builtin")
+            })
+        }
+        CustomStyleStore.all().sortedByDescending { it.createdAt }.take(40).forEach { d ->
+            arr.put(JSONObject().apply {
+                put("id", d.id)
+                put("label", d.name)
+                put("desc", if (d.hasModelNet) "模型色彩" else "我的色彩")
+                put("kind", "custom")
+            })
+        }
+        return arr
+    }
+
+    override fun imageStats(): JSONObject? {
+        val bmp = onMainSync { currentDisplayBitmap() } ?: return null
+        return try {
+            if (bmp.isRecycled) null else ImageStats.describe(bmp)
+        } catch (t: Throwable) {
+            DiagLog.w("AiHost", "统计失败：${t.message}")
+            null
+        }
+    }
+
+    override fun applyParams(args: JSONObject): JSONObject {
+        val res = onMainSync {
+            if (originalBitmap == null) {
+                JSONObject().apply { put("ok", false); put("error", "当前没有照片") }
+            } else {
+                brightLevel = args.optInt("brightness", brightLevel).coerceIn(-10, 10)
+                exposureLevel = args.optInt("exposure", exposureLevel).coerceIn(-10, 10)
+                highlightLevel = args.optInt("highlights", highlightLevel).coerceIn(-10, 10)
+                shadowLevel = args.optInt("shadows", shadowLevel).coerceIn(-10, 10)
+                blackLevel = args.optInt("black", blackLevel).coerceIn(-10, 10)
+                satLevel = args.optInt("saturation", satLevel).coerceIn(-10, 10)
+                contrastLevel = args.optInt("contrast", contrastLevel).coerceIn(-10, 10)
+                glowLevel = args.optInt("glow", glowLevel).coerceIn(-10, 10)
+                val changed = listOf(
+                    brightLevel, exposureLevel, highlightLevel, shadowLevel,
+                    blackLevel, satLevel, contrastLevel, glowLevel
+                ).count { it != 0 }
+                aiResultHint = if (changed == 0) null else "AI · $changed 项"
+                updateLumBarUi()
+                recomputeAdjAsync()
+                JSONObject().apply {
+                    put("ok", true)
+                    put("applied", currentParamsJson())
+                    put("note", "参数已应用，预览在数百毫秒内更新")
+                }
+            }
+        }
+        return res ?: JSONObject().apply { put("ok", false); put("error", "主线程无响应") }
+    }
+
+    override fun applyStyle(styleId: String): JSONObject {
+        val res = onMainSync {
+            val builtIn = LeicaEngine.Style.values()
+                .firstOrNull { it.id == styleId && it in LeicaEngine.Style.UI_VISIBLE }
+            val custom = CustomStyleStore.byId(styleId)
+            when {
+                builtIn != null -> {
+                    onFilterSelected(FilterEntry.BuiltIn(builtIn))
+                    JSONObject().apply {
+                        put("ok", true)
+                        put("style", builtIn.label)
+                        put("note", "已切换「${builtIn.label}」，渲染约 1~2 秒后生效")
+                    }
+                }
+                custom != null -> {
+                    onFilterSelected(FilterEntry.Custom(custom.id))
+                    JSONObject().apply {
+                        put("ok", true)
+                        put("style", custom.name)
+                        put("note", "已切换「${custom.name}」，渲染约 1~2 秒后生效")
+                    }
+                }
+                else -> JSONObject().apply {
+                    put("ok", false)
+                    put("error", "没有这个色彩：$styleId")
+                }
+            }
+        }
+        return res ?: JSONObject().apply { put("ok", false); put("error", "主线程无响应") }
+    }
+
+    override fun previewBase64(maxDim: Int): String? {
+        val copy = onMainSync {
+            val bmp = currentDisplayBitmap() ?: return@onMainSync null
+            if (bmp.isRecycled) return@onMainSync null
+            val m = maxOf(bmp.width, bmp.height)
+            if (m <= maxDim) bmp.copy(Bitmap.Config.ARGB_8888, false) else {
+                val s = maxDim.toFloat() / m
+                Bitmap.createScaledBitmap(
+                    bmp,
+                    (bmp.width * s).toInt().coerceAtLeast(1),
+                    (bmp.height * s).toInt().coerceAtLeast(1),
+                    true
+                )
+            }
+        } ?: return null
+        return try {
+            val bos = ByteArrayOutputStream()
+            copy.compress(Bitmap.CompressFormat.JPEG, 82, bos)
+            copy.recycle()
+            android.util.Base64.encodeToString(bos.toByteArray(), android.util.Base64.NO_WRAP)
+        } catch (t: Throwable) {
+            try { copy.recycle() } catch (e: Throwable) { }
+            null
+        }
+    }
+
+    override fun searchReference(query: String, limit: Int): JSONArray {
+        val res = ImageSearchEngine.search(this, query, limit)
+        val arr = JSONArray()
+        res.candidates.forEach { c ->
+            arr.put(JSONObject().apply {
+                put("thumb", c.thumbUrl)
+                put("url", c.fullUrl)
+                put("source", c.source)
+                put("width", c.width)
+                put("height", c.height)
+            })
+        }
+        return arr
+    }
+
+    override fun applyReferenceStyle(url: String): JSONObject {
+        val fail = { msg: String ->
+            JSONObject().apply { put("ok", false); put("error", msg) }
+        }
+        if (originalBitmap == null) return fail("当前没有照片")
+        val bytes = AiHttp.getBytes(url, emptyMap(), 20000) ?: return fail("参考图下载失败")
+        val ref = try {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } catch (t: Throwable) {
+            null
+        } ?: return fail("参考图无法解码")
+
+        val style = try {
+            AdaptiveColorNet.encodeStyle(this, listOf(ref))
+        } catch (t: Throwable) {
+            DiagLog.w("AiHost", "拟合异常：${t.message}")
+            null
+        } ?: run {
+            ref.recycle()
+            return fail("参考图拟合失败")
+        }
+        val finalStyle = try {
+            AdaptiveColorNet.monoIfGray(listOf(ref), style).first
+        } catch (t: Throwable) {
+            style
+        }
+        ref.recycle()
+
+        // 拷一份底图：预览链在另一条线程会 recycle 旧 lifted 位图，直接引用可能踩到已回收对象
+        val base = onMainSync {
+            val b = currentDisplayBitmap()
+            if (b == null || b.isRecycled) null else b.copy(Bitmap.Config.ARGB_8888, false)
+        } ?: return fail("没有可预览的底图")
+        val preview = try {
+            AdaptiveColorNet.apply(base, finalStyle)
+        } catch (t: Throwable) {
+            null
+        } ?: return fail("渲染失败")
+        base.recycle()
+
+        aiRefStyle = finalStyle
+        aiRefPreview = preview
+        val name = uniqueAiStyleName()
+        onMainSync {
+            imgPreview.setImageBitmap(preview)
+            txtStyleHint.text = "AI 参考 · 待保存"
+        }
+        return JSONObject().apply {
+            put("ok", true)
+            put("name", name)
+            put("note", "已在预览上应用这套参考色彩，等待用户确认是否保存")
+        }
+    }
+
+    override fun currentSummary(): String {
+        val styleName = when {
+            currentCustomId != null -> CustomStyleStore.nameOf(currentCustomId!!)
+            currentStyle != null -> currentStyle!!.label
+            else -> "原图"
+        }
+        return "色彩=$styleName；" + paramsSummary()
+    }
+
+    private fun paramsSummary(): String =
+        "亮度=$brightLevel 曝光=$exposureLevel 高光=$highlightLevel 阴影=$shadowLevel " +
+            "黑位=$blackLevel 饱和=$satLevel 对比=$contrastLevel 柔光=$glowLevel"
+
+    private fun currentParamsJson(): JSONObject = JSONObject().apply {
+        put("brightness", brightLevel)
+        put("exposure", exposureLevel)
+        put("highlights", highlightLevel)
+        put("shadows", shadowLevel)
+        put("black", blackLevel)
+        put("saturation", satLevel)
+        put("contrast", contrastLevel)
+        put("glow", glowLevel)
+    }
+
+    override fun snapshotParams(): JSONObject = currentParamsJson()
+
+    override fun restoreParams(snapshot: JSONObject) {
+        onMainSync {
+            brightLevel = snapshot.optInt("brightness", brightLevel).coerceIn(-10, 10)
+            exposureLevel = snapshot.optInt("exposure", exposureLevel).coerceIn(-10, 10)
+            highlightLevel = snapshot.optInt("highlights", highlightLevel).coerceIn(-10, 10)
+            shadowLevel = snapshot.optInt("shadows", shadowLevel).coerceIn(-10, 10)
+            blackLevel = snapshot.optInt("black", blackLevel).coerceIn(-10, 10)
+            satLevel = snapshot.optInt("saturation", satLevel).coerceIn(-10, 10)
+            contrastLevel = snapshot.optInt("contrast", contrastLevel).coerceIn(-10, 10)
+            glowLevel = snapshot.optInt("glow", glowLevel).coerceIn(-10, 10)
+            updateLumBarUi()
+            recomputeAdjAsync()
+        }
+    }
+
+    override fun hasPendingReferenceStyle(): Boolean = aiRefStyle != null
+
+    override fun pendingReferenceDefaultName(): String = uniqueAiStyleName()
+
+    /** AI 参考色彩入库：只新增，不触碰任何已有条目（重名自动加序号）。 */
+    override fun savePendingReferenceStyle(name: String): Boolean {
+        val style = aiRefStyle ?: return false
+        val finalName = uniqueAiStyleName(name)
+        val id = CustomStyleStore.newId()
+        val now = System.currentTimeMillis()
+        val verId = "v" + now.toString(36)
+
+        // 卡片缩略图：拿当前底图渲一张 240px 的成品图（失败不影响入库）
+        try {
+            val base = originalBitmap
+            if (base != null) {
+                val small = scaleBitmap(base, 240)
+                val applied = AdaptiveColorNet.apply(small, style) ?: small
+                val bos = ByteArrayOutputStream()
+                applied.compress(Bitmap.CompressFormat.JPEG, 92, bos)
+                ColorShareImport.saveThumb(this, id, bos.toByteArray())
+                thumbCache[id] = applied
+                if (applied !== small) small.recycle()
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("AiHost", "缩略图生成失败：${t.message}")
+        }
+
+        val version = StyleVersion(
+            id = verId,
+            createdAt = now,
+            label = "初始",
+            lutFile = "",
+            seedCount = 0,
+            source = VersionSource.INITIAL,
+            strength = 1f,
+            thetaFile = "",
+            paramFile = "",
+            modelAff = style.aff,
+            modelKnots = style.knots
+        )
+        val def = CustomStyleDef(
+            id = id,
+            name = finalName,
+            createdAt = now,
+            seeds = mutableListOf(),
+            versions = mutableListOf(version),
+            currentVersionId = verId,
+            kind = StyleKind.MODEL,
+            seedCount = 0,
+            seedsLoaded = false,
+            modelAff = style.aff,
+            modelKnots = style.knots
+        )
+        val ok = try {
+            CustomStyleStore.put(this, def)
+        } catch (t: Throwable) {
+            false
+        }
+        if (ok) {
+            aiRefStyle = null
+            aiRefPreview = null
+            seenRevision = CustomStyleStore.revision
+            onModelPicked(id)
+            toast("已保存「$finalName」到我的色彩")
+        }
+        return ok
+    }
+
+    override fun clearPendingReferenceStyle() {
+        aiRefStyle = null
+        aiRefPreview = null
+    }
+
+    override fun onAiSheetClosed() {
+        // 预览保留（AI 的调整属于当前编辑会话，不因关面板而丢弃）；
+        // 有调整结果时把入口卡文案换成「AI · N 项」，让成果在滤镜条上可见
+        if (aiResultHint != null) buildFilterBar(currentCategory)
+    }
+
+    /** 「AI 色彩」命名去重：只加序号，绝不覆盖已有同名条目。 */
+    private fun uniqueAiStyleName(base: String = "AI 色彩"): String {
+        val baseName = base.trim().ifEmpty { "AI 色彩" }
+        val names = CustomStyleStore.all().map { it.name }.toHashSet()
+        if (baseName !in names) return baseName
+        var i = 2
+        while ("$baseName $i" in names) i++
+        return "$baseName $i"
+    }
+
     private fun buildFilterBar(category: FilterCategory) {
         currentCategory = category
         txtTitle.text = category.title
@@ -589,6 +1134,8 @@ class MainActivity : AppCompatActivity() {
             addAll(pinned)
             if (category.hostsCustom) add(FilterEntry.Create)
             addAll(normal.filter { it.id !in pinnedIds })
+            // AI 入口常驻末尾：既是上滑手势的可见兜底，也不参与分类归属/置顶
+            add(FilterEntry.Ai)
         }
     }
 
@@ -611,6 +1158,7 @@ class MainActivity : AppCompatActivity() {
      * L-Moment 全量可见；自定义/模型色彩只在「我的色彩」；内置色彩在其所属分类。
      */
     private fun belongsToCategory(entry: FilterEntry, category: FilterCategory): Boolean {
+        if (entry is FilterEntry.Ai) return true      // AI 入口常驻所有分类末尾
         return when (category) {
             FilterCategory.ALL -> true
             FilterCategory.CUSTOM -> entry is FilterEntry.Custom
@@ -621,6 +1169,7 @@ class MainActivity : AppCompatActivity() {
     /** 持久化的 id → 条目；色彩已被删除时返回 null（残留的置顶记录自动跳过） */
     private fun resolveEntry(id: String): FilterEntry? {
         if (id == FilterEntry.ORIG_ID) return FilterEntry.Orig
+        if (id == FilterEntry.AI_ID) return FilterEntry.Ai
         LeicaEngine.Style.values().firstOrNull { it.id == id }?.let { return FilterEntry.BuiltIn(it) }
         return CustomStyleStore.byId(id)?.let { FilterEntry.Custom(it.id) }
     }
@@ -655,6 +1204,16 @@ class MainActivity : AppCompatActivity() {
 
     /** 是否有任何色彩生效（内置或自定义） */
     private fun hasColor(): Boolean = currentStyle != null || currentCustomId != null
+
+    /**
+     * 是否有任意一档参数被调整过。
+     *
+     * 用于长按对比：AI 常在没有选色彩（原图卡）的情况下只调八档，
+     * 若对比只看 [hasColor]，这种场景就看不到调整前后差异。
+     */
+    private fun hasAdjustments(): Boolean =
+        brightLevel != 0 || exposureLevel != 0 || highlightLevel != 0 || shadowLevel != 0 ||
+            blackLevel != 0 || satLevel != 0 || contrastLevel != 0 || glowLevel != 0
 
     private fun showCategoryPicker() {
         if (categoryPopup != null) return
@@ -740,7 +1299,11 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(dp(72), LinearLayout.LayoutParams.WRAP_CONTENT)
         }
         val tv = TextView(this).apply {
-            text = if (entry is FilterEntry.Create) "新建" else entry.label
+            text = when {
+                entry is FilterEntry.Create -> "新建"
+                entry is FilterEntry.Ai -> aiResultHint ?: "AI"
+                else -> entry.label
+            }
             textSize = 11f
             // 卡片宽 72dp：不锁单行的话长名字会换行把卡片撑高，同排高度就参差了
             isSingleLine = true
@@ -757,6 +1320,20 @@ class MainActivity : AppCompatActivity() {
                 gravity = Gravity.CENTER
                 setTextColor(Color.parseColor("#8E8E93"))
                 background = roundedRect(0xFF232326.toInt(), thumbCorner)
+                layoutParams = LinearLayout.LayoutParams(dp(60), dp(60))
+            })
+        } else if (entry is FilterEntry.Ai) {
+            // AI 入口卡：描边 + ✨，与色彩卡区分（"选现成的" vs "让 AI 来"）
+            card.addView(TextView(this).apply {
+                text = "✦"
+                textSize = 22f
+                gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#F2F2F2"))
+                background = GradientDrawable().apply {
+                    cornerRadius = thumbCorner.toFloat()
+                    setColor(Color.parseColor("#1A1A1D"))
+                    setStroke(dp(1), Color.parseColor("#59FFFFFF"))
+                }
                 layoutParams = LinearLayout.LayoutParams(dp(60), dp(60))
             })
         } else {
@@ -805,6 +1382,11 @@ class MainActivity : AppCompatActivity() {
 
         card.addView(tv)
         card.setOnClickListener {
+            // AI 卡不改选中态：它不是一个色彩，点它只是打开抽屉
+            if (entry is FilterEntry.Ai) {
+                openAiSheet()
+                return@setOnClickListener
+            }
             selectCard(index)
             when (entry) {
                 is FilterEntry.BuiltIn -> onFilterSelected(entry)
@@ -812,6 +1394,7 @@ class MainActivity : AppCompatActivity() {
                 is FilterEntry.Orig -> onFilterSelected(entry)
                 // 新建入口统一走模型色彩（QUICK 快速生成已退役，管线见 git 历史）
                 is FilterEntry.Create -> openModelCreate()
+                is FilterEntry.Ai -> openAiSheet()      // 上面已提前返回，这里只为密封 when 完整
             }
         }
         card.setOnLongClickListener { v ->
@@ -1296,6 +1879,8 @@ class MainActivity : AppCompatActivity() {
             toast("画质处理中，请稍候再分享")
             return
         }
+        // 分享是单图入口：与「导入单张」同口径，先收摊已有批次，避免批次序号指向旧图
+        clearBatch()
         onImagePicked(uri)
     }
 
@@ -1313,8 +1898,17 @@ class MainActivity : AppCompatActivity() {
 
     // ---- 导入 ----
 
-    private fun onImagePicked(uri: Uri) {
-        progress.visible()
+    /**
+     * 导入一张图并（可选）绑定到批量条目。
+     *
+     * @param item 非空时把加载结果绑进该条目（切图冷加载 / 批量首张）
+     * @param silent 批量导出用的静默装载：只写字段、不碰任何 View（不闪预览、不重建缩略图、
+     *               不弹 toast），落地后直接把字段对齐该条目保存的设置
+     * @param onResult 加载结果回调（主线程，恰好一次）：批量首张失败顺延、批量导出跳过坏图都靠它
+     */
+    private fun onImagePicked(uri: Uri, item: EditItem? = null, silent: Boolean = false,
+                              onResult: ((Boolean) -> Unit)? = null) {
+        if (!silent) progress.visible()
         executor.execute {
             try {
                 val mime = contentResolver.getType(uri) ?: "image/jpeg"
@@ -1395,7 +1989,11 @@ class MainActivity : AppCompatActivity() {
                     val r = decodeRaw(bytes)
                     if (r == null) {
                         DiagLog.e("Import", "RAW 解码失败")
-                        mainHandler.post { progress.gone(); toast("RAW 解码失败") }
+                        mainHandler.post {
+                            progress.gone()
+                            toast("RAW 解码失败")
+                            onResult?.invoke(false)
+                        }
                         return@execute
                     }
                     preview = r.first
@@ -1409,7 +2007,11 @@ class MainActivity : AppCompatActivity() {
                         val p = ImageUtils.decode(this, uri, 1600)
                         if (p == null) {
                             DiagLog.e("Import", "图片解码失败")
-                            mainHandler.post { progress.gone(); toast("无法解码该图片") }
+                            mainHandler.post {
+                            progress.gone()
+                            toast("无法解码该图片")
+                            onResult?.invoke(false)
+                        }
                             return@execute
                         }
                         preview = p
@@ -1422,7 +2024,11 @@ class MainActivity : AppCompatActivity() {
                         val work = ImageUtils.decodeWork(this, uri)
                         if (work == null) {
                             DiagLog.e("Import", "图片解码失败")
-                            mainHandler.post { progress.gone(); toast("无法解码该图片") }
+                            mainHandler.post {
+                            progress.gone()
+                            toast("无法解码该图片")
+                            onResult?.invoke(false)
+                        }
                             return@execute
                         }
                         val pv = scaleBitmap(work, 1600)
@@ -1479,11 +2085,23 @@ class MainActivity : AppCompatActivity() {
                         " (方向归一 ${workBytes.size}→${normalizedBytes.size}B)" else ""))
 
                 mainHandler.post {
+                    // 换图：旧预览/结果位图必须主动回收，否则每切一张泄漏约 8MB（批量切换会迅速堆满堆）。
+                    // 顺序约定：先记旧引用 → 字段指向新对象 → 视图换图 → 最后回收旧图，
+                    // 与 recomputeAdjAsync 里「先换显示再回收」同款，避免画到已回收位图。
+                    // 但批量场景下旧图可能已被 snapshot 进某个 EditItem.hot（归属已转移），
+                    // 那种情况绝不能回收——否则切回去就是一张已回收位图。
+                    val prevOriginal = originalBitmap
+                    val prevResult = resultBitmap
+                    if (!silent) dropAdjCache()
+
+                    // ---- 字段段：静默装载（批量导出）同样执行，保证导出读到的就是这张图 ----
                     originalBytes = normalizedBytes
                     workWidth = workSize[0]
                     workHeight = workSize[1]
                     pendingHdr = if (jpegDirect) hdr else null
                     // C1：全像素直通源（仅「原图」档导出可用；滤镜仍走 normalizedBytes）
+                    // 批量切图时上一张的 cache 文件归属已转移到 EditItem，
+                    // 调用方会先 detachFullResFields()，这里的删除才是空操作。
                     clearFullRes()
                     fullResFile = fullResFileLocal
                     fullResExifHead = fullResHeadLocal
@@ -1503,60 +2121,544 @@ class MainActivity : AppCompatActivity() {
                     // 这里**只读不写**记忆——否则导一张徕卡直出（自带 HDR）就会把用户的「开」冲掉。
                     val hasSourceHdr = pendingHdr != null || fullResHdr != null
                     hdrBoost = SettingsStore.hdrDefaultOn(this) && !hasSourceHdr
-                    setHdrButton(hdrBoost)
-                    updateLumBarUi()
                     // 作废在途调整任务：防止旧图的调整版完成于新导入之后盖在预览上
                     liftGen++
-                    // 调节入口对所有导入开放（RAW/JPG/HEIF）；管线作用在工作字节上，与输入格式无关
-                    btnAdjust.visible()
-                    adjPanel.gone()
                     originalBitmap = preview
                     resultBitmap = null
                     currentStyle = null
                     currentCustomId = null
+                    // 换图：AI 的临时参考色彩与入口卡文案属于上一张图，一并作废
+                    aiRefStyle = null
+                    aiRefPreview = null
+                    aiResultHint = null
                     liftedOriginal?.recycle(); liftedOriginal = null
                     liftedResult?.recycle(); liftedResult = null
-                    txtEmpty.gone()
-                    imgPreview.setImageBitmap(preview)
-                    txtStyleHint.visible()
-                    btnSuperRes.visible()
-                    btnSuperResFast.visible()
                     // 完美档完整管线需要原始 DNG：这里只记源，用时再重读（不常驻大字节）
                     sourceUri = uri
                     sourceIsRaw = isRaw
-                    // 此时 pendingHdr / fullResHdr 已赋值，仅按「源图自带 HDR」决定是否隐藏
-                    updateHdrVisibility()
-                    clearPerfectState()
-                    txtStyleHint.text = "原图"
-                    selectCard(0)
-                    progress.gone()
-                    generateThumbnails()
-                    val rawTag = when (SettingsStore.rawThrLevel(this)) {
-                        1 -> " · 提亮"
-                        2 -> " · 强力提亮"
-                        else -> ""
+                    perfectBytes = null
+                    perfectStyle = null
+                    perfectApplied = false
+                    if (item != null) {
+                        // 批量：把本次加载的热数据/中状态绑进条目。**轻状态（色彩/档位）保持条目原值**，
+                        // 随后由 applySessionFields 原样装回，冷加载才不会把该图的设置清成原图。
+                        snapshotHotInto(item)
                     }
-                    if (fullResFileLocal != null) {
-                        // C1：200MP 直通可用性显式告知（滤镜档仍按工作字节 3072 级导出）
-                        txtStyleHint.text = "原图 · 全像素直通"
-                        toast(
-                            "200MP 已导入 · 原图档可全像素导出 " +
-                                "${fullResWidth}x${fullResHeight}"
-                        )
-                    } else {
-                        toast(
-                            if (isRaw) "RAW 已解码：${preview.width}x${preview.height}$rawTag"
-                            else "已导入"
-                        )
+
+                    if (!silent) {
+                        // ---- UI 段 ----
+                        if (item != null) applySessionFields(item)
+                        setHdrButton(hdrBoost)
+                        updateLumBarUi()
+                        // 调节入口对所有导入开放（RAW/JPG/HEIF）；管线作用在工作字节上，与输入格式无关
+                        btnAdjust.visible()
+                        adjPanel.gone()
+                        // AI 对话跨图保留（用户要求）：只提示上下文切换，不清历史
+                        aiSheet?.onImageChanged()
+                        aiSheet?.dismiss()
+                        txtEmpty.gone()
+                        imgPreview.setImageBitmap(originalBitmap ?: preview)
+                        // 视图已换到新图，才可以回收旧图；归属仍在批量条目里的不回收（切回去还要用）
+                        if (prevOriginal !== preview && !isCachedByBatch(prevOriginal)) prevOriginal?.recycle()
+                        if (!isCachedByBatch(prevResult)) prevResult?.recycle()
+                        txtStyleHint.visible()
+                        btnSuperRes.visible()
+                        btnSuperResFast.visible()
+                        // 此时 pendingHdr / fullResHdr 已赋值，仅按「源图自带 HDR」决定是否隐藏
+                        updateHdrVisibility()
+                        setPerfectButton(perfectApplied)
+                        updatePerfectVisibility(currentStyle)
+                        txtStyleHint.text = "原图"
+                        selectCard(0)
+                        progress.gone()
+                        generateThumbnails()
+                        maybeShowAiOnboarding()
+                        // 批量：按该图保存的色彩/档位刷新预览（新条目为空 → 仍是原图）；
+                        // 缩略图刚由 generateThumbnails 重建，不再重复
+                        if (item != null) refreshAfterSwitch(rebuildThumbs = false)
+                        val rawTag = when (SettingsStore.rawThrLevel(this)) {
+                            1 -> " · 提亮"
+                            2 -> " · 强力提亮"
+                            else -> ""
+                        }
+                        if (fullResFileLocal != null) {
+                            // C1：200MP 直通可用性显式告知（滤镜档仍按工作字节 3072 级导出）
+                            txtStyleHint.text = "原图 · 全像素直通"
+                            toast(
+                                "200MP 已导入 · 原图档可全像素导出 " +
+                                    "${fullResWidth}x${fullResHeight}"
+                            )
+                        } else {
+                            toast(
+                                if (isRaw) "RAW 已解码：${preview.width}x${preview.height}$rawTag"
+                                else "已导入"
+                            )
+                        }
+                        if (isRaw) showRawHintIfNeeded()
+                    } else if (item != null) {
+                        // 静默装载（批量导出）：不碰任何 View，只保证字段与该条目一致
+                        applySessionFields(item)
                     }
-                    if (isRaw) showRawHintIfNeeded()
+                    onResult?.invoke(true)
                 }
             } catch (e: Exception) {
                 DiagLog.e("Import", "导入异常", e)
                 mainHandler.post {
                     progress.gone()
                     toast("读取图片失败，请换一张或重试（详情见日志）")
+                    onResult?.invoke(false)
                 }
+            }
+        }
+    }
+
+    // ---- 批量会话：字段冻结 / 装载 ----
+    //
+    // 为什么是「快照 + 装载」而不是把状态抽成对象：导出/渲染/调节共 5000 行全部直接读写成
+    // 员字段，改造成本与回归面都不可接受。这里只在切图这一个时机做整体打包/还原，单图逻辑
+    // 一行不改。代价是必须**穷举**字段（漏一项 = 参数串图），故下面两函数严格成对维护。
+
+    /**
+     * 把当前活动图的字段整体打包进 [item]。
+     *
+     * 调用时机：切图前、批量导出前、退到后台/销毁前。热数据（工作字节+预览位图）一并转移
+     * 给条目持有，之后**不得**再被 onImagePicked 的换图回收逻辑回收（见 isCachedByBatch）。
+     */
+    private fun snapshotActiveInto(item: EditItem) {
+        snapshotLightInto(item)
+        // 完美成片 / 超分合成成果属于「这张图的产物」，只在切走时回收登记；
+        // 装载路径绝不能覆盖它们（否则再导出一张完美图就退化成普通链）
+        item.perfectBytes = perfectBytes
+        item.perfectStyle = perfectStyle
+        item.srBakedStyle = srBakedStyle
+        snapshotHotInto(item)
+    }
+
+    /**
+     * 只写轻状态（色彩 / 八档 / HDR）。
+     *
+     * 滑杆连续拖动会每帧触发一次，走全量快照（含 thumbCache 拷贝）纯属制造 GC 压力，
+     * 故与 [snapshotActiveInto] 拆开。
+     */
+    private fun snapshotLightInto(item: EditItem) {
+        item.styleId = currentStyle?.id
+        item.customId = currentCustomId
+        val lv = item.levels
+        lv[EditItem.LV_BRIGHT] = brightLevel
+        lv[EditItem.LV_EXPOSURE] = exposureLevel
+        lv[EditItem.LV_HIGHLIGHT] = highlightLevel
+        lv[EditItem.LV_SHADOW] = shadowLevel
+        lv[EditItem.LV_BLACK] = blackLevel
+        lv[EditItem.LV_SAT] = satLevel
+        lv[EditItem.LV_CONTRAST] = contrastLevel
+        lv[EditItem.LV_GLOW] = glowLevel
+        item.hdrBoost = hdrBoost
+    }
+
+    /**
+     * 只打包「图本身」的数据（中状态 + 热状态），**不动色彩/档位**。
+     *
+     * 冷加载落地时用这个：此时字段里是刚导入的默认值（原图/0 档），而条目里存着这张图
+     * 之前保存的设置；若用 [snapshotActiveInto] 会把设置一起冲掉。
+     */
+    private fun snapshotHotInto(item: EditItem) {
+        // 中状态
+        item.pendingHdr = pendingHdr
+        item.fullResFile = fullResFile
+        item.fullResHead = fullResExifHead
+        item.fullResW = fullResWidth
+        item.fullResH = fullResHeight
+        item.fullResHdr = fullResHdr
+        item.sourceUri = sourceUri
+        item.sourceIsRaw = sourceIsRaw
+        // 热状态（没有工作字节/预览就保持旧值，避免把条目打成"空壳"）
+        val work = originalBytes
+        val preview = originalBitmap
+        if (work != null && preview != null && !preview.isRecycled) {
+            item.hot = EditItem.Hot(
+                workBytes = work,
+                workW = workWidth,
+                workH = workHeight,
+                preview = preview,
+                result = resultBitmap,
+                thumbs = HashMap(thumbCache),
+                rawLin16 = rawLin16,
+                rawLin16Level = rawLin16Level,
+                rawPreviewJpeg = rawPreviewJpeg,
+                rawLinearLuma = rawLinearLuma,
+                pseudoLinear = pseudoLinearAllowed,
+                pseudoFromHeif = pseudoLinearFromHeif
+            )
+        }
+    }
+
+    /**
+     * 把 [item] 的字段装回 MainActivity（**不碰任何 View**）。
+     *
+     * 静默装载（批量导出）与切图后的 UI 恢复共用这一段，避免两份字段逻辑漂移。
+     *
+     * @return false = 该条目还没有热数据，调用方需要先沿导入链把它加载出来
+     */
+    private fun applySessionFields(item: EditItem): Boolean {
+        val hot = item.hot ?: return false
+        applyingSession = true
+        // 轻状态
+        currentStyle = item.styleId?.let { id -> LeicaEngine.Style.values().firstOrNull { it.id == id } }
+        currentCustomId = item.customId
+        val lv = item.levels
+        brightLevel = lv[EditItem.LV_BRIGHT]
+        exposureLevel = lv[EditItem.LV_EXPOSURE]
+        highlightLevel = lv[EditItem.LV_HIGHLIGHT]
+        shadowLevel = lv[EditItem.LV_SHADOW]
+        blackLevel = lv[EditItem.LV_BLACK]
+        satLevel = lv[EditItem.LV_SAT]
+        contrastLevel = lv[EditItem.LV_CONTRAST]
+        glowLevel = lv[EditItem.LV_GLOW]
+        // HDR：与导入期同一条规则——源图自带增益图时开关不起作用（只压制生效值，不改用户选择）
+        val hasSourceHdr = item.pendingHdr != null || item.fullResHdr != null
+        hdrBoost = item.hdrBoost && !hasSourceHdr
+        // 中状态
+        pendingHdr = item.pendingHdr
+        fullResFile = item.fullResFile
+        fullResExifHead = item.fullResHead
+        fullResWidth = item.fullResW
+        fullResHeight = item.fullResH
+        fullResHdr = item.fullResHdr
+        perfectBytes = item.perfectBytes
+        perfectStyle = item.perfectStyle
+        perfectApplied = item.perfectBytes != null
+        srBakedStyle = item.srBakedStyle
+        sourceUri = item.sourceUri
+        sourceIsRaw = item.sourceIsRaw
+        // 热状态
+        originalBytes = hot.workBytes
+        workWidth = hot.workW
+        workHeight = hot.workH
+        originalBitmap = hot.preview
+        resultBitmap = hot.result
+        thumbCache.clear()
+        thumbCache.putAll(hot.thumbs)
+        rawLin16 = hot.rawLin16
+        rawLin16Level = hot.rawLin16Level
+        rawPreviewJpeg = hot.rawPreviewJpeg
+        rawLinearLuma = hot.rawLinearLuma
+        pseudoLinearAllowed = hot.pseudoLinear
+        pseudoLinearFromHeif = hot.pseudoFromHeif
+        // 逐张级别的瞬时标志：绝不能跨图残留（上一张的回落会让下一张直接跳过全像素）
+        skipFullResOnce = false
+        fullResFallbackOnce = false
+        applyingSession = false
+        return true
+    }
+
+    /**
+     * 该位图是否仍被批量条目的热数据引用。
+     *
+     * 换图回收位图时必须问一句：这张是不是还挂在某个 EditItem.hot 里？是则归属已转移，
+     * 回收它等于把用户切回去的那张图打成废图（Canvas: trying to use a recycled bitmap）。
+     */
+    private fun isCachedByBatch(bmp: Bitmap?): Boolean {
+        if (bmp == null) return true
+        return batchItems.any { it.hot?.preview === bmp || it.hot?.result === bmp }
+    }
+
+    /**
+     * 释放调档预览基准。
+     *
+     * 与 [ensureAdjBase] 同一套所有权规则：基准与基图是同一对象时（小图直接复用）不能回收；
+     * 只有独立副本才回收。换图/切图前必须清空，否则会把上一张的 1920 基准一直钉在堆里。
+     */
+    private fun dropAdjCache() {
+        val baseO = adjBaseO
+        val baseR = adjBaseR
+        if (baseO != null && baseO !== adjSrcO && !baseO.isRecycled) baseO.recycle()
+        if (baseR != null && baseR !== adjSrcR && !baseR.isRecycled) baseR.recycle()
+        adjBaseO = null
+        adjSrcO = null
+        adjBaseR = null
+        adjSrcR = null
+    }
+
+    /**
+     * 只清全像素直通字段，**不删磁盘文件**。
+     *
+     * 批量切图时旧图的 cache 文件归属已经转移到对应 EditItem，删掉会让那张图永远失去
+     * 全像素导出的能力；真正该删的时机是清批次 / 退出应用（见 releaseBatchDisk）。
+     */
+    private fun detachFullResFields() {
+        fullResFile = null
+        fullResExifHead = null
+        fullResWidth = 0
+        fullResHeight = 0
+        fullResHdr = null
+    }
+
+    // ---- 批量会话：导入 / 切换 ----
+
+    /**
+     * 多选导入：只在第一张上跑完整导入链，其余保 uri 懒加载。
+     *
+     * 不预先解码所有图：30 张各解一次 = 几十秒等待 + 几百 MB 峰值，而用户多数只精修一两张。
+     */
+    private fun beginBatch(uris: List<Uri>) {
+        clearBatch()
+        val taken = if (uris.size > MAX_BATCH) uris.take(MAX_BATCH) else uris
+        taken.forEachIndexed { i, u -> batchItems.add(EditItem(i.toLong(), u)) }
+        if (uris.size > MAX_BATCH) toast("单批最多 ${MAX_BATCH} 张，已取前 ${MAX_BATCH} 张")
+        batchIndex = 0
+        refreshBatchNavUi()
+        loadBatchItemAt(0, firstLoad = true)
+    }
+
+    /** 清空批次（不动屏上位图：它们可能仍是当前预览，随字段/视图交接后由 GC 回收） */
+    private fun clearBatch() {
+        if (batchItems.isEmpty()) return
+        batchItems.forEach { it.releaseDisk() }
+        batchItems.clear()
+        batchIndex = -1
+        batchRecipe.clear()      // 换批次不能继承上一批的风格
+        ++switchSeq
+        refreshBatchNavUi()
+    }
+
+    /**
+     * 加载批内第 [index] 张（复用既有导入链，落地时把该图保存的设置装回）。
+     *
+     * @param firstLoad 首张：失败顺延下一张 —— 多选里第一张是坏 RAW/坏文件时不能让整批空转
+     */
+    private fun loadBatchItemAt(index: Int, firstLoad: Boolean = false) {
+        val item = batchItems.getOrNull(index) ?: return
+        batchIndex = index
+        refreshBatchNavUi()
+        // 先把「继承的配方」写进条目：落地时 applySessionFields 会直接读它
+        applyRecipeIfUntouched(item)
+        val seq = ++switchSeq
+        // 超分成片：字节才是最终工作图（重读 uri 会退回超分前），走落盘文件恢复
+        if (item.srBakedStyle != null && item.srResultFile != null) {
+            loadSrResult(item, seq)
+            return
+        }
+        onImagePicked(item.uri, item, silent = false, onResult = { ok ->
+            if (seq != switchSeq) return@onImagePicked
+            if (!ok && firstLoad && index + 1 < batchItems.size) {
+                DiagLog.w("Batch", "第 ${index + 1} 张导入失败，顺延下一张")
+                loadBatchItemAt(index + 1, firstLoad = true)
+            }
+        })
+    }
+
+    /**
+     * 切到批内第 [index] 张。首尾循环由调用方算好。
+     *
+     * 互斥：超分/导出/批量导出期间禁止切图 —— 超分用 originalBytes 身份比对识别「用户换图」，
+     * 切走会让成片在回来后落到 else 分支被丢弃；导出则直接读字段，切图就是串数据。
+     */
+    private fun switchTo(index: Int) {
+        if (batchItems.size <= 1 || index !in batchItems.indices || index == batchIndex) return
+        if (srBusy) { toast("画质处理中，请稍候再切换"); return }
+        if (exporting || batchExportRunning) { toast("导出中，请稍候再切换"); return }
+        // 当前图整体打包（轻状态 + 热数据）；全像素字段先摘掉，文件归属已转移到条目
+        batchItems.getOrNull(batchIndex)?.let { snapshotActiveInto(it) }
+        detachFullResFields()
+        // 作废在途渲染/调整：旧图结果绝不能盖到新图；派生位图随视图换图交给 GC
+        ++processingGeneration
+        ++liftGen
+        dropAdjCache()
+        liftedOriginal = null
+        liftedResult = null
+        val item = batchItems[index]
+        batchIndex = index
+        if (item.hot != null) {
+            applyRecipeIfUntouched(item)
+            applySessionFields(item)
+            refreshAfterSwitch(rebuildThumbs = true)
+            return
+        }
+        loadBatchItemAt(index)
+    }
+
+    /**
+     * 从落盘的超分成片恢复会话。
+     *
+     * 超分完成后 originalBytes 被替换为成片（2× 且已重新编码）；若该图被驱逐后重读 uri，
+     * 拿到的是超分**前**的字节，等于白做一次超分。故超分完成时同步落一份 cache（见 srListener）。
+     */
+    private fun loadSrResult(item: EditItem, seq: Int) {
+        val file = item.srResultFile ?: return
+        progress.visible()
+        executor.execute {
+            val bytes = runCatching { file.readBytes() }.getOrNull()
+            val preview = bytes?.let { decodePreview(it, 1600) }
+            val size = bytes?.let { ImageUtils.probeJpegSize(it) }
+            mainHandler.post {
+                progress.gone()
+                if (seq != switchSeq) return@post
+                if (bytes == null || preview == null || size == null) {
+                    DiagLog.e("Batch", "超分成片读取失败 ${file.length()}B")
+                    toast("超分成片读取失败，请重新导入该图")
+                    return@post
+                }
+                // 成片即最终工作图：不再走导入链（否则会被引擎上限二次缩放，白丢超分收益）
+                pendingHdr = null
+                detachFullResFields()
+                perfectBytes = item.perfectBytes
+                perfectStyle = item.perfectStyle
+                perfectApplied = item.perfectBytes != null
+                srBakedStyle = item.srBakedStyle
+                rawLin16 = null
+                rawLin16Level = 0
+                rawPreviewJpeg = null
+                rawLinearLuma = null
+                pseudoLinearAllowed = false
+                pseudoLinearFromHeif = false
+                originalBytes = bytes
+                workWidth = size[0]
+                workHeight = size[1]
+                originalBitmap = preview
+                resultBitmap = null
+                currentStyle = null
+                currentCustomId = null
+                sourceUri = item.uri
+                sourceIsRaw = item.sourceIsRaw
+                snapshotHotInto(item)
+                applySessionFields(item)
+                refreshAfterSwitch(rebuildThumbs = true)
+            }
+        }
+    }
+
+    /**
+     * 切图/冷加载落地后的 UI 刷新：把控件状态对齐当前字段。
+     *
+     * @param rebuildThumbs true = 缩略图池不属于本图，需要重建；false = 调用方刚跑过
+     *                      [generateThumbnails]（导入落地路径），再用缓存回填一次即可
+     */
+    private fun refreshAfterSwitch(rebuildThumbs: Boolean) {
+        txtEmpty.gone()
+        btnAdjust.visible()
+        adjPanel.gone()
+        txtStyleHint.visible()
+        btnSuperRes.visible()
+        btnSuperResFast.visible()
+        setHdrButton(hdrBoost)
+        updateHdrVisibility()
+        updateLumBarUi()
+        updatePerfectVisibility(currentStyle)
+        setPerfectButton(perfectApplied)
+        if (rebuildThumbs) {
+            if (thumbCache.size <= 1) {
+                generateThumbnails()
+            } else {
+                imgByStyle.forEach { (id, iv) -> thumbCache[id]?.let { iv.setImageBitmap(it) } }
+            }
+        }
+        // 下面是程序性还原：渲染链里的 onFilterSelected 不能把这张图误标成「用户调整过」
+        applyingSession = true
+        selectCardByEntry(currentEntry())
+        when {
+            // 完美成片：预览取成片字节（工作字节仍是原图，不能直接上屏）
+            perfectBytes != null -> {
+                resultBitmap = decodePreview(perfectBytes!!, 2048)
+                resultBitmap?.let { imgPreview.setImageBitmap(it) }
+                txtStyleHint.text = perfectStyle?.let { "${it.label} · 完美成片" } ?: "完美成片"
+            }
+            // 超分合成图：成片自带色彩，不再二次套色
+            srBakedStyle != null -> {
+                imgPreview.setImageBitmap(originalBitmap)
+                txtStyleHint.text = "${srBakedStyle!!.label} · 已合成"
+                recomputeAdjAsync()
+            }
+            // 有色彩：复用既有一致渲染链（自带 progress 与降级提示）
+            hasColor() -> {
+                imgPreview.setImageBitmap(originalBitmap)
+                onFilterSelected(currentEntry())
+            }
+            else -> {
+                imgPreview.setImageBitmap(originalBitmap)
+                txtStyleHint.text = "原图"
+                recomputeAdjAsync()
+            }
+        }
+        applyingSession = false
+        refreshBatchNavUi()
+    }
+
+    /**
+     * 用户手动改了当前图的设置。
+     *
+     * 两件事：①该图标为「已单独调整」，此后不再跟随配方；②它成为本批的新配方，
+     * 之后切到任何未调整的图都会立即套用 —— 这样「未调整的继承当前」是可见的，
+     * 而不是导出瞬间才偷偷换色。
+     */
+    private fun onUserSettingsChanged() {
+        if (applyingSession) return
+        val item = batchItems.getOrNull(batchIndex) ?: return
+        item.touched = true
+        snapshotLightInto(item)          // 只写轻状态：滑杆拖动每帧都会走到这里
+        batchRecipe.copyFrom(item)
+    }
+
+    /** 切到一张从未被单独调整过的图：自动套用本批配方（色彩 + 八档 + HDR） */
+    private fun applyRecipeIfUntouched(item: EditItem) {
+        if (item.touched || batchRecipe.isEmpty) return
+        item.applyRecipe(batchRecipe)
+    }
+
+    /** 通知里的色彩名（批量进度「第 3/12 张 · L-M9」用） */
+    private fun labelOf(item: EditItem): String =
+        item.customId?.let { CustomStyleStore.byId(it)?.name }
+            ?: item.styleId?.let { id ->
+                LeicaEngine.Style.values().firstOrNull { it.id == id }?.label
+            }
+            ?: "原图"
+
+    /** 首尾循环取上一张/下一张（n<=1 时返回当前，调用方不会再触发切图） */
+    private fun stepBatchIndex(delta: Int): Int {
+        val n = batchItems.size
+        if (n <= 1) return batchIndex.coerceAtLeast(0)
+        val cur = if (batchIndex in batchItems.indices) batchIndex else 0
+        return ((cur + delta) % n + n) % n
+    }
+
+    /**
+     * 切换 UI 的**唯一**显隐入口。
+     *
+     * 三处状态必须同时表达：张数（单张全隐藏 → 像素级零变化）、序号、可用性
+     * （超分/导出/批量导出期间置 0.35 透明度，与滑杆禁用同款口径）。
+     */
+    private fun refreshBatchNavUi() {
+        val n = batchItems.size
+        if (n <= 1) {
+            btnPrev.gone()
+            btnNext.gone()
+            txtBatchIndex.gone()
+            return
+        }
+        btnPrev.visible()
+        btnNext.visible()
+        txtBatchIndex.visible()
+        txtBatchIndex.text = "${batchIndex + 1} / $n"
+        val alpha = if (srBusy || exporting || batchExportRunning) 0.35f else 1f
+        btnPrev.alpha = alpha
+        btnNext.alpha = alpha
+    }
+
+    /**
+     * 超分成片落盘（仅批量会话需要）。
+     *
+     * 单张场景下成片就在内存里，切走即丢、也不需要恢复；批量场景切走再切回必须还原，
+     * 而 uri 指向的是超分前的原图，只能靠这份文件。
+     */
+    private fun persistSrResultForBatch(bytes: ByteArray) {
+        val item = batchItems.getOrNull(batchIndex) ?: return
+        executor.execute {
+            val f = writeCacheBytes(bytes, "leica_sr")
+            mainHandler.post {
+                if (f == null) return@post
+                val old = item.srResultFile
+                item.srResultFile = f
+                if (old != null && old != f) runCatching { old.delete() }
+                DiagLog.i("Batch", "超分成片已落盘 ${f.length()}B（冷加载真相源）")
             }
         }
     }
@@ -1921,6 +3023,7 @@ class MainActivity : AppCompatActivity() {
         val gen = ++processingGeneration
         currentStyle = style
         currentCustomId = null
+        onUserSettingsChanged()   // 批量：本张已单独调整，并成为新配方（程序性还原时自动跳过）
         if (style == null) {
             // 原图（档位≠0 时显示曝光版）
             refreshPreviewImage()
@@ -2017,6 +3120,7 @@ class MainActivity : AppCompatActivity() {
         val prevHint = txtStyleHint.text
         currentStyle = null
         currentCustomId = entry.styleId
+        onUserSettingsChanged()   // 批量：本张已单独调整（程序性还原时自动跳过）
         updatePerfectVisibility(null)
         txtStyleHint.text = "${def.name} · 自定义色彩"
         val work = originalBytes ?: return
@@ -2829,7 +3933,10 @@ class MainActivity : AppCompatActivity() {
         sb.progress = get() + 10
         sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, progressLevel: Int, fromUser: Boolean) {
-                if (fromUser) set(progressLevel - 10)
+                if (fromUser) {
+                    set(progressLevel - 10)
+                    onUserSettingsChanged()   // 批量：这张被单独调整，同时成为本批新配方
+                }
             }
 
             override fun onStartTrackingTouch(s: SeekBar) {}
@@ -2837,7 +3944,10 @@ class MainActivity : AppCompatActivity() {
         })
         val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDoubleTap(e: MotionEvent): Boolean {
-                if (!srBusy) set(0)
+                if (!srBusy) {
+                    set(0)
+                    onUserSettingsChanged()   // 双击复位也是一次用户调整
+                }
                 return true
             }
         })
@@ -3180,6 +4290,9 @@ class MainActivity : AppCompatActivity() {
                 } else if (originalBytes === srStartedBytes) {
                     // 用户未换图：预览/工作字节升级为高清版
                     originalBytes = st.jpeg
+                    // 批量：成片落一份 cache 作为「冷加载真相源」——切走再切回时若重读 uri，
+                    // 拿到的是超分前的字节，等于白做一次超分
+                    persistSrResultForBatch(st.jpeg)
                     // 工作字节已被超分成片替换：200MP 全像素直通源与之不再对应，作废
                     clearFullRes()
                     // 源增益图是原图尺寸，超分成片是 2× 且重新编码（不再有 HDR 容器），
@@ -3401,6 +4514,7 @@ class MainActivity : AppCompatActivity() {
             hdrBoost = false
             setHdrButton(false)
             SettingsStore.setHdrDefaultOn(this, false)   // 记忆本次关闭
+            onUserSettingsChanged()                      // 批量：HDR 开关属于本张的独立设置
             toast("HDR 输出已关闭")
             return
         }
@@ -3412,6 +4526,7 @@ class MainActivity : AppCompatActivity() {
         hdrBoost = true
         setHdrButton(true)
         SettingsStore.setHdrDefaultOn(this, true)        // 记忆本次开启，下次导入自动带 HDR
+        onUserSettingsChanged()                          // 批量：HDR 开关属于本张的独立设置
         toast("已开启：导出时写入 HDR 数据")
     }
 
@@ -3619,14 +4734,272 @@ class MainActivity : AppCompatActivity() {
 
     // ---- 导出 ----
 
+    /**
+     * 导出收尾回调：4 条落盘出口 + 提前返回分支各调用**恰好一次**。
+     *
+     * 非批量时 [exportDoneHook] 为 null → 空操作，单张导出与改前完全一致。
+     * 漏调会让批量导出停在那一张（看门狗兜底但会中止整批），多调会让同一张被计两次。
+     */
+    private fun notifyExportDone(ok: Boolean) {
+        val cb = exportDoneHook ?: return
+        exportDoneHook = null
+        cb.invoke(ok)
+    }
+
+    /**
+     * 导出入口分流：单张直接导；批量时先问「只导当前这张，还是全部」。
+     *
+     * 文案沿用 [buildBigExportMessage] 的样式：首行红色耗时提示 + 分行说明。
+     */
+    private fun onExportClicked() {
+        if (batchItems.size <= 1) { export(); return }
+        if (batchExportRunning) { toast("批量导出进行中"); return }
+        val n = batchItems.size
+        val untouched = batchItems.count { !it.touched }
+        val styleLabel = currentStyle?.label
+            ?: currentCustomId?.let { CustomStyleStore.byId(it)?.name }
+            ?: "原图"
+        val adj = listOf(brightLevel, exposureLevel, highlightLevel, shadowLevel,
+            blackLevel, satLevel, contrastLevel, glowLevel).count { it != 0 }
+        val red = "全部导出要逐张跑完整导出链（含高分辨率/全像素），耗时较长\n"
+        val rest = "当前：第 ${batchIndex + 1} / $n 张 · $styleLabel" +
+            (if (adj > 0) " · 调节 $adj 项" else "") + "\n" +
+            "全部：$n 张，均按各自画面上的设置导出" +
+            (if (untouched > 0) "（其中 $untouched 张未单独调整，会套用当前色彩）" else "") + "\n" +
+            "过程中会显示进度，可随时停止；已完成的部分会保留在图库。"
+        val msg = android.text.SpannableString(red + rest)
+        msg.setSpan(
+            android.text.style.ForegroundColorSpan(WARN_TEXT_COLOR),
+            0, red.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("导出当前 1 张，还是全部 $n 张？")
+            .setMessage(msg)
+            .setPositiveButton("全部导出") { _, _ -> startBatchExport() }
+            .setNegativeButton("仅当前张") { _, _ -> export() }
+            .setNeutralButton("取消", null)
+            .show()
+    }
+
+    // ---- 批量导出：逐张复用现有导出链 ----
+
+    /** 单张导出结果（汇总用） */
+    private class BatchExportResult(val index: Int, val ok: Boolean, val note: String)
+
+    private val batchExportPlan = mutableListOf<Int>()
+    private var batchExportCursor = -1
+    private val batchExportResults = mutableListOf<BatchExportResult>()
+    /** 批量结束后要回到的那张（用户点导出时正在看的那张） */
+    private var batchRestoreIndex = 0
+    private var batchWatchdog: Runnable? = null
+    /** 批量开始时间（完成通知/汇总里的用时） */
+    private var batchStartMs = 0L
+
+    private fun startBatchExport() {
+        if (batchExportRunning) return
+        if (exporting || srBusy) { toast("处理中，请稍候"); return }
+        if (batchItems.size <= 1) { export(); return }
+        // 配方兜底：未单独调整的图跟随当前设置（切图时已写过一次，这里覆盖「从未显示过」的图）
+        batchItems.getOrNull(batchIndex)?.let { snapshotActiveInto(it) }
+        val recipe = Recipe()
+        val cur = batchItems.getOrNull(batchIndex)
+        if (cur != null && cur.hasSettings) recipe.copyFrom(cur)
+        else if (!batchRecipe.isEmpty) recipe.copyFrom(batchRecipe)
+        if (recipe.isEmpty) { toast("请先选择一个色彩再全部导出"); return }
+        batchRecipe.copyFrom(recipe)
+        batchItems.forEach { it.applyRecipe(recipe) }
+
+        batchRestoreIndex = batchIndex
+        batchExportPlan.clear()
+        for (i in batchItems.indices) {
+            batchExportPlan.add((batchIndex + i) % batchItems.size)   // 从当前张开始环形
+        }
+        batchExportResults.clear()
+        batchExportCursor = -1
+        batchCancel = false
+        batchExportRunning = true
+        batchStartMs = System.currentTimeMillis()
+        batchOverlay.visible()
+        batchRing.max = 100
+        batchRing.setProgress(0)
+        batchMain.text = "正在导出 1 / ${batchExportPlan.size}"
+        batchSub.text = "准备中 · 可停止"
+        // 整批挂一次前台服务：切后台/锁屏继续跑，通知栏显示整批进度（与超分同一套机制）
+        startExportForeground("批量导出", "准备中", longTask = true)
+        refreshBatchNavUi()
+        DiagLog.i("Batch", "批量导出开始 ${batchExportPlan.size} 张 起始=$batchIndex")
+        stepBatchExport()
+    }
+
+    private fun stepBatchExport() {
+        if (!batchExportRunning) return
+        if (batchCancel) { finishBatchExport("已停止"); return }
+        val next = batchExportCursor + 1
+        if (next >= batchExportPlan.size) { finishBatchExport(null); return }
+        batchExportCursor = next
+        val idx = batchExportPlan[next]
+        val item = batchItems.getOrNull(idx)
+        if (item == null) { mainHandler.post { stepBatchExport() }; return }
+        // 通知栏前进到这一张（整批百分比 + 「第 3/12 张 · L-M9」）
+        ExportProgress.batchItem(next, batchExportPlan.size, labelOf(item))
+        // 超分合成图：成片在超分完成时已自动导出，再导一次只会产生重复文件
+        if (item.srBakedStyle != null) {
+            batchExportResults.add(BatchExportResult(idx, true, "超分已自动导出"))
+            mainHandler.post { stepBatchExport() }
+            return
+        }
+        batchMain.text = "正在导出 ${next + 1} / ${batchExportPlan.size}"
+        batchSub.text = "准备中 · 可停止"
+        ensureItemLoadedForExport(item) { ok ->
+            if (!batchExportRunning) return@ensureItemLoadedForExport
+            if (!ok) {
+                DiagLog.w("Batch", "第 ${next + 1} 张读取失败，跳过")
+                batchExportResults.add(BatchExportResult(idx, false, "读取失败"))
+                mainHandler.post { stepBatchExport() }
+                return@ensureItemLoadedForExport
+            }
+            // 让上一张的收尾（exporting=false / finally 清理）先落地，避免被 export() 入口闸门吞掉
+            mainHandler.postDelayed({
+                if (!batchExportRunning) return@postDelayed
+                if (batchCancel) { finishBatchExport("已停止"); return@postDelayed }
+                exportDoneHook = { ok2 -> onBatchItemFinished(idx, ok2) }
+                armBatchWatchdog(item)
+                export()
+            }, 120L)
+        }
+    }
+
+    /**
+     * 把某张图装进字段，供导出链读取。
+     *
+     * 与切图不同：这里走**静默装载**（不闪预览、不重建缩略图），并且先把手上的字段
+     * 快照回它自己的条目 —— 否则上一张的 200MP 直通源会被 clearFullRes 删掉。
+     */
+    private fun ensureItemLoadedForExport(item: EditItem, onReady: (Boolean) -> Unit) {
+        val prev = batchItems.getOrNull(batchIndex)
+        if (prev != null && prev !== item) snapshotActiveInto(prev)
+        detachFullResFields()
+        batchIndex = batchItems.indexOf(item)
+        if (item.hot != null) {
+            applySessionFields(item)
+            refreshBatchNavUi()
+            onReady(true)
+            return
+        }
+        onImagePicked(item.uri, item, silent = true) { ok -> onReady(ok) }
+    }
+
+    private fun onBatchItemFinished(index: Int, ok: Boolean) {
+        cancelBatchWatchdog()
+        if (!batchExportRunning) return
+        batchExportResults.add(BatchExportResult(index, ok, if (ok) "" else "导出失败"))
+        val done = batchExportCursor + 1
+        batchRing.setProgress((done * 100) / batchExportPlan.size.coerceAtLeast(1))
+        batchSub.text = if (ok) "已完成 $done / ${batchExportPlan.size}"
+        else "第 $done 张失败，继续下一张"
+        DiagLog.i("Batch", "第 $done 张${if (ok) "完成" else "失败"}")
+        mainHandler.postDelayed({
+            if (batchExportRunning) stepBatchExport()
+        }, 80L)
+    }
+
+    /**
+     * 单张看门狗：漏回调或引擎卡死时不能让整批永远停在浮层上。
+     *
+     * 超时即中止整批（不继续下一张）：此时字段可能仍被在途任务占用，继续会有串数据风险。
+     */
+    private fun armBatchWatchdog(item: EditItem) {
+        cancelBatchWatchdog()
+        val px = item.fullResW.toLong() * item.fullResH
+        val timeout = if (item.fullResFile != null && px >= BIG_EXPORT_PIXELS) 480_000L else 180_000L
+        val r = Runnable {
+            if (!batchExportRunning) return@Runnable
+            DiagLog.w("Batch", "第 ${batchExportCursor + 1} 张导出超时 ${timeout}ms")
+            exportDoneHook = null          // 迟到回调直接丢弃
+            batchCancel = true
+            finishBatchExport("第 ${batchExportCursor + 1} 张超时，已停止")
+        }
+        batchWatchdog = r
+        mainHandler.postDelayed(r, timeout)
+    }
+
+    private fun cancelBatchWatchdog() {
+        batchWatchdog?.let { mainHandler.removeCallbacks(it) }
+        batchWatchdog = null
+    }
+
+    private fun finishBatchExport(reason: String?) {
+        cancelBatchWatchdog()
+        exportDoneHook = null
+        batchExportRunning = false
+        batchCancel = false
+        batchOverlay.gone()
+        // 完成通知：张数 + 失败数 + 停止原因 + 用时（前台服务据此发"批量导出完成"）
+        val total = batchExportPlan.size
+        val okCount = batchExportResults.count { it.ok }
+        val failCount = batchExportResults.size - okCount
+        val elapsed = if (batchStartMs > 0) System.currentTimeMillis() - batchStartMs else 0L
+        val summary = buildString {
+            append("已导出 $okCount / $total 张")
+            if (failCount > 0) append(" · 失败 $failCount 张")
+            if (reason != null) append(" · $reason")
+            if (elapsed > 0) append(" · 用时 ${fmtDuration(elapsed)}")
+        }
+        ExportProgress.end(failCount == 0 && batchExportResults.size == total, summary)
+        refreshBatchNavUi()
+        // 导出期间字段被借给每一张，收尾必须回到用户原本看的那张
+        val back = batchItems.getOrNull(batchRestoreIndex)
+        if (back != null) {
+            batchItems.getOrNull(batchIndex)?.let { snapshotActiveInto(it) }
+            detachFullResFields()
+            batchIndex = batchRestoreIndex
+            if (back.hot != null) {
+                applySessionFields(back)
+                refreshAfterSwitch(rebuildThumbs = true)
+            } else {
+                loadBatchItemAt(batchRestoreIndex)
+            }
+        }
+        showBatchExportSummary(reason)
+    }
+
+    /** 汇总弹窗：数分钟等待必须有明确交代（与 [showBigExportDoneDialog] 同款口径） */
+    private fun showBatchExportSummary(reason: String?) {
+        if (isFinishing || isDestroyed) return
+        val total = batchExportPlan.size
+        val okCount = batchExportResults.count { it.ok }
+        val failed = batchExportResults.filter { !it.ok }
+        val skipped = batchExportResults.count { it.ok && it.note.isNotEmpty() }
+        val head = if (failed.isNotEmpty()) "成功 $okCount / $total 张" else "已导出 $okCount / $total 张"
+        val sb = StringBuilder(head)
+        if (skipped > 0) sb.append("（其中 $skipped 张为超分成片，此前已自动导出）")
+        if (failed.isNotEmpty()) {
+            sb.append("\n失败 ${failed.size} 张：")
+            failed.take(5).forEach { sb.append("\n· 第 ${it.index + 1} 张（${it.note}）") }
+            if (failed.size > 5) sb.append("\n· 等")
+        }
+        if (reason != null) sb.append("\n\n$reason")
+        sb.append("\n\n成片已保存到相册 Pictures/LeicaMoments。")
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("批量导出结束")
+            .setMessage(sb.toString())
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
     private fun export() {
-        if (exporting) { toast("全像素导出进行中，请稍候"); return }
-        if (srBusy) { toast("处理中，请稍候"); return }
-        val bytes = originalBytes ?: run { toast("请先导入图片"); return }
+        // 每条出口都必须恰好回调一次 notifyExportDone，否则批量导出会卡在这张上（看门狗兜底）
+        if (exporting) { toast("全像素导出进行中，请稍候"); notifyExportDone(false); return }
+        if (srBusy) { toast("处理中，请稍候"); notifyExportDone(false); return }
+        val bytes = originalBytes ?: run { toast("请先导入图片"); notifyExportDone(false); return }
         // 完美态：成片自带色彩，直接落盘（跳过滤镜链，避免二次套色）
         if (perfectApplied && perfectBytes != null) { exportPerfect(); return }
         // 合成态：超分完成时已自动导出（带徽章），手动导出会产生重复文件
-        if (srBakedStyle != null) { toast("超分完成后已自动导出至图库"); return }
+        if (srBakedStyle != null) {
+            toast("超分完成后已自动导出至图库")
+            notifyExportDone(true)      // 已导出过，批量里按成功计
+            return
+        }
         // C1/C4：全像素导出。原图档直通；甲档（LUT 家族）与乙档（模型链 M9/M9+/M10R/M9D）
         // 带滤镜逐带处理，同为全像素。SA 与 LP9（P9Post 依赖全图空间场）仍按工作字节导出。
         // 兜底重入：M9 高分辨率导出失败时会置位并重调本方法，让这次跳过全像素分支。
@@ -3714,7 +5087,7 @@ class MainActivity : AppCompatActivity() {
                 DiagLog.i("FullRes", "自定义 LUT 走 CustomLutPost 全图引导滤波，无法按带等价复现 → 按工作版导出")
             }
         }
-        if (!hasColor()) { toast("请先选择一个滤镜"); return }
+        if (!hasColor()) { toast("请先选择一个滤镜"); notifyExportDone(false); return }
         val customDef = currentCustomId?.let { CustomStyleStore.byId(it) }
         val customVer = customDef?.let { CustomStyleStore.currentVersion(it) }
         if (currentCustomId != null && (customDef == null || customVer == null)) {
@@ -3800,13 +5173,14 @@ class MainActivity : AppCompatActivity() {
             val hdrForExport = resolveHdrForExport(pendingHdr, bytes, out, hdrOn, rawLuma)
             mainHandler.post {
                 progress.gone()
-                if (gen != processingGeneration) return@post
+                if (gen != processingGeneration) { notifyExportDone(false); return@post }
                 if (Build.VERSION.SDK_INT <= 28 && !hasWritePermission()) {
                     requestWritePermission { export() }
                     return@post
                 }
                 val badgeOn = SettingsStore.leicaBadgeEnabled(this)
-                val marked = LeicaMark.mark(out, badgeOn)
+                val deviceMode = SettingsStore.deviceInfoModeCode(this)
+                val marked = LeicaMark.mark(out, badgeOn, deviceMode)
                 if (marked === out) DiagLog.w("Export",
                     if (badgeOn) "徽章写入失败（返回原字节）" else "徽章关闭：源图无徽章元数据（原样返回）")
                 // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）；
@@ -3839,6 +5213,7 @@ class MainActivity : AppCompatActivity() {
                         else -> "已保存到相册"
                     }
                 )
+                notifyExportDone(uri != null)
             }
         }
     }
@@ -3936,14 +5311,15 @@ class MainActivity : AppCompatActivity() {
                 fullResHdr ?: pendingHdr, srcBytes, outFinal, hdrOn, rawLinearLuma)
             mainHandler.post {
                 progress.gone()
-                if (gen != processingGeneration) return@post
+                if (gen != processingGeneration) { notifyExportDone(false); return@post }
                 if (Build.VERSION.SDK_INT <= 28 && !hasWritePermission()) {
                     // 老设备写权限兜底：授权后回落工作版重跑（避免 HiRes 再失败一次）
                     requestWritePermission { skipFullResOnce = true; export() }
                     return@post
                 }
                 val badgeOn = SettingsStore.leicaBadgeEnabled(this)
-                val marked = LeicaMark.mark(outFinal, badgeOn)
+                val deviceMode = SettingsStore.deviceInfoModeCode(this)
+                val marked = LeicaMark.mark(outFinal, badgeOn, deviceMode)
                 if (marked === outFinal) DiagLog.w("Export",
                     if (badgeOn) "徽章写入失败（返回原字节）" else "徽章关闭：源图无徽章元数据（原样返回）")
                 val hdrSrc = hdrForExport
@@ -3960,6 +5336,7 @@ class MainActivity : AppCompatActivity() {
                         else -> "已保存到相册（高分辨率 $hiSize）"
                     }
                 )
+                notifyExportDone(uri != null)
             }
         }
     }
@@ -3989,7 +5366,8 @@ class MainActivity : AppCompatActivity() {
         val px = w0.toLong() * h0
         // 全像素（≥45MP）：条带要跑半分钟以上，先讲清耗时与后台限制再开工
         val big = px >= BIG_EXPORT_PIXELS
-        if (big && !confirmed) {
+        // 批量导出：确认弹窗在批量入口已统一讲清，逐张再弹会打断整批
+        if (big && !confirmed && !batchExportRunning) {
             confirmBigExport(px, w0, h0) {
                 exportFullRes(
                     srcFile, op, nameTag, styleId,
@@ -4000,11 +5378,14 @@ class MainActivity : AppCompatActivity() {
         }
         if (big) {
             exporting = true
-            startExportForeground()
-            // 长任务通道用「环形进度 + 百分比」浮层替代普通转圈（与通知栏同源 ExportProgress）
-            showBigExportOverlay()
+            // 批量：整批已挂前台服务，且进度由批量浮层统一表达，不再叠一层大图浮层
+            if (!batchExportRunning) {
+                startExportForeground()
+                // 长任务通道用「环形进度 + 百分比」浮层替代普通转圈（与通知栏同源 ExportProgress）
+                showBigExportOverlay()
+            }
         } else {
-            progress.visible()
+            if (!batchExportRunning) progress.visible()
         }
         val gen = ++processingGeneration
         val hdrSrc = fullResHdr
@@ -4054,12 +5435,15 @@ class MainActivity : AppCompatActivity() {
                     mainHandler.post {
                         progress.gone()
                         hideBigExportOverlay()
-                        if (gen != processingGeneration || isFinishing || isDestroyed) return@post
-                        if (onFailure != null) onFailure()
-                        else toast(
-                            if (op != null) "全像素滤镜导出失败，请重试（详情见日志）"
-                            else "全像素导出失败，请重试（详情见日志）"
-                        )
+                        if (gen == processingGeneration && !isFinishing && !isDestroyed) {
+                            if (onFailure != null) onFailure()
+                            else toast(
+                                if (op != null) "全像素滤镜导出失败，请重试（详情见日志）"
+                                else "全像素导出失败，请重试（详情见日志）"
+                            )
+                        }
+                        // onFailure 会重入 export()，由内层回调；没有 onFailure 才自己收尾
+                        if (onFailure == null) notifyExportDone(false)
                     }
                     return@execute
                 }
@@ -4071,7 +5455,9 @@ class MainActivity : AppCompatActivity() {
                 // 档案等于「sRGB 数值 + P3 标签」，色彩管理的查看器会外扩 → 整体偏艳偏蓝
                 // （v1.4.x 相比 v1.3.0 的「M9 更饱和失真」根因）。无 ICC 标签 = sRGB 约定。
                 val badgeOn = SettingsStore.leicaBadgeEnabled(this)
-                val badgeOk = LeicaMark.markFile(tmp, null, badgeOn)
+                val badgeOk = LeicaMark.markFile(
+                    tmp, null, badgeOn, SettingsStore.deviceInfoModeCode(this)
+                )
                 val badgeMsg = if (badgeOn) "徽章写入${if (badgeOk) "完成" else "失败（保留原样）"}"
                 else "徽章关闭（剥离徽章元数据）${if (badgeOk) "完成" else "失败（保留原样）"}"
                 DiagLog.i("FullRes",
@@ -4115,17 +5501,22 @@ class MainActivity : AppCompatActivity() {
                 mainHandler.post {
                     progress.gone()
                     hideBigExportOverlay()
-                    if (gen != processingGeneration || isFinishing || isDestroyed) return@post
-                    // 柔光是空间算子不进条带链（半径 > 重叠带必带边不连续），全像素条带导出时明示
-                    val glowNote = if (op != null && glowLevel != 0) " · 柔光未参与" else ""
-                    val tail = (if (op != null) "· ${nameTag} 已套色" else "") + glowNote
-                    val hdrShort = hdrForExport != null && !hdrChk.ok
-                    when {
-                        uri == null -> toast("全像素导出失败，请重试（详情见日志）")
-                        big -> showBigExportDoneDialog(w, h, elapsed, hdrShort, tail)
-                        hdrShort -> toast("已保存到相册（${w}×$h）· HDR 数据未完整保留$tail")
-                        else -> toast("已保存到相册（${w}×$h）$tail")
+                    if (gen == processingGeneration && !isFinishing && !isDestroyed) {
+                        // 柔光是空间算子不进条带链（半径 > 重叠带必带边不连续），全像素条带导出时明示
+                        val glowNote = if (op != null && glowLevel != 0) " · 柔光未参与" else ""
+                        val tail = (if (op != null) "· ${nameTag} 已套色" else "") + glowNote
+                        val hdrShort = hdrForExport != null && !hdrChk.ok
+                        when {
+                            uri == null -> toast("全像素导出失败，请重试（详情见日志）")
+                            // 批量：逐张弹「导出完成」会打断整批（且 toast 已被重定向到浮层）
+                            big && batchExportRunning -> toast("已保存到相册（${w}×$h）$tail")
+                            big -> showBigExportDoneDialog(w, h, elapsed, hdrShort, tail)
+                            hdrShort -> toast("已保存到相册（${w}×$h）· HDR 数据未完整保留$tail")
+                            else -> toast("已保存到相册（${w}×$h）$tail")
+                        }
                     }
+                    // 无论 UI 是否被新任务顶掉，导出本身已落盘 → 批量必须收到回调
+                    notifyExportDone(uri != null)
                 }
             } catch (t: Throwable) {
                 DiagLog.e("FullRes", "全像素导出异常：${t.message}", t)
@@ -4138,10 +5529,12 @@ class MainActivity : AppCompatActivity() {
                         if (onFailure != null) onFailure()
                         else toast("全像素导出失败：${t.javaClass.simpleName}")
                     }
+                    if (onFailure == null) notifyExportDone(false)
                 }
             } finally {
                 runCatching { tmp.delete() }
-                ExportProgress.end(succeeded, exportSummary)
+                // 批量：通知栏由整批统一收尾，逐张 end 会让通知一闪一闪
+                if (!batchExportRunning) ExportProgress.end(succeeded, exportSummary)
                 exporting = false
             }
         }
@@ -4263,14 +5656,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 大图导出起前台服务（+通知权限）：切后台/息屏后条带编码继续跑 */
-    private fun startExportForeground() {
+    /**
+     * 起前台服务（+通知权限）并初始化进度单例。
+     *
+     * @param title    通知标题：单张「全像素导出」/ 批量「批量导出」
+     * @param stage    初始阶段文案（空 = 条带默认的「处理中…」）
+     * @param longTask 批量：服务把唤醒锁从 30 分钟放宽到 120 分钟
+     */
+    private fun startExportForeground(
+        title: String = "全像素导出",
+        stage: String = "",
+        longTask: Boolean = false
+    ) {
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1002)
         }
-        ExportProgress.begin()
+        ExportProgress.begin(title, stage, longTask)
         try {
             ContextCompat.startForegroundService(
                 this,
@@ -4345,12 +5749,16 @@ class MainActivity : AppCompatActivity() {
                 pendingHdr, originalBytes, out, hdrOn, rawLinearLuma)
             mainHandler.post {
                 progress.gone()
-                if (gen != processingGeneration) return@post
+                if (gen != processingGeneration) { notifyExportDone(false); return@post }
                 if (Build.VERSION.SDK_INT <= 28 && !hasWritePermission()) {
                     requestWritePermission { exportPerfect() }
                     return@post
                 }
-                val marked = LeicaMark.mark(out, SettingsStore.leicaBadgeEnabled(this))
+                val marked = LeicaMark.mark(
+                    out,
+                    SettingsStore.leicaBadgeEnabled(this),
+                    SettingsStore.deviceInfoModeCode(this)
+                )
                 // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF）；未回嵌则裁掉残留增益图尾数据
                 val hdrSrc = hdrForExport
                 val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
@@ -4366,6 +5774,7 @@ class MainActivity : AppCompatActivity() {
                         else -> "完美成片已保存"
                     }
                 )
+                notifyExportDone(uri != null)
             }
         }
     }
@@ -4433,18 +5842,32 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveNamed(bytes: ByteArray, name: String): Uri? {
         return try {
+            // 导出时间模式：original=DATE_TAKEN 取原图拍摄时间（无则当下）；
+            // now=先把 EXIF 三时间 tag 重写为当下，DATE_TAKEN 也取当下。
+            val now = System.currentTimeMillis()
+            val payload: ByteArray
+            val takenAt: Long
+            if (SettingsStore.exportTimeOriginal(this)) {
+                payload = bytes
+                takenAt = ExifTimes.readTakenAtEpoch(bytes) ?: now
+            } else {
+                payload = ExifTimes.rewriteToNow(this, bytes)
+                takenAt = now
+            }
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, name)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 if (Build.VERSION.SDK_INT >= 29) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/LeicaMoments")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, SettingsStore.saveRelativePath(this@MainActivity))
                     put(MediaStore.Images.Media.IS_PENDING, 1)
+                    // 相册「拍摄时间」显示与排序的依据（date_added/date_modified 由系统强制写为入库时刻）
+                    put(MediaStore.Images.ImageColumns.DATE_TAKEN, takenAt)
                 }
             }
             val resolver = contentResolver
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             uri?.let {
-                resolver.openOutputStream(it)?.use { os -> os.write(bytes) }
+                resolver.openOutputStream(it)?.use { os -> os.write(payload) }
                 if (Build.VERSION.SDK_INT >= 29) {
                     values.clear()
                     values.put(MediaStore.Images.Media.IS_PENDING, 0)
@@ -4462,12 +5885,25 @@ class MainActivity : AppCompatActivity() {
     /** 文件版入库：流式拷贝，不把整幅字节读进堆（200MP 直通导出用）。 */
     private fun saveNamedFile(file: File, name: String): Uri? {
         return try {
+            // 导出时间模式（文件路径版，免大文件整读进堆）：
+            // original=DATE_TAKEN 取原图拍摄时间（无则当下）；now=就地重写 EXIF 三时间 tag，DATE_TAKEN 取当下。
+            val now = System.currentTimeMillis()
+            val takenAt: Long
+            if (SettingsStore.exportTimeOriginal(this)) {
+                takenAt = ExifTimes.readTakenAtEpoch(file) ?: now
+            } else {
+                if (!ExifTimes.rewriteToNowInPlace(file)) {
+                    DiagLog.w("FullRes", "EXIF 时间重写为当下失败（文件原样保留）")
+                }
+                takenAt = now
+            }
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, name)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 if (Build.VERSION.SDK_INT >= 29) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/LeicaMoments")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, SettingsStore.saveRelativePath(this@MainActivity))
                     put(MediaStore.Images.Media.IS_PENDING, 1)
+                    put(MediaStore.Images.ImageColumns.DATE_TAKEN, takenAt)
                 }
             }
             val resolver = contentResolver
@@ -4517,6 +5953,12 @@ class MainActivity : AppCompatActivity() {
         else "「${style.label}」完整链路不可用，已降级为 LUT 模拟"
 
     private fun toast(msg: String) {
+        // 批量导出期间每张一条 toast 会刷屏（12 张就是 12 条排队)：改投浮层次行，
+        // 一次性结论由结束时的汇总弹窗交代，逐张细节在 DiagLog 里
+        if (batchExportRunning && ::batchSub.isInitialized) {
+            batchSub.text = msg
+            return
+        }
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 

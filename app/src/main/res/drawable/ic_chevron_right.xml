@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  批量切图「下一张」：矢量 chevron（2.6dp 粗描边 + 圆头）。
+  用矢量而不是字形 ›：字形在各机型字体下粗细/重心不一致，且默认墨迹只有字的 4 成高，
+  放在 48dp 圆里显得小而空。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M9.5,4.5 L17,12 L9.5,19.5"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

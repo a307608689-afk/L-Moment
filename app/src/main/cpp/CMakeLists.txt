@@ -69,9 +69,48 @@ add_library(jpegturbo STATIC ${LJT_SOURCES}
 target_include_directories(jpegturbo PUBLIC ${LJT} ${CMAKE_SOURCE_DIR}/ljt-config)
 target_compile_options(jpegturbo PRIVATE -O3 -fPIC -fvisibility=hidden -w)
 
+# ---- ncnn (Vulkan, prebuilt static, arm64-v8a slice only) ----
+# Package: ncnn-20261020-android-vulkan.zip (Tencent/ncnn, BSD-3-Clause).
+# Flags baked into this slice: NCNN_VULKAN=1 NCNN_SIMPLEVK=1 NCNN_STRING=1
+# NCNN_INT8=1 NCNN_THREADS=1 NCNN_OPENMP=1.
+# Imported by hand instead of find_package() on purpose: the exported target
+# carries INTERFACE_COMPILE_OPTIONS "-fno-rtti;-fno-exceptions", which must not
+# leak into our existing sources (libraw/libjpeg-turbo wrappers still use both).
+set(NCNN_ROOT ${CMAKE_SOURCE_DIR}/ncnn)
+if(ANDROID_ABI STREQUAL "arm64-v8a" AND EXISTS ${NCNN_ROOT}/lib/libncnn.a)
+    add_library(ncnn_vk STATIC IMPORTED)
+    set_target_properties(ncnn_vk PROPERTIES
+        IMPORTED_LOCATION ${NCNN_ROOT}/lib/libncnn.a
+        INTERFACE_INCLUDE_DIRECTORIES ${NCNN_ROOT}/include/ncnn)
+    foreach(_ncnn_dep glslang glslang-default-resource-limits
+            MachineIndependent OSDependent GenericCodeGen SPIRV)
+        add_library(ncnn_vk_${_ncnn_dep} STATIC IMPORTED)
+        set_target_properties(ncnn_vk_${_ncnn_dep} PROPERTIES
+            IMPORTED_LOCATION ${NCNN_ROOT}/lib/lib${_ncnn_dep}.a)
+    endforeach()
+    set(HAVE_NCNN TRUE)
+else()
+    set(HAVE_NCNN FALSE)
+    message(WARNING "ncnn prebuilt not found for ABI ${ANDROID_ABI}; GPU path disabled")
+endif()
+
 # ---- JNI 封装共享库 ----
-add_library(rawdecoder SHARED RawDecoder.cpp JpegStream.cpp ModelColor.cpp)
+add_library(rawdecoder SHARED RawDecoder.cpp JpegStream.cpp ModelColor.cpp NcnnNet.cpp LibcxxShim.cpp)
 target_link_libraries(rawdecoder libraw jpegturbo log jnigraphics)
+if(HAVE_NCNN)
+    # ncnn 的 AAsset* 路径需要 libandroid
+    target_link_libraries(rawdecoder android)
+    # glslang needs a whole-archive style grouping; the upstream package relies on
+    # its exported target ordering, a link group is the portable equivalent here.
+    target_link_libraries(rawdecoder
+        "-Wl,--start-group"
+        ncnn_vk ncnn_vk_glslang ncnn_vk_glslang-default-resource-limits
+        ncnn_vk_MachineIndependent ncnn_vk_OSDependent ncnn_vk_GenericCodeGen
+        ncnn_vk_SPIRV
+        "-Wl,--end-group"
+        "-fopenmp" "-static-openmp")
+    target_compile_definitions(rawdecoder PRIVATE HAVE_NCNN=1)
+endif()
 # ModelColor.cpp uses std::clamp / std::thread; the NDK defaults to C++14.
 set_target_properties(rawdecoder PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_include_directories(rawdecoder PRIVATE ${CMAKE_SOURCE_DIR}/libraw)

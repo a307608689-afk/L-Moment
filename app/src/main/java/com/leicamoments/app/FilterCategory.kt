@@ -3,7 +3,7 @@ package com.leicamoments.app
 /**
  * 滤镜条分类：**只影响 UI 展示**，不改动 LeicaEngine.Style 与处理链。
  *
- * [id] 与 SettingsStore 里的持久化值一一对应（all / leica / arri / ccd / fuji / kodak / custom）。
+ * [id] 与 SettingsStore 里的持久化值一一对应（all / leica / arri / hassel / ccd / fuji / kodak / custom）。
  *
  * [CUSTOM] 的 [styles] 恒为空：它装的是运行时创建的自定义色彩，
  * 数量走 [subtitle] 的动态入参，不能用 `styles.size` 推算。
@@ -36,6 +36,24 @@ enum class FilterCategory(val id: String, val title: String, val styles: List<Le
         LeicaEngine.Style.DUNE,
         LeicaEngine.Style.LALALAND,
         LeicaEngine.Style.JOKER
+    )),
+
+    /**
+     * H 色彩（HNCS 式自然还原，解析式烘焙 65³ LUT，八档）。
+     *
+     * 显示名与 F 胶片 / K 胶片同口径中性化：界面不出现显式品牌。
+     * 每档一个可指认特征——自然（基准）/ 蓝（深青天空）/ 绿（橄榄植被）/
+     * 人像（金黄肤色）/ 暖阳（黄昏金调）/ 灰（高级灰）/ 黑白（纯灰阶）/ 冷调（青灰）。
+     */
+    HASSEL("hassel", "H 色彩", listOf(
+        LeicaEngine.Style.HN,
+        LeicaEngine.Style.HB,
+        LeicaEngine.Style.HG,
+        LeicaEngine.Style.HP,
+        LeicaEngine.Style.HW,
+        LeicaEngine.Style.HS,
+        LeicaEngine.Style.HM,
+        LeicaEngine.Style.HC
     )),
 
     /** CCD 胶片家族（同一 SepLUT 链路，冷白/粉/暖三档色彩） */

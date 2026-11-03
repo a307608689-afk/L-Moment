@@ -7,10 +7,15 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
+import android.view.View
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import java.io.File
@@ -41,12 +46,59 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var rowLeicaBadge: LinearLayout
     private lateinit var txtLeicaBadgeValue: TextView
     private lateinit var txtLeicaBadgeHint: TextView
+    private lateinit var rowSavePath: LinearLayout
+    private lateinit var txtSavePathValue: TextView
+    private lateinit var txtSavePathHint: TextView
+    private lateinit var rowExportTime: LinearLayout
+    private lateinit var txtExportTimeValue: TextView
+    private lateinit var txtExportTimeHint: TextView
+    private lateinit var rowDeviceInfo: LinearLayout
+    private lateinit var txtDeviceInfoValue: TextView
+    private lateinit var txtDeviceInfoHint: TextView
     private lateinit var rowPseudoLinear: LinearLayout
     private lateinit var txtPseudoLinearValue: TextView
     private lateinit var txtPseudoLinearHint: TextView
+    private lateinit var rowGpu: LinearLayout
+    private lateinit var txtGpuValue: TextView
+    private lateinit var txtGpuHint: TextView
     private lateinit var rowHdrBoost: LinearLayout
     private lateinit var txtHdrBoostValue: TextView
     private lateinit var txtHdrBoostHint: TextView
+    private lateinit var rowAiService: LinearLayout
+    private lateinit var txtAiServiceValue: TextView
+    private lateinit var rowAiSearch: LinearLayout
+    private lateinit var txtAiSearchValue: TextView
+
+    // ---- 页内页面栈（设置首屏 + 5 个三级页）----
+    private lateinit var txtTitle: TextView
+    private lateinit var pageHub: View
+    private lateinit var pageDisplay: View
+    private lateinit var pageQuality: View
+    private lateinit var pageExport: View
+    private lateinit var pageAi: View
+    private lateinit var pageColors: View
+    private lateinit var rowNavDisplay: LinearLayout
+    private lateinit var txtNavDisplay: TextView
+    private lateinit var rowNavQuality: LinearLayout
+    private lateinit var txtNavQuality: TextView
+    private lateinit var rowNavExport: LinearLayout
+    private lateinit var txtNavExport: TextView
+    private lateinit var rowNavAi: LinearLayout
+    private lateinit var txtNavAi: TextView
+    private lateinit var rowNavColors: LinearLayout
+    private lateinit var txtNavColors: TextView
+
+    /** 设置页内的三级页：首屏 [HUB] + 五个分类页（标题即顶栏文字） */
+    private enum class SettingPage(val title: String) {
+        HUB("设置"),
+        DISPLAY("打开与显示"),
+        QUALITY("画质与性能"),
+        EXPORT("导出与元数据"),
+        AI("AI 服务"),
+        COLORS("我的色彩")
+    }
+
+    private var currentPage = SettingPage.HUB
 
     /**
      * RAW 解码亮度档位（id, 标题, 副标题）。id 与 [SettingsStore.rawThrLevel] 的存储值一一对应。
@@ -94,32 +146,195 @@ class SettingsActivity : AppCompatActivity() {
         rowLeicaBadge = findViewById(R.id.rowLeicaBadge)
         txtLeicaBadgeValue = findViewById(R.id.txtLeicaBadgeValue)
         txtLeicaBadgeHint = findViewById(R.id.txtLeicaBadgeHint)
+        rowSavePath = findViewById(R.id.rowSavePath)
+        txtSavePathValue = findViewById(R.id.txtSavePathValue)
+        txtSavePathHint = findViewById(R.id.txtSavePathHint)
+        rowExportTime = findViewById(R.id.rowExportTime)
+        txtExportTimeValue = findViewById(R.id.txtExportTimeValue)
+        txtExportTimeHint = findViewById(R.id.txtExportTimeHint)
+        rowDeviceInfo = findViewById(R.id.rowDeviceInfo)
+        txtDeviceInfoValue = findViewById(R.id.txtDeviceInfoValue)
+        txtDeviceInfoHint = findViewById(R.id.txtDeviceInfoHint)
         rowPseudoLinear = findViewById(R.id.rowPseudoLinear)
         txtPseudoLinearValue = findViewById(R.id.txtPseudoLinearValue)
         txtPseudoLinearHint = findViewById(R.id.txtPseudoLinearHint)
+        rowGpu = findViewById(R.id.rowGpu)
+        txtGpuValue = findViewById(R.id.txtGpuValue)
+        txtGpuHint = findViewById(R.id.txtGpuHint)
         rowHdrBoost = findViewById(R.id.rowHdrBoost)
         txtHdrBoostValue = findViewById(R.id.txtHdrBoostValue)
         txtHdrBoostHint = findViewById(R.id.txtHdrBoostHint)
-        findViewById<TextView>(R.id.btnBack).setOnClickListener { finish() }
+        rowAiService = findViewById(R.id.rowAiService)
+        txtAiServiceValue = findViewById(R.id.txtAiServiceValue)
+        rowAiSearch = findViewById(R.id.rowAiSearch)
+        txtAiSearchValue = findViewById(R.id.txtAiSearchValue)
+        txtTitle = findViewById(R.id.txtTitle)
+        pageHub = findViewById(R.id.pageHub)
+        pageDisplay = findViewById(R.id.pageDisplay)
+        pageQuality = findViewById(R.id.pageQuality)
+        pageExport = findViewById(R.id.pageExport)
+        pageAi = findViewById(R.id.pageAi)
+        pageColors = findViewById(R.id.pageColors)
+        rowNavDisplay = findViewById(R.id.rowNavDisplay)
+        txtNavDisplay = findViewById(R.id.txtNavDisplay)
+        rowNavQuality = findViewById(R.id.rowNavQuality)
+        txtNavQuality = findViewById(R.id.txtNavQuality)
+        rowNavExport = findViewById(R.id.rowNavExport)
+        txtNavExport = findViewById(R.id.txtNavExport)
+        rowNavAi = findViewById(R.id.rowNavAi)
+        txtNavAi = findViewById(R.id.txtNavAi)
+        rowNavColors = findViewById(R.id.rowNavColors)
+        txtNavColors = findViewById(R.id.txtNavColors)
+        rowNavDisplay.setOnClickListener { showPage(SettingPage.DISPLAY) }
+        rowNavQuality.setOnClickListener { showPage(SettingPage.QUALITY) }
+        rowNavExport.setOnClickListener { showPage(SettingPage.EXPORT) }
+        rowNavAi.setOnClickListener { showPage(SettingPage.AI) }
+        rowNavColors.setOnClickListener { showPage(SettingPage.COLORS) }
+        // ← 钮与系统返回同语义：三级页先回首屏，首屏再退出设置
+        findViewById<TextView>(R.id.btnBack).setOnClickListener { goBack() }
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = goBack()
+        })
         rowDefault.setOnClickListener { showDefaultPicker() }
         rowRaw.setOnClickListener { showRawPicker() }
         rowFullRes.setOnClickListener { showFullResPicker() }
         rowM9Hires.setOnClickListener { showM9HiresPicker() }
         rowLeicaBadge.setOnClickListener { showLeicaBadgePicker() }
+        rowSavePath.setOnClickListener { showSavePathPicker() }
+        rowExportTime.setOnClickListener { showExportTimePicker() }
+        rowDeviceInfo.setOnClickListener { showDeviceInfoPicker() }
         rowPseudoLinear.setOnClickListener { showPseudoLinearPicker() }
+        rowGpu.setOnClickListener { showGpuPicker() }
         rowHdrBoost.setOnClickListener { showHdrBoostPicker() }
         rowBackup.setOnClickListener { startBackup() }
         rowImport.setOnClickListener { startImport() }
         rowShareImport.setOnClickListener { startShareImport() }
         rowPinnedCross.setOnClickListener { showPinnedCrossPicker() }
+        rowAiService.setOnClickListener { AiSettingsSheet(this).show() }
+        rowAiSearch.setOnClickListener { AiSettingsSheet(this).show() }
         renderValue()
         renderRawValue()
         renderFullRes()
         renderLeicaBadge()
+        renderSavePath()
+        renderExportTime()
+        renderDeviceInfo()
         renderPseudoLinear()
+        renderGpu()
         renderHdrBoost()
         renderPinnedCross()
         renderBackupSummary()
+        renderAi()
+        renderHub()
+        // 旋转/重建后回到原三级页（否则一转屏就跳回首屏）
+        savedInstanceState?.getString(KEY_PAGE)?.let { name ->
+            SettingPage.values().firstOrNull { it.name == name }
+                ?.takeIf { it != SettingPage.HUB }
+                ?.let { showPage(it, animate = false) }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(KEY_PAGE, currentPage.name)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // AI 面板里可能刚改过 provider / 搜索源，或备份/导入刚结束，回来刷新两处摘要
+        if (this::txtAiServiceValue.isInitialized) renderAi()
+        if (this::txtNavDisplay.isInitialized) renderHub()
+    }
+
+    // ---- 页内页面栈：首屏 → 三级页 ----
+
+    /** 返回：三级页先回首屏，首屏再退出设置（← 钮与系统返回/手势同语义）。 */
+    private fun goBack() {
+        if (currentPage == SettingPage.HUB) finish() else showPage(SettingPage.HUB)
+    }
+
+    private fun pageView(page: SettingPage): View = when (page) {
+        SettingPage.HUB -> pageHub
+        SettingPage.DISPLAY -> pageDisplay
+        SettingPage.QUALITY -> pageQuality
+        SettingPage.EXPORT -> pageExport
+        SettingPage.AI -> pageAi
+        SettingPage.COLORS -> pageColors
+    }
+
+    /**
+     * 切页。旧页立即让位（避免两页同时在动互抢状态），新页淡入 + 24dp 横移进场，
+     * 动效语言与 [CategoryPopup] 的 130ms 一致。回首屏时重算摘要（三级页里可能刚改过）。
+     */
+    private fun showPage(page: SettingPage, animate: Boolean = true) {
+        if (page == currentPage) return
+        val from = pageView(currentPage)
+        val to = pageView(page)
+        val forward = page != SettingPage.HUB
+        val dx = 24 * resources.displayMetrics.density
+        currentPage = page
+        txtTitle.text = page.title
+        from.visibility = View.GONE
+        from.alpha = 1f
+        from.translationX = 0f
+        to.visibility = View.VISIBLE
+        if (animate) {
+            to.alpha = 0f
+            to.translationX = if (forward) dx else -dx
+            to.animate().alpha(1f).translationX(0f).setDuration(180).start()
+        } else {
+            to.alpha = 1f
+            to.translationX = 0f
+        }
+        if (page == SettingPage.HUB) renderHub()
+    }
+
+    /**
+     * 首屏摘要（只读）：把每个分类的关键状态露在入口上，
+     * 否则设置搬进三级页后必须点进去才知道当前值。
+     */
+    private fun renderHub() {
+        val def = SettingsStore.defaultSetting(this)
+        txtNavDisplay.text = if (def == SettingsStore.VALUE_LAST) {
+            "记忆上次"
+        } else {
+            FilterCategory.fromId(def)?.title ?: FilterCategory.ALL.title
+        }
+
+        txtNavQuality.text = "高位深 ${onOff(SettingsStore.pseudoLinearEnabled(this))}" +
+                " · GPU ${onOff(SettingsStore.gpuAccelEnabled(this))}"
+
+        val path = SettingsStore.saveRelativePath(this)
+        val pathLabel = if (path == SettingsStore.DEFAULT_SAVE_REL_PATH) "默认目录" else path
+        txtNavExport.text = "徽章 ${onOff(SettingsStore.leicaBadgeEnabled(this))} · $pathLabel"
+
+        val provider = AiProviderStore.currentProvider(this)
+        txtNavAi.text = when {
+            provider == null -> "未配置"
+            provider.model.isBlank() -> provider.name
+            else -> provider.model
+        }
+
+        val styles = CustomStyleStore.all()
+        txtNavColors.text = if (styles.isEmpty()) {
+            "备份与分享"
+        } else {
+            val versions = styles.fold(0) { acc, s -> acc + s.versions.size }
+            "${styles.size} 个色彩 / $versions 个版本"
+        }
+    }
+
+    private fun onOff(on: Boolean) = if (on) "开" else "关"
+
+    /** 「AI 服务」两行摘要：只读展示，具体增删改在 [AiSettingsSheet] 里。 */
+    private fun renderAi() {
+        val provider = AiProviderStore.currentProvider(this)
+        txtAiServiceValue.text = when {
+            provider == null -> "未配置"
+            else -> provider.model.ifBlank { provider.name }
+        }
+        val enabled = AiProviderStore.searchSources(this).count { it.enabled }
+        txtAiSearchValue.text = if (enabled == 0) "全部关闭" else "已启用 $enabled 个"
     }
 
     /**
@@ -307,6 +522,192 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    // ---- 保存位置 ----
+
+    /**
+     * 保存位置（MediaStore RELATIVE_PATH，默认 Pictures/LeicaMoments）。
+     *
+     * 四个预设档 + 「自定义目录…」（输入子目录名拼 Pictures/ 前缀，或直接给
+     * Pictures/、DCIM/ 开头的完整写法）+ 「恢复默认」。
+     * 顶层仅限 Pictures/DCIM 是 MediaStore 媒体集合目录的硬约束
+     * （SD 卡任意目录需 SAF，未做）。
+     */
+    private fun renderSavePath() {
+        val path = SettingsStore.saveRelativePath(this)
+        val isDefault = path == SettingsStore.DEFAULT_SAVE_REL_PATH
+        txtSavePathValue.text = if (isDefault) "默认" else path
+        txtSavePathHint.text = if (isDefault) {
+            "导出到相册 Pictures/LeicaMoments 目录（默认）\n子目录不存在会自动创建；只影响之后导出的文件"
+        } else {
+            "导出到相册 $path 目录\n子目录不存在会自动创建；只影响之后导出的文件"
+        }
+    }
+
+    private fun showSavePathPicker() {
+        CategoryPopup.show(
+            anchor = rowSavePath,
+            items = listOf(
+                CategoryPopup.Item("default", "默认（Pictures/LeicaMoments）", "与历史版本一致的落点"),
+                CategoryPopup.Item("pictures", "Pictures 根目录", "与系统截图等混在一起"),
+                CategoryPopup.Item("dcim", "DCIM", "相册相机集合根目录"),
+                CategoryPopup.Item("dcim_camera", "DCIM/Camera", "直接混入相机照片目录"),
+                CategoryPopup.Item("custom", "自定义目录…", "Pictures 下的自定义子目录"),
+                CategoryPopup.Item("reset", "恢复默认", "回到 Pictures/LeicaMoments")
+            ),
+            selectedId = when (SettingsStore.saveRelativePath(this)) {
+                "Pictures/LeicaMoments" -> "default"
+                "Pictures" -> "pictures"
+                "DCIM" -> "dcim"
+                "DCIM/Camera" -> "dcim_camera"
+                else -> "custom"
+            },
+            centerOnAnchor = false
+        ) { item ->
+            when (item.id) {
+                "default" -> {
+                    SettingsStore.resetSaveRelativePath(this)
+                    renderSavePath()
+                }
+                "pictures" -> {
+                    SettingsStore.setSaveRelativePath(this, "Pictures")
+                    renderSavePath()
+                }
+                "dcim" -> {
+                    SettingsStore.setSaveRelativePath(this, "DCIM")
+                    renderSavePath()
+                }
+                "dcim_camera" -> {
+                    SettingsStore.setSaveRelativePath(this, "DCIM/Camera")
+                    renderSavePath()
+                }
+                "custom" -> promptCustomSavePath()
+                "reset" -> {
+                    SettingsStore.resetSaveRelativePath(this)
+                    renderSavePath()
+                    Toast.makeText(this, "已恢复默认保存位置", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * 「自定义目录…」输入弹窗：输入子目录名拼 `Pictures/<名>`，
+     * 也接受 `Pictures/`、`DCIM/` 开头的完整写法。经 [SettingsStore.setSaveRelativePath]
+     * 校验，非法输入拒绝保存并提示。
+     */
+    private fun promptCustomSavePath() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            hint = "如：Leica，或 Pictures/Leica、DCIM/Leica"
+            setText(SettingsStore.saveRelativePath(this@SettingsActivity))
+            setSingleLine(true)
+        }
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(64, 32, 64, 0)
+            addView(input)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("自定义保存目录")
+            .setMessage("输入 Pictures 下的子目录名（自动创建），\n或 Pictures/、DCIM/ 开头的完整路径。")
+            .setView(wrap)
+            .setPositiveButton("保存") { _, _ ->
+                val value = input.text.toString().trim()
+                if (SettingsStore.setSaveRelativePath(this, value)) {
+                    renderSavePath()
+                    Toast.makeText(this, "保存位置：${SettingsStore.saveRelativePath(this)}", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "路径不合法：顶层须为 Pictures 或 DCIM，且不含特殊字符", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    // ---- 导出时间 ----
+
+    /**
+     * 导出时间（默认按图片原本时间）。
+     * original：相册按源图拍摄时间显示与排序（DATE_TAKEN 取原图 EXIF 时间）；
+     * now：EXIF 三个时间 tag 重写为导出时刻，如刚拍的照片。
+     * 文件属性时间（date_added）始终为导出时刻——系统强制写、应用不可改。
+     */
+    private fun renderExportTime() {
+        val original = SettingsStore.exportTimeOriginal(this)
+        txtExportTimeValue.text = if (original) "按图片原本时间" else "按当下时间"
+        txtExportTimeHint.text = if (original) {
+            "相册按源图拍摄时间显示与排序\n文件属性时间始终为导出时刻（系统机制）\nGPS、机型、拍摄参数不受影响"
+        } else {
+            "导出的照片在相册里如刚拍摄（EXIF 时间=导出时刻）\n文件属性时间始终为导出时刻（系统机制）\nGPS、机型、拍摄参数不受影响"
+        }
+    }
+
+    private fun showExportTimePicker() {
+        CategoryPopup.show(
+            anchor = rowExportTime,
+            items = listOf(
+                CategoryPopup.Item("original", "按图片原本时间导出", "相册按源图拍摄时间显示与排序"),
+                CategoryPopup.Item("now", "按当下时间信息导出", "导出的照片在相册里如刚拍摄")
+            ),
+            selectedId = if (SettingsStore.exportTimeOriginal(this)) "original" else "now",
+            centerOnAnchor = false
+        ) { item ->
+            SettingsStore.setExportTimeMode(this, item.id)
+            renderExportTime()
+        }
+    }
+
+    /**
+     * 导出设备标识（默认跟随原图）。
+     *
+     * 历史版本把徽章元数据里的机型字段写死成 Xiaomi 15 Ultra，导致任何手机拍的图
+     * 导出后都显示该机型；本档位让机型跟随源图 EXIF，另留旧行为与本机型号两个回退档。
+     */
+    private fun renderDeviceInfo() {
+        val mode = SettingsStore.deviceInfoMode(this)
+        txtDeviceInfoValue.text = when (mode) {
+            SettingsStore.DEVICE_INFO_FIXED -> "固定 15 Ultra"
+            SettingsStore.DEVICE_INFO_LOCAL -> "本机型号"
+            else -> "跟随原图"
+        }
+        txtDeviceInfoHint.text = when (mode) {
+            SettingsStore.DEVICE_INFO_FIXED ->
+                "固定写入 Xiaomi 15 Ultra（旧版行为）\n若切换后相册徕卡徽章恢复正常，说明徽章判定依赖该字段"
+            SettingsStore.DEVICE_INFO_LOCAL ->
+                "写入当前手机型号（Build.MODEL）\n只影响设备标识，拍摄参数与 GPS 不受影响"
+            else ->
+                "导出图片的机型取自原图 EXIF；原图无 EXIF 时使用本机型号\n只影响设备标识，拍摄参数与 GPS 不受影响"
+        }
+    }
+
+    private fun showDeviceInfoPicker() {
+        CategoryPopup.show(
+            anchor = rowDeviceInfo,
+            items = listOf(
+                CategoryPopup.Item(
+                    SettingsStore.DEVICE_INFO_SOURCE,
+                    "跟随原图（默认）",
+                    "写入拍摄设备的真实机型"
+                ),
+                CategoryPopup.Item(
+                    SettingsStore.DEVICE_INFO_FIXED,
+                    "固定 Xiaomi 15 Ultra",
+                    "保持旧版徽章模板"
+                ),
+                CategoryPopup.Item(
+                    SettingsStore.DEVICE_INFO_LOCAL,
+                    "本机型号",
+                    "使用当前手机型号"
+                )
+            ),
+            selectedId = SettingsStore.deviceInfoMode(this),
+            centerOnAnchor = false
+        ) { item ->
+            SettingsStore.setDeviceInfoMode(this, item.id)
+            renderDeviceInfo()
+        }
+    }
+
     /**
      * 高位深工作域（伪 RAW，JPG/HEIF，**默认关**）：
      * 开 = 导入时建立 16-bit 线性基准，七档影调在 16 位域运算（预览与导出同源）；
@@ -337,6 +738,42 @@ class SettingsActivity : AppCompatActivity() {
         ) { item ->
             SettingsStore.setPseudoLinearEnabled(this, item.id == "on")
             renderPseudoLinear()
+        }
+    }
+
+    /**
+     * GPU 加速（实验，默认关）。
+     *
+     * 关闭时完全不加载 GPU 相关资源，导出与改前一致；开启后只有完美档与超分快速档走 GPU。
+     * 判负（本机 GPU 更慢 / 连续失败）时 [GpuNet] 会把开关自动关掉，这里刷新即可看到。
+     */
+    private fun renderGpu() {
+        val on = SettingsStore.gpuAccelEnabled(this)
+        txtGpuValue.text = if (on) "开" else "关"
+        txtGpuHint.text = if (on) {
+            "已开启：完美档与超分快速档走 GPU\n" +
+                "若本机 GPU 反而更慢，会自动改用 CPU 并把本开关关掉"
+        } else {
+            "关闭（默认）：不加载 GPU，导出与改前完全一致\n" +
+                "开启后只影响完美档与超分快速档；首次导出会多等几秒做一次本机对比"
+        }
+    }
+
+    private fun showGpuPicker() {
+        CategoryPopup.show(
+            anchor = rowGpu,
+            items = listOf(
+                CategoryPopup.Item("off", "关闭（默认）", "不加载 GPU，与改前完全一致"),
+                CategoryPopup.Item("on", "开启（实验）", "完美档与超分快速档加速；更慢会自动关掉")
+            ),
+            selectedId = if (SettingsStore.gpuAccelEnabled(this)) "on" else "off",
+            centerOnAnchor = false
+        ) { item ->
+            val on = item.id == "on"
+            SettingsStore.setGpuAccelEnabled(this, on)
+            // 关掉时立刻递归回收会话与显存；开着的会话在下次导出开始时才建立
+            if (!on) GpuNet.release()
+            renderGpu()
         }
     }
 
@@ -597,5 +1034,10 @@ class SettingsActivity : AppCompatActivity() {
             isAppearanceLightStatusBars = false
             isAppearanceLightNavigationBars = false
         }
+    }
+
+    private companion object {
+        /** 旋转/重建时恢复所在三级页 */
+        const val KEY_PAGE = "settings_page"
     }
 }

@@ -200,30 +200,53 @@ object M9Perfect {
         val maskFb = ByteBuffer.allocateDirect(4 * plane)
             .order(ByteOrder.nativeOrder()).asFloatBuffer() // mask 全 0（humanseg 不移植）
 
-        val styledBmp: Bitmap
-        OnnxTensor.createTensor(env, rgbFb, longArrayOf(1, 3, inH.toLong(), inW.toLong())).use { tRgb ->
-            OnnxTensor.createTensor(env, maskFb, longArrayOf(1, 1, inH.toLong(), inW.toLong())).use { tMask ->
-                st.run(mapOf("rgb" to tRgb, "mask" to tMask)).use { res ->
-                    val out = res[0] as OnnxTensor
-                    val ob = out.floatBuffer
-                    val outPx = IntArray(NW * NH)
-                    for (y in 0 until NH) {
-                        var o = y * NW
-                        val iR = (PAD + y) * inW + PAD
-                        val iG = plane + (PAD + y) * inW + PAD
-                        val iB = plane * 2 + (PAD + y) * inW + PAD
-                        for (x in 0 until NW) {
-                            val r = (ob.get(iR + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                            val g = (ob.get(iG + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                            val b = (ob.get(iB + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                            outPx[o + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                        }
-                    }
-                    styledBmp = Bitmap.createBitmap(NW, NH, Bitmap.Config.ARGB_8888)
-                    styledBmp.setPixels(outPx, 0, NW, 0, 0, NW, NH)
+        // StyleTrans 单次 501 GFLOP，是完美档里最贵的一步：先试 GPU，失败或判负走 ORT。
+        // 与降级链共用同一份模型与同一份标定结论（GpuNet 按 model.id 存判定）。
+        var stGpuOut: FloatArray? = null
+        val stUseGpu = GpuNet.isEnabled(app) &&
+                GpuNet.prepare(app, GpuNet.Model.STYLETRANS,
+                    arrayOf(intArrayOf(3, inH, inW), intArrayOf(1, inH, inW)))
+        if (stUseGpu) {
+            rgbFb.rewind()
+            maskFb.rewind()
+            val tg = System.currentTimeMillis()
+            stGpuOut = GpuNet.run(GpuNet.Model.STYLETRANS, arrayOf(rgbFb, maskFb),
+                intArrayOf(3, 1), intArrayOf(inH, inH), intArrayOf(inW, inW))
+            val gpuMs = System.currentTimeMillis() - tg
+            if (stGpuOut != null && GpuNet.needsProbe(app, GpuNet.Model.STYLETRANS)) {
+                val tc = System.currentTimeMillis()
+                val cpuOut = runCatching {
+                    M9OrtFallback.runOrtStyletrans(st, env, rgbFb, maskFb, inH, inW)
+                }.getOrNull()
+                val cpuMs = System.currentTimeMillis() - tc
+                if (cpuOut != null &&
+                        !GpuNet.reportProbe(app, GpuNet.Model.STYLETRANS, gpuMs, cpuMs)) {
+                    stGpuOut = cpuOut     // 判负：用刚算出的 CPU 结果
                 }
             }
+            if (stGpuOut == null) DiagLog.w(TAG, "styletrans 走 CPU 兜底：${GpuNet.lastError}")
         }
+        val stOut: java.nio.FloatBuffer = stGpuOut?.let { java.nio.FloatBuffer.wrap(it) }
+            ?: java.nio.FloatBuffer.wrap(
+                M9OrtFallback.runOrtStyletrans(st, env, rgbFb, maskFb, inH, inW)
+                    ?: return null)
+
+        // stPx：与后段全分辨率合成的 outPx 区分开，避免同名冲突
+        val stPx = IntArray(NW * NH)
+        for (y in 0 until NH) {
+            var o = y * NW
+            val iR = (PAD + y) * inW + PAD
+            val iG = plane + (PAD + y) * inW + PAD
+            val iB = plane * 2 + (PAD + y) * inW + PAD
+            for (x in 0 until NW) {
+                val r = (stOut.get(iR + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
+                val g = (stOut.get(iG + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
+                val b = (stOut.get(iB + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
+                stPx[o + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        val styledBmp = Bitmap.createBitmap(NW, NH, Bitmap.Config.ARGB_8888)
+        styledBmp.setPixels(stPx, 0, NW, 0, 0, NW, NH)
         onProgress?.invoke(pDone)
 
         // ---- 放大回画布，取像素数组（Bitmap 与数组不同时驻留，降峰值）----
@@ -237,7 +260,7 @@ object M9Perfect {
         big.recycle()
 
         // ---- 真 ColorFix（544 分块）----
-        val fixed = colorfix(env, cf, bigPx, cw, ch, styledPx, pDone, pEnd, onProgress)
+        val fixed = colorfix(app, env, cf, bigPx, cw, ch, styledPx, pDone, pEnd, onProgress)
         bigPx.fill(0)
         styledPx.fill(0)
 
@@ -267,6 +290,7 @@ object M9Perfect {
      * step 512 / 中心 512 保留 / margin 16。与 m9/styletrans.py 一致。
      */
     private fun colorfix(
+        app: Context,
         env: OrtEnvironment,
         sess: OrtSession,
         origPx: IntArray,
@@ -313,11 +337,20 @@ object M9Perfect {
         val buf = ByteBuffer.allocateDirect(4 * BATCH * 6 * tilePlane)
             .order(ByteOrder.nativeOrder()).asFloatBuffer()
 
+        // GPU 通道（设置页开关，默认关）：一次一块（batch=1），失败该块回落 ORT。
+        // var：首次标定判负后，本张图剩下的块立即改走 CPU。
+        var useGpu = GpuNet.isEnabled(app) &&
+                GpuNet.prepare(app, GpuNet.Model.COLORFIX, arrayOf(intArrayOf(6, TILE, TILE)))
+        val tAll = System.currentTimeMillis()
+        var gpuTiles = 0
+        var cpuTiles = 0
+        var fallbackLogged = false
+
         var start = 0
         var done = 0
         val span = Math.max(1, pTo - pFrom)
         while (start < count) {
-            val n = Math.min(BATCH, count - start)
+            val n = if (useGpu) 1 else Math.min(BATCH, count - start)
             for (i in 0 until n) {
                 val j = start + i
                 val oy = MARGIN - (ty[j] - tys[j])
@@ -344,28 +377,58 @@ object M9Perfect {
                 }
             }
 
-            OnnxTensor.createTensor(env, buf,
-                longArrayOf(n.toLong(), 6, TILE.toLong(), TILE.toLong())).use { tIn ->
-                sess.run(mapOf("x" to tIn)).use { res ->
-                    val ob = (res[0] as OnnxTensor).floatBuffer
-                    for (i in 0 until n) {
-                        val j = start + i
-                        // 读回尺寸必须用中心保留窗口：tth/ttw 含 16px margin 外扩，
-                        // 内部片（tys/txs 已内缩 16）会多读 16 行/列，越过 544x544 平面导致越界
-                        val th = tkh[j]
-                        val tw = tkw[j]
-                        val base = i * 3 * tilePlane
-                        for (row in 0 until th) {
-                            val drow = (ty[j] + row) * w + tx[j]
-                            val srow = base + (MARGIN + row) * TILE + MARGIN
-                            for (col in 0 until tw) {
-                                val si = srow + col
-                                val r = (ob.get(si) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                                val g = (ob.get(si + tilePlane) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                                val b = (ob.get(si + 2 * tilePlane) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                                out[drow + col] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                            }
+            // 先试 GPU，失败或判负回落 ORT（同一份输入缓冲，零额外拷贝）
+            var gpuOut: FloatArray? = null
+            if (useGpu) {
+                buf.rewind()
+                val tg = System.currentTimeMillis()
+                gpuOut = GpuNet.run(GpuNet.Model.COLORFIX, arrayOf(buf),
+                    intArrayOf(6), intArrayOf(TILE), intArrayOf(TILE))
+                val gpuMs = System.currentTimeMillis() - tg
+                if (gpuOut != null) {
+                    gpuTiles++
+                    // 本机首次使用：同块再跑一次 CPU，判掉「能跑但更慢」的机型
+                    if (GpuNet.needsProbe(app, GpuNet.Model.COLORFIX)) {
+                        val tc = System.currentTimeMillis()
+                        // 标定只是锦上添花，它自身任何异常都不能连累导出
+                        val cpuOut = runCatching { ortColorfix(env, sess, buf, n) }.getOrNull()
+                        val cpuMs = System.currentTimeMillis() - tc
+                        if (cpuOut != null &&
+                                !GpuNet.reportProbe(app, GpuNet.Model.COLORFIX, gpuMs, cpuMs)) {
+                            gpuOut = cpuOut     // 判负：直接用刚算出的 CPU 结果，不白算
+                            cpuTiles++
+                            useGpu = false      // 本张图剩下的块不必再试 GPU
                         }
+                    }
+                } else {
+                    if (!fallbackLogged) {
+                        fallbackLogged = true
+                        DiagLog.w(TAG, "colorfix 走 CPU 兜底：${GpuNet.lastError}")
+                    }
+                    cpuTiles++
+                }
+            } else {
+                cpuTiles++
+            }
+            // ORT 也失败时按原语义抛异常（上层报"完美档失败"），不交半成品出去
+            val ob: FloatArray = gpuOut ?: (ortColorfix(env, sess, buf, n)
+                ?: error("colorfix 推理失败"))
+            for (i in 0 until n) {
+                val j = start + i
+                // 读回尺寸必须用中心保留窗口：tth/ttw 含 16px margin 外扩，
+                // 内部片（tys/txs 已内缩 16）会多读 16 行/列，越过 544x544 平面导致越界
+                val th = tkh[j]
+                val tw = tkw[j]
+                val base = i * 3 * tilePlane
+                for (row in 0 until th) {
+                    val drow = (ty[j] + row) * w + tx[j]
+                    val srow = base + (MARGIN + row) * TILE + MARGIN
+                    for (col in 0 until tw) {
+                        val si = srow + col
+                        val r = (ob[si] * 127.5f + 128f).toInt().coerceIn(0, 255)
+                        val g = (ob[si + tilePlane] * 127.5f + 128f).toInt().coerceIn(0, 255)
+                        val b = (ob[si + 2 * tilePlane] * 127.5f + 128f).toInt().coerceIn(0, 255)
+                        out[drow + col] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                     }
                 }
             }
@@ -373,7 +436,41 @@ object M9Perfect {
             done += n
             onProgress?.invoke(pFrom + done * span / count)
         }
+        // 每次处理只留一行汇总（长按日志可见），逐块打点会把诊断环冲掉
+        if (GpuInferConfig.LOG && gpuTiles > 0) {
+            DiagLog.w(TAG, "colorfix tiles=$count gpu=$gpuTiles cpu=$cpuTiles " +
+                    "${System.currentTimeMillis() - tAll}ms")
+        }
         return out
+    }
+
+    /**
+     * ORT 参考路径：输出整块拷进 FloatArray，好让 GPU / ORT 两条分支共用同一段读出代码。
+     *
+     * 注意输入必须是**限长视图**：`buf` 按 BATCH 分配，而 GPU 路径一次只喂 1 块，
+     * ORT 要求 `remaining()` 与形状元素数严格相等（多一个都抛 OrtException）。
+     */
+    private fun ortColorfix(
+        env: OrtEnvironment,
+        sess: OrtSession,
+        buf: java.nio.FloatBuffer,
+        n: Int
+    ): FloatArray? {
+        val need = n * 6 * TILE * TILE
+        val view = buf.duplicate()
+        view.position(0)
+        view.limit(minOf(need, view.capacity()))
+        var arr: FloatArray? = null
+        OnnxTensor.createTensor(env, view,
+            longArrayOf(n.toLong(), 6, TILE.toLong(), TILE.toLong())).use { tIn ->
+            sess.run(mapOf("x" to tIn)).use { res ->
+                val fb = (res[0] as OnnxTensor).floatBuffer
+                val a = FloatArray(fb.remaining())
+                fb.get(a)
+                arr = a
+            }
+        }
+        return arr
     }
 
     private fun colorfixSession(app: Context): OrtSession? {

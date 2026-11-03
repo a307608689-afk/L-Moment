@@ -41,6 +41,36 @@ public final class Lm9Stats {
 
     private static final int PROBE = 320;      // 统计/选桶用的探测边长（足够稳且快）
 
+    // ---- v16：中性亮部归天空（治"灰白薄雾/云絮状硬边色块"）----
+    // 根因：三档曲线亮度差 24~28%（sky 0.919~0.959 / other 0.720~0.760），而薄雾里
+    // b-g、r-b、chroma 只有几级自然浓度起伏，落在 blueness 0.078 / warmSky 0.060 /
+    // satGate 0.055 的窄斜坡内 → 权重 0~1 整段摆动 → ±3 级输入起伏被放大成 ±25 级硬边块。
+    // 判据方向还与曲线增益同向（越蓝→越归 sky→B 压得最少 0.959 vs 0.760），形成正反馈。
+    // 语义修正：低饱和 + 中高亮 = 雾/云/水汽/白墙，物理上属天空侧，不该被 other 档压暗。
+    // 该区权重恒 1.0（不是 0.85——留 15% other 混合仍余 4% 亮度差，斑块隐约可见）。
+    // 定标依据（用户样张 20261102-180311.jpg 纯雾区实测，原图域）：
+    //   雾区 chroma 均值 0.091（p10 0.082 / p90 0.106）、lum 0.802；山体 chroma 0.13~0.33。
+    // 纪律：门控斜坡不得与雾区噪声幅度重叠，故全效区间盖过 0.11、归零从 0.20 起。
+    static final boolean NEUTRAL_ENABLED = true;
+    static final float N_CHROMA_HI = 0.20f;   // chroma 高于此 → 中性权重 0
+    static final float N_CHROMA_LO = 0.13f;   // chroma 低于此 → 中性权重 1
+    static final float N_LUM_LO = 0.58f;      // lum 低于此 → 0（中景山体 0.40~0.55 不入选）
+    static final float N_LUM_HI = 0.72f;      // lum 高于此 → 1
+
+    // ---- v16：三区域权重场空间化（治残余细碎斑 + 类内抖动）----
+    // 探测图（320 宽）上算权重 → 高斯平滑 → 双线性上采样；全图权重 = 场×w + 逐像素×(1-w)。
+    // PC 台扫参：sigma 6→14 收益趋零，w 0.75 优于 1.0（保留细节响应、边界更贴）。
+    static final boolean FIELD_ENABLED = true;
+    static final float FIELD_SIGMA = 8.0f;
+    static final float FIELD_W = 0.75f;
+
+    // ---- 天空域单等效曲线（v12 补丁，v16 起停用；代码保留供 A/B）----
+    // 停用理由：它是为同一症状打的补丁，且启用条件不稳——新增 neutral 会把域内平均权重
+    // wbar 从 0.140 抬到 0.502（越过 0.30 门槛）而突然激活；该域在本样张覆盖 75.6% 画面
+    // （候选只要 b-g>2，蓝绿山体也入选），区域被统一到单等效曲线后山体被整体提亮 6~8 级、
+    // 色度 +1.5，偏离"浓青橙·电影暗调"骨架。根因已由 neutral + 权重场解决。
+    static final boolean SKY_DOMAIN_ENABLED = false;
+
     /** @return 处理后 JPEG；任何失败返回 null（调用方回落正常 M9 + 提醒） */
     public static byte[] run(Context app, byte[] jpeg) {
         try {
@@ -141,8 +171,23 @@ public final class Lm9Stats {
             int dpw = 0, dph = 0;
             int[] mx0 = null, mx1 = null;
             float[] mfx = null;
+            if (FIELD_ENABLED || SKY_DOMAIN_ENABLED) {
+                // x 方向采样索引/权重（每行复用，双线性）：权重场与 skyDomain 掩码共用
+                mx0 = new int[w];
+                mx1 = new int[w];
+                mfx = new float[w];
+                for (int x = 0; x < w; x++) {
+                    float sx = (x + 0.5f) * pw / w - 0.5f;
+                    sx = Math.max(0f, Math.min(pw - 1f, sx));
+                    int i0 = (int) sx;
+                    int i1 = Math.min(pw - 1, i0 + 1);
+                    mx0[x] = i0;
+                    mx1[x] = i1;
+                    mfx[x] = sx - i0;
+                }
+            }
             {
-                float[] mk = skyDomain(pp, pw, ph);
+                float[] mk = SKY_DOMAIN_ENABLED ? skyDomain(pp, pw, ph) : null;
                 if (mk != null) {
                     float[] w3 = new float[3];
                     int area = 0;
@@ -181,24 +226,31 @@ public final class Lm9Stats {
                             dMk = mk;
                             dpw = pw;
                             dph = ph;
-                            // x 方向采样索引/权重（每行复用，双线性）
-                            mx0 = new int[w];
-                            mx1 = new int[w];
-                            mfx = new float[w];
-                            for (int x = 0; x < w; x++) {
-                                float sx = (x + 0.5f) * dpw / w - 0.5f;
-                                sx = Math.max(0f, Math.min(dpw - 1f, sx));
-                                int i0 = (int) sx;
-                                int i1 = Math.min(dpw - 1, i0 + 1);
-                                mx0[x] = i0;
-                                mx1[x] = i1;
-                                mfx[x] = sx - i0;
-                            }
                             DiagLog.INSTANCE.w("LM9STAT", "sky-domain on: area=" + String.format("%.3f", area / (double) pp.length)
                                     + " wbar=" + String.format("%.3f", wbar) + " wMix=" + String.format("%.3f", wMix));
                         }
                     }
                 }
+            }
+            // v16：三区域权重场（探测图 → 高斯平滑 → 待双线性采样）。
+            // 逐像素权重由 blueness/warmSky 的窄斜坡驱动，在薄雾/云/山体内部会随几级噪声整段
+            // 摆动；低频场把空间方差限制在探测尺度上，逐像素项只保留小幅细节响应。
+            float[] fSky = null, fVeg = null;
+            if (FIELD_ENABLED) {
+                fSky = new float[pw * ph];
+                fVeg = new float[pw * ph];
+                float[] wf = new float[3];
+                for (int y = 0; y < ph; y++) {
+                    int row = y * pw;
+                    for (int x = 0; x < pw; x++) {
+                        int p = pp[row + x];
+                        skyWeight((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF, wf);
+                        fSky[row + x] = wf[0];
+                        fVeg[row + x] = wf[1];
+                    }
+                }
+                fSky = blur5(fSky, pw, ph, FIELD_SIGMA);
+                fVeg = blur5(fVeg, pw, ph, FIELD_SIGMA);
             }
             float errR = 0f, errG = 0f, errB = 0f;      // 误差扩散的状态（每行重置）
             // 软权重（连续映射，无硬边）+ 高光保护：
@@ -214,12 +266,12 @@ public final class Lm9Stats {
                 int x = i % w;
                 if (x == 0) {
                     errR = errG = errB = 0f;
-                    if (dMk != null) {
+                    if (mx0 != null) {
                         int y = i / w;
-                        float sy = (y + 0.5f) * dph / h - 0.5f;
-                        sy = Math.max(0f, Math.min(dph - 1f, sy));
+                        float sy = (y + 0.5f) * ph / h - 0.5f;
+                        sy = Math.max(0f, Math.min(ph - 1f, sy));
                         my0 = (int) sy;
-                        my1 = Math.min(dph - 1, my0 + 1);
+                        my1 = Math.min(ph - 1, my0 + 1);
                         mfy = sy - my0;
                     }
                 }
@@ -229,7 +281,20 @@ public final class Lm9Stats {
                 //   · 亮部（lum>0.8，云与辉光）权重向"天空"靠拢，从机制上保证不会被压暗
                 //   · 暖色第二通道 + satGate 见 skyWeight（防暖白墙被劈成两档）
                 skyWeight(r0, g0, b0, w3);
-                float sky = w3[0], veg = w3[1], other = w3[2];
+                float sky = w3[0], veg = w3[1];
+                if (fSky != null) {
+                    // 低频场（FIELD_W）+ 逐像素（1-FIELD_W）；两方向双线性，取样口径与 skyDomain 一致
+                    int a0 = my0 * pw, a1 = my1 * pw;
+                    int fx0 = mx0[x], fx1 = mx1[x];
+                    float fx = mfx[x];
+                    float fs = ((fSky[a0 + fx0] * (1f - fx) + fSky[a0 + fx1] * fx) * (1f - mfy))
+                            + ((fSky[a1 + fx0] * (1f - fx) + fSky[a1 + fx1] * fx) * mfy);
+                    float fv = ((fVeg[a0 + fx0] * (1f - fx) + fVeg[a0 + fx1] * fx) * (1f - mfy))
+                            + ((fVeg[a1 + fx0] * (1f - fx) + fVeg[a1 + fx1] * fx) * mfy);
+                    sky = FIELD_W * fs + (1f - FIELD_W) * sky;
+                    veg = FIELD_W * fv + (1f - FIELD_W) * veg;
+                }
+                float other = Math.max(0f, 1f - sky - veg);
                 float[][] cSky = lut[0], cOth = lut[2];
                 if (dMk != null) {
                     // 域内：sky 权重换成"空间域掩码"（域内≈1、域外回落到原权重），
@@ -276,6 +341,19 @@ public final class Lm9Stats {
         }
     }
 
+    /** smoothstep：x<=lo → 0，x>=hi → 1。 */
+    private static float smoothUp(float x, float lo, float hi) {
+        float t = (x - lo) / (hi - lo);
+        if (t <= 0f) return 0f;
+        if (t >= 1f) return 1f;
+        return t * t * (3f - 2f * t);
+    }
+
+    /** 反向 smoothstep：x<=lo → 1，x>=hi → 0。 */
+    private static float smoothDown(float x, float hi, float lo) {
+        return 1f - smoothUp(x, lo, hi);
+    }
+
     /**
      * 三区域软权重（探测图与全图共用，保证口径一致）。
      * 写出 out[0]=sky, out[1]=veg, out[2]=other。
@@ -294,6 +372,13 @@ public final class Lm9Stats {
         float sky = Math.max(blueSky, warmSky);
         float hi = Math.min(1f, Math.max(0f, (lum - 0.80f) / 0.15f));
         sky = sky * (1f - hi) + hi;
+        // v16：低饱和 + 中高亮 = 雾/云/白墙，语义属天空侧。权重给到 1.0 使该区分类方差归零，
+        // 从机制上消除"权重窄斜坡 × 曲线亮度差"的放大链（不是削弱权重，是让权重恒定）。
+        if (NEUTRAL_ENABLED) {
+            float neutral = smoothDown(chroma, N_CHROMA_HI, N_CHROMA_LO)
+                    * smoothUp(lum, N_LUM_LO, N_LUM_HI);
+            if (neutral > sky) sky = neutral;
+        }
         float veg = greenness * (1f - sky);
         out[0] = sky;
         out[1] = veg;

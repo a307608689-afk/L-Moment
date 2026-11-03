@@ -85,6 +85,8 @@ object SuperRes {
         try { maskTensor?.close() } catch (_: Exception) {}
         session = null
         maskTensor = null
+        // GPU 侧会话（Vulkan 设备常驻 + 各模型权重）一并回收
+        GpuNet.release()
     }
 
     /**
@@ -119,6 +121,14 @@ object SuperRes {
         var inferMsTotal = 0L
         var inferMsMax = 0L
 
+        // GPU 通道（设置页开关，默认关）：只对快速档（纯卷积 SPAN）启用。
+        // SwinIR 每块要喂 [1024,64,64] 的注意力掩码（16MB），Vulkan 上的布局转换会吃掉收益。
+        val gpuModel = if (fast) GpuNet.Model.SPAN_X2 else null
+        var useGpu = gpuModel != null && GpuNet.isEnabled(context) &&
+                GpuNet.prepare(context, gpuModel, arrayOf(intArrayOf(3, TILE, TILE)))
+        var gpuTiles = 0
+        var fallbackLogged = false
+
         try {
             for (ty in 0 until nY) {
                 for (tx in 0 until nX) {
@@ -131,18 +141,37 @@ object SuperRes {
                     padded.getPixels(px, 0, TILE, x0, y0, TILE, TILE)
                     fillChw(px, inputBuf)
 
-                    // 3b. 推理（SwinIR：input + 共享 attn mask；SPAN：仅 input）
-                    OnnxTensor.createTensor(env, FloatBuffer.wrap(inputBuf), longArrayOf(1, 3, TILE.toLong(), TILE.toLong())).use { t ->
-                        val feeds = HashMap<String, OnnxTensor>(2)
-                        feeds["input"] = t
-                        if (!fast) feeds["mask"] = maskTensor!!
-                        sess.run(feeds).use { res ->
-                            val outTensor = res[0] as OnnxTensor
-                            val fb = outTensor.floatBuffer
-                            // 3c. 色彩锁：Y 取模型输出，Cb/Cr 取原图双线性放大 → 色度零漂移
-                            writeTileColorLocked(out, padded, fb, x0, y0, TILE * SCALE)
+                    // 3b. 推理：GPU 优先，失败或判负回落 ORT（SwinIR 带 attn mask，SPAN 仅 input）
+                    var tileOut: FloatBuffer? = null
+                    if (useGpu) {
+                        val tg = android.os.SystemClock.elapsedRealtime()
+                        val arr = GpuNet.run(gpuModel!!, arrayOf(FloatBuffer.wrap(inputBuf)),
+                            intArrayOf(3), intArrayOf(TILE), intArrayOf(TILE))
+                        val gpuMs = android.os.SystemClock.elapsedRealtime() - tg
+                        if (arr != null) {
+                            tileOut = FloatBuffer.wrap(arr)
+                            gpuTiles++
+                            // 本机首次使用：同块也跑一次 CPU，判掉「能跑但更慢」的机型
+                            if (GpuNet.needsProbe(context, gpuModel)) {
+                                val tc = android.os.SystemClock.elapsedRealtime()
+                                val cpuOut = runCatching { inferTileOrt(sess, inputBuf, fast) }
+                                    .getOrNull()
+                                val cpuMs = android.os.SystemClock.elapsedRealtime() - tc
+                                if (cpuOut != null &&
+                                        !GpuNet.reportProbe(context, gpuModel, gpuMs, cpuMs)) {
+                                    tileOut = cpuOut     // 判负：用刚算出的 CPU 结果
+                                    useGpu = false       // 剩下的块不必再试 GPU
+                                }
+                            }
+                        } else if (!fallbackLogged) {
+                            fallbackLogged = true
+                            DiagLog.w("SuperRes", "超分走 CPU 兜底：${GpuNet.lastError}")
                         }
                     }
+                    if (tileOut == null) tileOut = inferTileOrt(sess, inputBuf, fast)
+                    if (tileOut == null) throw IllegalStateException("tile inference returned null")
+                    // 3c. 色彩锁：Y 取模型输出，Cb/Cr 取原图双线性放大 → 色度零漂移
+                    writeTileColorLocked(out, padded, tileOut, x0, y0, TILE * SCALE)
 
                     done++
                     if (SuperResConfig.LOG_TILE_TIMING) {
@@ -166,7 +195,8 @@ object SuperRes {
             val avg = if (done > 0) inferMsTotal / done else 0
             val line = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
                 .format(java.util.Date()) +
-                " SUMMARY tiles=$done avg=${avg}ms max=${inferMsMax}ms infer=${inferMsTotal}ms " +
+                " SUMMARY tiles=$done gpu=$gpuTiles cpu=${done - gpuTiles} " +
+                "avg=${avg}ms max=${inferMsMax}ms infer=${inferMsTotal}ms " +
                 "pipeline=${totalMs}ms (${w}x${h}->${w * SCALE}x${h * SCALE})"
             DiagLog.i("SuperRes", line)
             lastSummary = line
@@ -177,6 +207,27 @@ object SuperRes {
         val cropped = Bitmap.createBitmap(out, 0, 0, w * SCALE, h * SCALE)
         if (cropped != out) out.recycle()
         return cropped
+    }
+
+    /**
+     * ORT 兜底推理：输出整块拷进 FloatArray 再包一层 FloatBuffer，
+     * 便于与 GPU 分支共用读回代码。拷贝 3 × 512² × 4B ≈ 3MB/块，相对单块推理可忽略。
+     */
+    private fun inferTileOrt(sess: OrtSession, inputBuf: FloatArray, fast: Boolean): FloatBuffer? {
+        var arr: FloatArray? = null
+        OnnxTensor.createTensor(env!!, FloatBuffer.wrap(inputBuf),
+            longArrayOf(1, 3, TILE.toLong(), TILE.toLong())).use { t ->
+            val feeds = HashMap<String, OnnxTensor>(2)
+            feeds["input"] = t
+            if (!fast) feeds["mask"] = maskTensor!!
+            sess.run(feeds).use { res ->
+                val fb = (res[0] as OnnxTensor).floatBuffer
+                val a = FloatArray(fb.remaining())
+                fb.get(a)
+                arr = a
+            }
+        }
+        return arr?.let { FloatBuffer.wrap(it) }
     }
 
     /** 计时汇总落盘：每次新建时间戳文件，先写图片/LeicaMoments，再下载，再应用外部目录 */

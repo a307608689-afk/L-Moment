@@ -14,6 +14,8 @@ import org.json.JSONArray
  * - `pinned_cross_category`：置顶跨分类显示（默认关：置顶只出现在 L-Moment 与该色彩所属分类）
  * - `full_res_export`：全像素导出开关（C4，默认开；低端机由像素预算分档强制回落）
  * - `leica_badge`：徕卡徽章开关（默认开；关 = 导出不写徽章并剥离源图自带的徽章元数据）
+ * - `save_relative_path`：保存位置（MediaStore RELATIVE_PATH，默认 Pictures/LeicaMoments）
+ * - `export_time_mode`：导出时间模式（original=按图片原本时间〔默认〕/ now=按当下时间）
  * - `raw_thr_level:<MODEL>`：RAW 解码亮度档位（按机型记忆，不进备份）
  */
 object SettingsStore {
@@ -30,10 +32,14 @@ object SettingsStore {
     private const val KEY_FULL_RES = "full_res_export"
     private const val KEY_M9_HIRES = "m9_hires_export"
     private const val KEY_LEICA_BADGE = "leica_badge"
+    private const val KEY_DEVICE_INFO = "device_info_mode"
     private const val KEY_PSEUDO_LINEAR = "pseudo_linear_work"
     private const val KEY_HDR_BOOST = "hdr_boost_level"
     private const val KEY_HDR_HINT = "hdr_hint_shown"
     private const val KEY_HDR_DEFAULT_ON = "hdr_default_on"
+    private const val KEY_SAVE_REL_PATH = "save_relative_path"
+    private const val KEY_EXPORT_TIME_MODE = "export_time_mode"
+    private const val KEY_GPU_ACCEL = "gpu_accel"
 
     /** 「记忆上次」在 default_category 里的取值 */
     const val VALUE_LAST = "last"
@@ -253,6 +259,35 @@ object SettingsStore {
         prefs(c).edit().putBoolean(KEY_LEICA_BADGE, enabled).apply()
     }
 
+    // ---- 导出设备标识（机型字段来源）----
+
+    const val DEVICE_INFO_SOURCE = "source"
+    const val DEVICE_INFO_FIXED = "fixed"
+    const val DEVICE_INFO_LOCAL = "local"
+
+    /**
+     * 导出写入的机型标识来源（**默认跟随原图**）。
+     *
+     * - `source`：沿用导入图 EXIF 的真实 Make/Model（非小米图不再被写成 Xiaomi 15 Ultra）；
+     * - `fixed`：固定写 Xiaomi 15 Ultra（旧行为，若相册徽章判定依赖该字段可切回）；
+     * - `local`：写当前手机型号。
+     *
+     * 只影响 FFE4/0x889E 里的展示型设备字段，拍摄参数与 GPS 不受影响。
+     */
+    fun deviceInfoMode(c: Context): String =
+        prefs(c).getString(KEY_DEVICE_INFO, DEVICE_INFO_SOURCE) ?: DEVICE_INFO_SOURCE
+
+    fun setDeviceInfoMode(c: Context, value: String) {
+        prefs(c).edit().putString(KEY_DEVICE_INFO, value).apply()
+    }
+
+    /** 映射到 [com.codex.leicaapp.LeicaMark] 的写入档位。 */
+    fun deviceInfoModeCode(c: Context): Int = when (deviceInfoMode(c)) {
+        DEVICE_INFO_FIXED -> com.codex.leicaapp.LeicaMark.MODE_FIXED_LEICA
+        DEVICE_INFO_LOCAL -> com.codex.leicaapp.LeicaMark.MODE_LOCAL
+        else -> com.codex.leicaapp.LeicaMark.MODE_SOURCE
+    }
+
     // ---- 高位深工作域（伪 RAW，JPG/HEIF）----
 
     /**
@@ -306,5 +341,117 @@ object SettingsStore {
         0 -> 0.6f
         2 -> 1.4f
         else -> 1.0f
+    }
+
+    // ---- 保存位置（MediaStore RELATIVE_PATH）----
+
+    /** 默认保存位置（与历史行为一致的硬编码路径） */
+    const val DEFAULT_SAVE_REL_PATH = "Pictures/LeicaMoments"
+
+    /**
+     * 保存位置（MediaStore `RELATIVE_PATH`，**默认 `Pictures/LeicaMoments`**）。
+     *
+     * 合法形态（图片类媒体集合目录约束）：顶层必须为 `Pictures` 或 `DCIM`，
+     * 之后跟任意一层或多层子目录（系统自动创建）：
+     * - `Pictures` / `DCIM` / `DCIM/Camera`（预设档，可直达集合根）
+     * - `Pictures/<自定义名>`（自定义档，UI 输入子目录名后拼前缀）
+     * - 也接受 `Pictures/`、`DCIM/` 开头的完整写法
+     *
+     * 读取时同样校验：历史值若不合法（如旧版本写坏）回落 [DEFAULT_SAVE_REL_PATH]。
+     */
+    fun saveRelativePath(c: Context): String =
+        sanitizeRelPath(prefs(c).getString(KEY_SAVE_REL_PATH, null)) ?: DEFAULT_SAVE_REL_PATH
+
+    /** 非法输入拒绝写（保留原值），由 UI 层 toast 提示 */
+    fun setSaveRelativePath(c: Context, path: String): Boolean {
+        val clean = sanitizeRelPath(path) ?: return false
+        prefs(c).edit().putString(KEY_SAVE_REL_PATH, clean).apply()
+        return true
+    }
+
+    /** 恢复默认保存位置 */
+    fun resetSaveRelativePath(c: Context) {
+        prefs(c).edit().putString(KEY_SAVE_REL_PATH, DEFAULT_SAVE_REL_PATH).apply()
+    }
+
+    /**
+     * 保存位置清洗与校验：
+     * 1) trim、去首尾 `/`、合并连续 `/`；
+     * 2) 拒绝空串、`..` 段与路径穿越；
+     * 3) 拒绝非法文件名字符（`\ : * ? " < > |` 与控制符）；
+     * 4) 顶层必须是 `Pictures` 或 `DCIM`（大小写不敏感，统一转首字母大写）。
+     *
+     * 校验通过返回规范化路径（如 `Pictures/我的徕卡`），否则返回 null。
+     */
+    fun sanitizeRelPath(raw: String?): String? {
+        var s = (raw ?: "").trim().replace('\\', '/').trim('/')
+        if (s.isEmpty()) return null
+        // 合并连续斜杠
+        while (s.contains("//")) s = s.replace("//", "/")
+        val segments = s.split('/')
+        if (segments.any { it == "." || it == ".." }) return null
+        if (segments.any { it.isEmpty() }) return null
+        if (segments.any { seg ->
+                seg.any { it.code < 0x20 || "\\:*?\"<>|".contains(it) }
+            }) return null
+        val top = segments[0].lowercase()
+        val normTop = when (top) {
+            "pictures" -> "Pictures"
+            "dcim" -> "DCIM"
+            else -> return null
+        }
+        return (listOf(normTop) + segments.drop(1)).joinToString("/")
+    }
+
+    // ---- 导出时间 ----
+
+    /** 导出时间模式 key 取值：原图时间 / 当下时间 */
+    const val EXPORT_TIME_ORIGINAL = "original"
+    const val EXPORT_TIME_NOW = "now"
+
+    /**
+     * 导出时间模式（**默认按图片原本时间**）。
+     *
+     * - `original`：EXIF 拍摄时间保持现状（copyExif 被动保留），并把源图
+     *   `DateTimeOriginal` 写入 MediaStore `DATE_TAKEN`，相册「拍摄时间」
+     *   显示与排序落到原图时间；源图无时间信息回退当下。
+     * - `now`：重写 EXIF `DateTime`/`DateTimeOriginal`/`DateTimeDigitized`
+     *   三个 tag 为导出时刻，`DATE_TAKEN` = 导出时刻，效果如刚拍的照片。
+     *
+     * 边界（设置页 hint 同步言明）：文件属性时间（date_added/date_modified）
+     * 由系统强制写为入库时刻、应用不可改；已导出的历史文件不受影响；
+     * GPS/机型/拍摄参数 EXIF 不受影响。
+     */
+    fun exportTimeMode(c: Context): String =
+        prefs(c).getString(KEY_EXPORT_TIME_MODE, EXPORT_TIME_ORIGINAL) ?: EXPORT_TIME_ORIGINAL
+
+    /** true = 按图片原本时间（默认） */
+    fun exportTimeOriginal(c: Context): Boolean = exportTimeMode(c) == EXPORT_TIME_ORIGINAL
+
+    fun setExportTimeMode(c: Context, mode: String) {
+        val v = if (mode == EXPORT_TIME_NOW) EXPORT_TIME_NOW else EXPORT_TIME_ORIGINAL
+        prefs(c).edit().putString(KEY_EXPORT_TIME_MODE, v).apply()
+    }
+
+    fun setExportTimeOriginal(c: Context, original: Boolean) {
+        setExportTimeMode(c, if (original) EXPORT_TIME_ORIGINAL else EXPORT_TIME_NOW)
+    }
+
+    // ---- GPU 加速（实验，默认关）----
+
+    /**
+     * GPU（ncnn/Vulkan）加速开关，**默认关 = 零回归**。
+     *
+     * 关：不建会话、不加载模型、不初始化 Vulkan、不占显存，导出路径与改造前完全一致。
+     * 开：只有完美档（风格迁移 + 调色修正）与超分快速档走 GPU，其余链路不受影响。
+     *
+     * 另有两条自动关闭路径（由 [GpuNet] 写入，用户可见）：
+     * - 首次使用的同块 A/B 判定「GPU 不比 CPU 快 20%」；
+     * - 某模型连续两次推理失败。
+     */
+    fun gpuAccelEnabled(c: Context): Boolean = prefs(c).getBoolean(KEY_GPU_ACCEL, false)
+
+    fun setGpuAccelEnabled(c: Context, enabled: Boolean) {
+        prefs(c).edit().putBoolean(KEY_GPU_ACCEL, enabled).apply()
     }
 }

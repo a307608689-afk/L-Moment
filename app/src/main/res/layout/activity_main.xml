@@ -146,6 +146,108 @@
                 android:textSize="12sp" />
         </LinearLayout>
 
+        <!--
+          批量切换箭头：48dp 实心圆底 + 矢量 chevron（描边 2.6dp 圆头）。
+          尺寸从 44 → 48 与 Material 最小点按区一致；图标墨迹约占圆 4 成，
+          比原来的字形 › 更"立得住"，也避免各机型字体差异。
+        -->
+        <ImageView
+            android:id="@+id/btnPrev"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_gravity="center_vertical|start"
+            android:layout_marginStart="12dp"
+            android:background="@drawable/bg_arrow_circle"
+            android:clickable="true"
+            android:contentDescription="上一张"
+            android:elevation="8dp"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackgroundBorderless"
+            android:padding="11dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_chevron_left"
+            android:visibility="gone" />
+
+        <ImageView
+            android:id="@+id/btnNext"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_gravity="center_vertical|end"
+            android:layout_marginEnd="12dp"
+            android:background="@drawable/bg_arrow_circle"
+            android:clickable="true"
+            android:contentDescription="下一张"
+            android:elevation="8dp"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackgroundBorderless"
+            android:padding="11dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_chevron_right"
+            android:visibility="gone" />
+
+        <!-- 批量导出浮层：底板与排版完全复用大图导出浮层（环 + 主行 + 次行 + 胶囊钮） -->
+        <LinearLayout
+            android:id="@+id/batchOverlay"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:background="@drawable/bg_big_export_overlay"
+            android:elevation="12dp"
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            android:paddingStart="36dp"
+            android:paddingTop="28dp"
+            android:paddingEnd="36dp"
+            android:paddingBottom="28dp"
+            android:visibility="gone">
+
+            <com.google.android.material.progressindicator.CircularProgressIndicator
+                android:id="@+id/batchRing"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:indeterminate="false"
+                android:max="100"
+                android:progress="0"
+                app:indicatorColor="#F2F2F2"
+                app:indicatorSize="54dp"
+                app:trackColor="#33FFFFFF"
+                app:trackCornerRadius="3dp"
+                app:trackThickness="5dp" />
+
+            <TextView
+                android:id="@+id/batchMain"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:text="正在导出 1 / 12"
+                android:textColor="#F2F2F2"
+                android:textSize="22sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/batchSub"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="可停止，已完成的部分会保留"
+                android:textColor="#99F2F2F2"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/btnBatchStop"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:background="@drawable/bg_pill"
+                android:paddingStart="14dp"
+                android:paddingTop="7dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="7dp"
+                android:text="停止"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
         <!-- 画质工具胶囊行（顶栏下方悬浮）：左侧超分双钮，右侧「设置」恒可见 -->
         <LinearLayout
             android:layout_width="match_parent"
@@ -180,6 +282,23 @@
                 android:paddingEnd="14dp"
                 android:paddingBottom="7dp"
                 android:text="快速超分"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <!-- 批量序号：并入同一行胶囊（而不是浮在中间），与画质胶囊 8dp 间距，结构上不可能重叠 -->
+            <TextView
+                android:id="@+id/txtBatchIndex"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center"
+                android:paddingStart="14dp"
+                android:paddingTop="7dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="7dp"
+                android:text="1 / 1"
                 android:textColor="#FFFFFF"
                 android:textSize="13sp"
                 android:visibility="gone" />

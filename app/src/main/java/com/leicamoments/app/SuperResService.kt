@@ -107,12 +107,14 @@ class SuperResService : Service() {
         }
 
         thread(name = "full-export-watch") {
-            var last = Int.MIN_VALUE
+            // 刷新判据要带上阶段文案：批量时"第 3/12 张"变了、百分比可能没变
+            var last = ""
             while (ExportProgress.running) {
-                val p = if (ExportProgress.indeterminate) -1 else ExportProgress.percent
-                if (p != last) {
+                val key = "${ExportProgress.title}|${ExportProgress.stage}|" +
+                    (if (ExportProgress.indeterminate) -1 else ExportProgress.percent)
+                if (key != last) {
                     notify(buildExportNotification(), FG_ID_EXPORT)
-                    last = p
+                    last = key
                 }
                 Thread.sleep(400)
             }
@@ -130,15 +132,19 @@ class SuperResService : Service() {
 
     /**
      * 部分唤醒锁：前台服务只保进程优先级，不保 CPU；屏幕熄灭后设备可能进入挂起，
-     * 条带编码会被拉长到不可接受的时长。上限 30 分钟（200MP 实测约 4 分钟）。
+     * 条带编码会被拉长到不可接受的时长。
+     *
+     * 上限：单张 30 分钟（200MP 实测约 4 分钟）；批量按 30 张 200MP 的最坏情况给 120 分钟，
+     * 否则锁屏后中途 CPU 被挂起，表现为"卡在某一张不动"。
      */
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         try {
             val pm = getSystemService(PowerManager::class.java) ?: return
+            val minutes = if (ExportProgress.longTask) 120L else 30L
             val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "L-Moment:fullResExport")
             wl.setReferenceCounted(false)
-            wl.acquire(30 * 60 * 1000L)
+            wl.acquire(minutes * 60 * 1000L)
             wakeLock = wl
         } catch (_: Throwable) {
         }
@@ -219,29 +225,39 @@ class SuperResService : Service() {
             .setContentIntent(contentIntent())
             .build()
 
+    /**
+     * 进度通知：标题与阶段都由 [ExportProgress] 给（单张=「全像素导出」，
+     * 批量=「批量导出 · 第 3/12 张 · L-M9」），服务只负责排版。
+     */
     private fun buildExportNotification(): Notification {
+        val stage = ExportProgress.stage
+        val percent = ExportProgress.percent
+        val text = when {
+            stage.isEmpty() ->
+                if (ExportProgress.indeterminate) "处理中…" else "处理中 $percent%"
+            ExportProgress.indeterminate -> stage
+            else -> "$stage · $percent%"
+        }
         val builder = NotificationCompat.Builder(this, CHANNEL_ID_EXPORT)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("全像素导出")
-            .setContentText(
-                if (ExportProgress.indeterminate) "逐条带处理中…"
-                else "逐条带处理中 ${ExportProgress.percent}%"
-            )
+            .setContentTitle(ExportProgress.title)
+            .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(contentIntent())
         if (ExportProgress.indeterminate) {
             builder.setProgress(0, 0, true)
         } else {
-            builder.setProgress(100, ExportProgress.percent, false)
+            builder.setProgress(100, percent, false)
         }
         return builder.build()
     }
 
-    private fun buildExportDoneNotification(): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID_EXPORT)
+    private fun buildExportDoneNotification(): Notification {
+        val title = ExportProgress.title
+        return NotificationCompat.Builder(this, CHANNEL_ID_EXPORT)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle(if (ExportProgress.success) "全像素导出完成" else "全像素导出已结束")
+            .setContentTitle(if (ExportProgress.success) "${title}完成" else "${title}已结束")
             .setContentText(
                 ExportProgress.summary.ifEmpty {
                     if (ExportProgress.success) "已保存到相册" else "本次未生成文件（详情见应用日志）"
@@ -251,6 +267,7 @@ class SuperResService : Service() {
             .setAutoCancel(true)
             .setContentIntent(contentIntent())
             .build()
+    }
 
     private fun notify(n: Notification, id: Int) {
         try {

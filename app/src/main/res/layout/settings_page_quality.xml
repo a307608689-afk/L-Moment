@@ -1,0 +1,362 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 三级页：画质与性能（RAW 解码 / 高位深 / HDR / 全像素 / M9 超高分辨率 / GPU） -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:fillViewport="true"
+    android:scrollbars="none">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#000000"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:id="@+id/rowRaw"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_settings_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="RAW 解码亮度"
+                android:textColor="#E8E8EA"
+                android:textSize="15sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/txtRawValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="标准"
+                android:textColor="#8E8E93"
+                android:textSize="15sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="›"
+                android:textColor="#5A5A5E"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:text="仅影响 RAW 照片，对之后导入的生效。白天大光比偏暗时选「提亮」"
+            android:textColor="#5A5A5E"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/rowPseudoLinear"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_settings_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="高位深工作域"
+                android:textColor="#E8E8EA"
+                android:textSize="15sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/txtPseudoLinearValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="关"
+                android:textColor="#8E8E93"
+                android:textSize="15sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="›"
+                android:textColor="#5A5A5E"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtPseudoLinearHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:text="开 = JPG / HEIF 的影调在 16 位域运算，暗部过渡更连续\n仅在常规导出（长边 ≤4096）生效；全像素直通与 M9 超高分辨率走各自链路\n不影响 RAW、色彩风格与 EXIF（机型/参数/GPS 均保留）"
+            android:textColor="#5A5A5E"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/rowHdrBoost"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_settings_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="HDR 强度"
+                android:textColor="#E8E8EA"
+                android:textSize="15sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/txtHdrBoostValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="标准"
+                android:textColor="#8E8E93"
+                android:textSize="15sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="›"
+                android:textColor="#5A5A5E"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtHdrBoostHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:text="只影响之后导出的 HDR 数据幅度：轻 1.5EV / 标准 2.0EV / 强 2.5EV\n需在主界面开启「HDR」按钮才会写入；不支持 HDR 的设备显示不变"
+            android:textColor="#5A5A5E"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/rowFullRes"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_settings_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="全像素导出（慢）"
+                android:textColor="#E8E8EA"
+                android:textSize="15sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/txtFullResValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="开"
+                android:textColor="#8E8E93"
+                android:textSize="15sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="›"
+                android:textColor="#5A5A5E"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtFullResHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:text="50MP / 200MP 图的最高导出像素：\n· 原图（不套滤镜）、LUT 色彩、M9+ / M10-R → 原始像素\n· M9、M9D → 约 2400 万（4240×5632，整图链无条带伪影）\n· SA、LP9、自定义 LUT → 1280 万（4096×3072）\n开关只对之后导入的图片生效；开启后耗时与内存更高"
+            android:textColor="#5A5A5E"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/rowM9Hires"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_settings_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="M9 超高分辨率（50MP 档）"
+                android:textColor="#E8E8EA"
+                android:textSize="15sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/txtM9HiresValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="关"
+                android:textColor="#8E8E93"
+                android:textSize="15sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="›"
+                android:textColor="#5A5A5E"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtM9HiresHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:text="仅 M9 / M9D 生效：50MP 源零降采样、200MP 出 50MP（8192×6144），耗时约 20s；需先开启「全像素导出」，失败自动回落 24MP 档"
+            android:textColor="#5A5A5E"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/rowGpu"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_settings_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="GPU 加速（实验）"
+                android:textColor="#E8E8EA"
+                android:textSize="15sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/txtGpuValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="关"
+                android:textColor="#8E8E93"
+                android:textSize="15sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="›"
+                android:textColor="#5A5A5E"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtGpuHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:text="只影响完美档与超分快速档，其余功能与色彩风格完全不变\n首次开启后的第一次导出会多等几秒（本机对比一次），之后正常\n如果本机 GPU 反而更慢，会自动改用 CPU 并关掉这个开关"
+            android:textColor="#5A5A5E"
+            android:textSize="12sp" />
+
+        <Space
+            android:layout_width="match_parent"
+            android:layout_height="24dp" />
+
+    </LinearLayout>
+</ScrollView>

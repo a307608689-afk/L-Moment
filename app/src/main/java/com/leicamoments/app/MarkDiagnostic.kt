@@ -13,6 +13,7 @@ object MarkDiagnostic {
         val sb = StringBuilder()
         var pos = 2
         var ffe4 = false
+        var customizeModel = ""
         var exifCount = 0
         var exifDesc: String? = null
         while (pos + 4 <= jpeg.size && (jpeg[pos].toInt() and 0xFF) == 0xFF) {
@@ -25,6 +26,13 @@ object MarkDiagnostic {
                 val seg = jpeg.copyOfRange(pos + 4, pos + 4 + len - 2)
                 val magic = if (seg.size >= 16) String(seg, 0, 16, StandardCharsets.ISO_8859_1) else ""
                 ffe4 = magic.startsWith("XIAOMI_CUSTOMIZE")
+                // 徽章段里的 110 = 相机 Model 的镜像字段；与主 EXIF 的 Model 对照可判断
+                // 「机型写错」究竟来自徽章 JSON 还是主 EXIF（真机排查用）。
+                if (ffe4 && seg.size > CUSTOMIZE_MAGIC_LEN) {
+                    val json = String(seg, CUSTOMIZE_MAGIC_LEN, seg.size - CUSTOMIZE_MAGIC_LEN,
+                        StandardCharsets.ISO_8859_1)
+                    customizeModel = jsonString(json, "110")
+                }
             }
             if (marker == 0xE1 && len >= 10 &&
                 jpeg[pos + 4] == 'E'.code.toByte() && jpeg[pos + 5] == 'x'.code.toByte()) {
@@ -38,6 +46,7 @@ object MarkDiagnostic {
         sb.append(exifDesc ?: "无EXIF")
         sb.append(" Exif段数=").append(exifCount)
         sb.append(" FFE4=").append(ffe4)
+        if (customizeModel.isNotEmpty()) sb.append(" customizeModel=").append(customizeModel)
         return sb.toString()
     }
 
@@ -90,6 +99,22 @@ object MarkDiagnostic {
             }
         }
         return "Make=$make Model=$model theme0=$theme0 theme=$t legend=$l mode=$m"
+    }
+
+    /** "XIAOMI_CUSTOMIZE\0\u0001\u0001" 的字节长度 */
+    private const val CUSTOMIZE_MAGIC_LEN = 19
+
+    /** 从扁平 JSON 里取一个字符串字段（不解析嵌套；110 只在顶层出现）。 */
+    private fun jsonString(json: String, key: String): String {
+        val at = json.indexOf("\"$key\"")
+        if (at < 0) return ""
+        val colon = json.indexOf(':', at + key.length + 2)
+        if (colon < 0) return ""
+        var p = colon + 1
+        while (p < json.length && json[p] == ' ') p++
+        if (p >= json.length || json[p] != '"') return ""
+        val end = json.indexOf('"', p + 1)
+        return if (end < 0) "" else json.substring(p + 1, end)
     }
 
     private fun readAscii(buf: ByteBuffer, d: ByteArray, e: Long, type: Int, cnt: Long, order: ByteOrder): String {

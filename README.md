@@ -25,11 +25,23 @@ gradle assembleDebug
 
 原生层内置 LibRaw 静态库，源码位于 `app/src/main/cpp/libraw/`，许可证与版权信息见 `NOTICE`。
 
+### GPU 推理（设置页开关，默认关）
+
+`app/src/main/cpp/ncnn/`（第三方预编译 ncnn，BSD-3，Vulkan 后端）与 `app/src/main/assets/ncnn/`
+（由运行时模型转换出的 fp16 权重）**都不在本仓库内**。两处任一缺失时 GPU 通道自动不可用。
+
+开关在「设置 → GPU 加速（实验）」，**默认关闭**：关闭时不加载模型、不初始化 Vulkan、
+不占显存，导出路径与不带该功能时完全一致。开启后只影响完美档与超分快速档；
+若本机 GPU 反而更慢或推理失败，会自动改用 CPU **并把开关关掉**（判定写入 `gpu_calib`，
+删该 preference 或清应用数据即可重新评估）。
+
+对拍台在 debug 变体的 `BatchTestActivity`（`--es mode gpu`）。
+
 ## 资产
 
-`app/src/main/assets/` 中随仓库分发的二进制共 26 个，均为本项目自产：
+`app/src/main/assets/` 中随仓库分发的二进制共 34 个，均为本项目自产：
 
-- LUT：`lut_alexa`、`lut_p9vibrant`、`lut_arri709`、`lut_arrireveal`、`lut_arridune`、`lut_arrilala`、`lut_arrijoker`，F-胶片家族 `lut_fuji_acros`、`lut_fuji_chrome`、`lut_fuji_cneg`、`lut_fuji_nn`、`lut_fuji_pnh`，以及 K-胶片家族 `lut_kodak_400`、`lut_kodak_200`、`lut_kodak_100`、`lut_kodak_64`
+- LUT：`lut_alexa`、`lut_p9vibrant`、`lut_arri709`、`lut_arrireveal`、`lut_arridune`、`lut_arrilala`、`lut_arrijoker`，F-胶片家族 `lut_fuji_acros`、`lut_fuji_chrome`、`lut_fuji_cneg`、`lut_fuji_nn`、`lut_fuji_pnh`，K-胶片家族 `lut_kodak_400`、`lut_kodak_200`、`lut_kodak_100`、`lut_kodak_64`，以及 H 色彩家族 `lut_hassel_hn`、`lut_hassel_hb`、`lut_hassel_hg`、`lut_hassel_hp`、`lut_hassel_hw`、`lut_hassel_hs`、`lut_hassel_hm`、`lut_hassel_hc`
 - 风格参数表：`styleA_s0` ~ `styleA_s5`
 - 蒸馏/网络模型：`m9_distill.onnx`、`lm9_net.onnx`，以及模型色彩两段网络 `m7_stage1.onnx`、`m7_stage2.onnx`
 

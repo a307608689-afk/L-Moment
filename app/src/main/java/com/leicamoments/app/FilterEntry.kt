@@ -25,6 +25,16 @@ sealed interface FilterEntry {
         override val label: String = ""
     }
 
+    /**
+     * 「AI 调色」入口卡：常驻滤镜条末尾，是上滑手势之外的第二入口。
+     *
+     * 它不是色彩——点它不改变当前样式，只打开 AI 抽屉，因此不参与置顶/重命名/删除。
+     */
+    object Ai : FilterEntry {
+        override val id: String = AI_ID
+        override val label: String = "AI"
+    }
+
     data class BuiltIn(val style: LeicaEngine.Style) : FilterEntry {
         override val id: String get() = style.id
         override val label: String get() = style.label
@@ -42,5 +52,6 @@ sealed interface FilterEntry {
     companion object {
         const val ORIG_ID = "__orig"
         const val CREATE_ID = "__create"
+        const val AI_ID = "__ai"
     }
 }

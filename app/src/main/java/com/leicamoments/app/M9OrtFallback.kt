@@ -184,33 +184,50 @@ object M9OrtFallback {
         val maskFb = ByteBuffer.allocateDirect(4 * plane)
             .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer() // mask 全 0（humanseg 不移植）
 
-        val rgbT = OnnxTensor.createTensor(e, rgbFb, longArrayOf(1, 3, inH.toLong(), inW.toLong()))
-        val maskT = OnnxTensor.createTensor(e, maskFb, longArrayOf(1, 1, inH.toLong(), inW.toLong()))
-        val styledBitmap: Bitmap
-        rgbT.use { tRgb ->
-            maskT.use { tMask ->
-                sess.run(mapOf("rgb" to tRgb, "mask" to tMask)).use { res ->
-                    val out = res[0] as OnnxTensor
-                    val ob = out.floatBuffer
-                    // [-1,1] → u8，裁掉 pad
-                    val outPx = IntArray(NW * NH)
-                    for (y in 0 until NH) {
-                        var o = y * NW
-                        var iR = (PAD + y) * inW + PAD           // 平面 0 R 的行起点
-                        var iG = plane + (PAD + y) * inW + PAD   // 平面 1 G
-                        var iB = plane * 2 + (PAD + y) * inW + PAD
-                        for (x in 0 until NW) {
-                            val r = (ob.get(iR + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                            val g = (ob.get(iG + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                            val b = (ob.get(iB + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
-                            outPx[o + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                        }
-                    }
-                    styledBitmap = Bitmap.createBitmap(NW, NH, Bitmap.Config.ARGB_8888)
-                    styledBitmap.setPixels(outPx, 0, NW, 0, 0, NW, NH)
+        // 推理：设置页开关打开时先试 GPU，失败或判负回落 ORT
+        var gpuOut: FloatArray? = null
+        val useGpu = GpuNet.isEnabled(app) &&
+                GpuNet.prepare(app, GpuNet.Model.STYLETRANS,
+                    arrayOf(intArrayOf(3, inH, inW), intArrayOf(1, inH, inW)))
+        if (useGpu) {
+            rgbFb.rewind()
+            maskFb.rewind()
+            val tg = System.currentTimeMillis()
+            gpuOut = GpuNet.run(GpuNet.Model.STYLETRANS, arrayOf(rgbFb, maskFb),
+                intArrayOf(3, 1), intArrayOf(inH, inH), intArrayOf(inW, inW))
+            val gpuMs = System.currentTimeMillis() - tg
+            if (gpuOut != null && GpuNet.needsProbe(app, GpuNet.Model.STYLETRANS)) {
+                val tc = System.currentTimeMillis()
+                val cpuOut = runCatching { runOrtStyletrans(sess, e, rgbFb, maskFb, inH, inW) }
+                    .getOrNull()
+                val cpuMs = System.currentTimeMillis() - tc
+                if (cpuOut != null &&
+                        !GpuNet.reportProbe(app, GpuNet.Model.STYLETRANS, gpuMs, cpuMs)) {
+                    gpuOut = cpuOut
                 }
             }
+            if (gpuOut == null) DiagLog.w(TAG, "styletrans 走 CPU 兜底：${GpuNet.lastError}")
         }
+        val ob: java.nio.FloatBuffer = gpuOut?.let { java.nio.FloatBuffer.wrap(it) }
+            ?: java.nio.FloatBuffer.wrap(
+                runOrtStyletrans(sess, e, rgbFb, maskFb, inH, inW) ?: return null)
+
+        // [-1,1] → u8，裁掉 pad（resPx 与后段全分辨率合成的 outPx 区分开，避免同名冲突）
+        val resPx = IntArray(NW * NH)
+        for (y in 0 until NH) {
+            val o = y * NW
+            val iR = (PAD + y) * inW + PAD           // 平面 0 R 的行起点
+            val iG = plane + (PAD + y) * inW + PAD   // 平面 1 G
+            val iB = plane * 2 + (PAD + y) * inW + PAD
+            for (x in 0 until NW) {
+                val r = (ob.get(iR + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
+                val g = (ob.get(iG + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
+                val b = (ob.get(iB + x) * 127.5f + 128f).toInt().coerceIn(0, 255)
+                resPx[o + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        val styledBitmap = Bitmap.createBitmap(NW, NH, Bitmap.Config.ARGB_8888)
+        styledBitmap.setPixels(resPx, 0, NW, 0, 0, NW, NH)
 
         // ---- ColorFix 近似（质量修正版）----
         // 细节场 = orig − blur(orig)，必须全分辨率（半分辨率会丢最细纹理带）；
@@ -288,6 +305,37 @@ object M9OrtFallback {
      * StyleTrans 会话（降级链与 M9Perfect 完美档共用同一份，避免同模型两份权重内存）。
      * 降级链内部调用点同为本方法，行为零变化。
      */
+    /**
+     * StyleTrans 的 ORT 推理（兜底与首次标定共用）：输出整块拷进 FloatArray，
+     * 便于与 GPU 分支共用同一段读出代码。
+     * 拷贝量 = 3 × 864 × 1120 × 4B ≈ 11.6MB，相对一次 501 GFLOP 的推理可忽略。
+     */
+    internal fun runOrtStyletrans(
+        sess: OrtSession,
+        e: OrtEnvironment,
+        rgbFb: java.nio.FloatBuffer,
+        maskFb: java.nio.FloatBuffer,
+        inH: Int,
+        inW: Int
+    ): FloatArray? {
+        rgbFb.rewind()
+        maskFb.rewind()
+        val rgbT = OnnxTensor.createTensor(e, rgbFb, longArrayOf(1, 3, inH.toLong(), inW.toLong()))
+        val maskT = OnnxTensor.createTensor(e, maskFb, longArrayOf(1, 1, inH.toLong(), inW.toLong()))
+        var arr: FloatArray? = null
+        rgbT.use { tRgb ->
+            maskT.use { tMask ->
+                sess.run(mapOf("rgb" to tRgb, "mask" to tMask)).use { res ->
+                    val fb = (res[0] as OnnxTensor).floatBuffer
+                    val a = FloatArray(fb.remaining())
+                    fb.get(a)
+                    arr = a
+                }
+            }
+        }
+        return arr
+    }
+
     internal fun styletransSession(app: Context): OrtSession? {
         session?.let { return it }
         synchronized(this) {

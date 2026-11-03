@@ -60,6 +60,10 @@ class BatchTestActivity : Activity() {
         JpegEnc.qualityOverride = intent.getIntExtra("q", 0)
         // C1 验收入口：条带全像素直通（可用 --es mode fullres 触发）
         val mode = intent.getStringExtra("mode") ?: ""
+        // 免 UI 切换 GPU 开关（仅测试包）：--ez gpu true/false
+        if (intent.hasExtra("gpu")) {
+            SettingsStore.setGpuAccelEnabled(this, intent.getBooleanExtra("gpu", false))
+        }
         Log.i(tag, "启动批量测试 mode=$mode styles=$styles indir=$indir outdir=$outdir limit=$limit thr=$thr level=$level rawonly=$rawOnly dumplin=$dumpLin")
 
         if (mode == "fullres") {
@@ -86,7 +90,23 @@ class BatchTestActivity : Activity() {
             return
         }
 
-        // 暖调 LUT 逐带敏感性隔离：同一张图「整幅套一次」vs「逐带各套一次」
+        // 完美档端到端（免 UI，走的就是 M9Perfect 那条重链）：
+        //   --es mode perfect [--es style M9] [--es indir ...] [--es outdir ...] [--es limit N]
+        if (mode == "perfect") {
+            val styleId = intent.getStringExtra("style") ?: "M9"
+            Thread { runPerfectSuite(File(indir), File(outdir).apply { mkdirs() }, styleId, limit) }.start()
+            return
+        }
+
+        // GPU 对拍：--es mode gpu [--es model colorfix|styletrans|span|all] [--ez cpu true]
+        if (mode == "gpu") {
+            val which = intent.getStringExtra("model") ?: "all"
+            val useVulkan = !intent.getBooleanExtra("cpu", false)
+            Thread { GpuParity.runSuite(this, File(outdir).apply { mkdirs() }, which, useVulkan) }.start()
+            return
+        }
+
+        // 暖调 LUT 逐带敏感性隔离：同一张图「幅套一次」vs「逐带各套一次」
         if (mode == "warm") {
             Thread { runWarmSuite(File(indir), File(outdir).apply { mkdirs() }) }.start()
             return
@@ -213,6 +233,59 @@ class BatchTestActivity : Activity() {
             }
             finish()
         }.start()
+    }
+
+    // ==================== 完美档端到端（--es mode perfect） ====================
+
+    /**
+     * 直接跑 `LeicaEngine.processPerfect`（= 导出的完美档链路），免 UI 验证 GPU 开关。
+     *
+     * 关注设备日志：开关关时**不应出现任何 `GPUNET` 行**；开时应有
+     * `colorfix tiles=N gpu=N cpu=0`；判负时会出现「开关已自动关闭」。
+     */
+    private fun runPerfectSuite(indir: File, outdir: File, styleId: String, limit: Int) {
+        val sb = StringBuilder()
+        try {
+            val style = LeicaEngine.Style.values()
+                .firstOrNull { it.id.equals(styleId, ignoreCase = true) }
+            if (style == null) {
+                sb.append("unknown style $styleId, 可用: ")
+                    .append(LeicaEngine.Style.values().joinToString(",") { it.id }).append('\n')
+            } else {
+                val files = indir.listFiles { f ->
+                    f.isFile && f.extension.lowercase() in setOf("jpg", "jpeg")
+                }?.sortedBy { it.name } ?: emptyList()
+                val use = if (limit > 0) files.take(limit) else files
+                sb.append("mode=perfect style=${style.id} gpu=")
+                    .append(SettingsStore.gpuAccelEnabled(this))
+                    .append(" files=${use.size}/${files.size}\n")
+                use.forEach { f ->
+                    val t0 = System.currentTimeMillis()
+                    val out = try {
+                        LeicaEngine.processPerfect(this, f.readBytes(), style)
+                    } catch (t: Throwable) {
+                        Log.e(tag, "perfect ${f.name} 抛异常", t)
+                        sb.append("FAIL ${f.name} ${t.javaClass.simpleName}: ${t.message}\n")
+                        null
+                    }
+                    val ms = System.currentTimeMillis() - t0
+                    if (out == null) {
+                        if (!sb.contains("FAIL ${f.name} ")) sb.append("FAIL ${f.name} null ${ms}ms\n")
+                    } else {
+                        File(outdir, "${f.nameWithoutExtension}_perfect_${style.id}.jpg").writeBytes(out)
+                        sb.append("OK ${f.name} ${ms}ms ${out.size}B ")
+                            .append("gpu=${SettingsStore.gpuAccelEnabled(this)}\n")
+                    }
+                    Log.i(tag, "perfect ${f.name} ${ms}ms")
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "perfect suite 失败", t)
+            sb.append("FATAL ${t.javaClass.simpleName}: ${t.message}\n")
+        }
+        runCatching { File(outdir, "_perfect_report.txt").writeText(sb.toString()) }
+        Log.i(tag, "perfect done -> ${outdir.absolutePath}/_perfect_report.txt")
+        finish()
     }
 
     /** 与 MainActivity.decodeRaw 的工作字节逻辑一致：LibRaw 解码 → 全尺寸 JPEG95。 */

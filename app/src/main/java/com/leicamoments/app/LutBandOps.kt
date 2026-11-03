@@ -77,6 +77,15 @@ internal object LutBandOps {
         LeicaEngine.Style.KG200 -> Recipe(AlexaLut.LUT_KODAK_200, 0.20f, 0.55f)
         LeicaEngine.Style.KE100 -> Recipe(AlexaLut.LUT_KODAK_100, 0.10f, 0.38f)
         LeicaEngine.Style.KC64 -> Recipe(AlexaLut.LUT_KODAK_64, 0.13f, 0.50f)
+        // H 色彩家族（颗粒/暗角与 LeicaEngine.process 逐项对齐，漏一项即预览与全像素不一致）
+        LeicaEngine.Style.HN -> Recipe(AlexaLut.LUT_HASSEL_HN, 0.09f, 0.45f)
+        LeicaEngine.Style.HB -> Recipe(AlexaLut.LUT_HASSEL_HB, 0.08f, 0.55f)
+        LeicaEngine.Style.HG -> Recipe(AlexaLut.LUT_HASSEL_HG, 0.10f, 0.45f)
+        LeicaEngine.Style.HP -> Recipe(AlexaLut.LUT_HASSEL_HP, 0.07f, 0.40f)
+        LeicaEngine.Style.HW -> Recipe(AlexaLut.LUT_HASSEL_HW, 0.14f, 0.70f)
+        LeicaEngine.Style.HS -> Recipe(AlexaLut.LUT_HASSEL_HS, 0.14f, 0.40f)
+        LeicaEngine.Style.HM -> Recipe(AlexaLut.LUT_HASSEL_HM, 0.14f, 0.50f)
+        LeicaEngine.Style.HC -> Recipe(AlexaLut.LUT_HASSEL_HC, 0.07f, 0.38f)
         else -> null
     }
 

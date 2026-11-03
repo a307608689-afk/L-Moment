@@ -26,7 +26,8 @@ import java.util.HashMap;
  *  - lut_p9vibrant.bin  : L-P9「P9 鲜艳」色彩还原（测量式拟合）
  *  - lut_fuji_*.bin     : F-胶片家族五档（经典铬/经典负片/怀旧负片/人像负片·高/细腻黑白，
  *                         解析式烘焙，33³）
- *  - lut_kodak_*.bin    : K-胶片家族四档（K400/K200/K100/K64，解析式烘焙，65³）</p>
+ *  - lut_kodak_*.bin    : K-胶片家族四档（K400/K200/K100/K64，解析式烘焙，65³）
+ *  - lut_hassel_*.bin   : H 色彩家族八档（HNCS 式自然还原，解析式烘焙，65³）</p>
  *
  * <p>自定义 LUT（运行时由 Kotlin 侧烘焙，落在 filesDir/luts/）：以 {@link #FILE_PREFIX}
  * 开头的引用读取，如 {@code "file:lut_u1729_v3.bin"}。</p>
@@ -76,6 +77,24 @@ public final class AlexaLut {
     public static final String LUT_KODAK_100 = "lut_kodak_100.bin";
     /** assets 内置：K-胶片 K64 浓红反转（65³）。 */
     public static final String LUT_KODAK_64 = "lut_kodak_64.bin";
+
+    // H 色彩家族：解析式烘焙（hassel_bake.py），65³，显示名走中性化口径
+    /** assets 内置：H 色彩 HNCS 标准档（65³）。 */
+    public static final String LUT_HASSEL_HN = "lut_hassel_hn.bin";
+    /** assets 内置：H 色彩 深青蓝「哈苏蓝」（65³）。 */
+    public static final String LUT_HASSEL_HB = "lut_hassel_hb.bin";
+    /** assets 内置：H 色彩 橄榄绿植（65³）。 */
+    public static final String LUT_HASSEL_HG = "lut_hassel_hg.bin";
+    /** assets 内置：H 色彩 金黄肤色柔调（65³）。 */
+    public static final String LUT_HASSEL_HP = "lut_hassel_hp.bin";
+    /** assets 内置：H 色彩 黄昏金调（65³）。 */
+    public static final String LUT_HASSEL_HW = "lut_hassel_hw.bin";
+    /** assets 内置：H 色彩 低饱和高级灰（65³）。 */
+    public static final String LUT_HASSEL_HS = "lut_hassel_hs.bin";
+    /** assets 内置：H 色彩 纯灰阶单色（65³）。 */
+    public static final String LUT_HASSEL_HM = "lut_hassel_hm.bin";
+    /** assets 内置：H 色彩 青灰冷调（65³）。 */
+    public static final String LUT_HASSEL_HC = "lut_hassel_hc.bin";
 
     /** 自定义 LUT 引用前缀：{@code file:<name>} → filesDir/luts/<name>。 */
     public static final String FILE_PREFIX = "file:";

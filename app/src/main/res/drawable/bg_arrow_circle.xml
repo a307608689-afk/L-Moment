@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  批量切图箭头底：与 bg_pill 同族的深色半透明（#80000000），但用 oval 保证正圆，
+  描边压到 20% 白（原来 40% 白 + 1dp 在亮部照片上像线框，显单薄）。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#80000000" />
+    <stroke android:width="1dp" android:color="#33FFFFFF" />
+</shape>

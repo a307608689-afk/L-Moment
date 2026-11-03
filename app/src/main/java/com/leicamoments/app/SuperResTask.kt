@@ -6,7 +6,6 @@ import com.codex.leicaapp.LeicaMark
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
@@ -203,7 +202,11 @@ object SuperResTask {
                     work, ImageUtils.toJpeg(result, 95))
                 // 自动导出：写入相机标记并按导出命名规则入库（与手动导出产物一致）
                 val marked = try {
-                    LeicaMark.mark(workBytes, SettingsStore.leicaBadgeEnabled(app))
+                    LeicaMark.mark(
+                        workBytes,
+                        SettingsStore.leicaBadgeEnabled(app),
+                        SettingsStore.deviceInfoModeCode(app)
+                    )
                 } catch (t: Throwable) {
                     DiagLog.e("SuperRes", "mark failed, export unmarked", t)
                     workBytes
@@ -263,18 +266,31 @@ object SuperResTask {
     }
 
     private fun saveNamed(context: Context, bytes: ByteArray, name: String) {
+        // 导出时间模式：original=DATE_TAKEN 取原图拍摄时间（无则当下）；
+        // now=先把 EXIF 三时间 tag 重写为当下，DATE_TAKEN 也取当下。
+        val now = System.currentTimeMillis()
+        val payload: ByteArray
+        val takenAt: Long
+        if (SettingsStore.exportTimeOriginal(context)) {
+            payload = bytes
+            takenAt = ExifTimes.readTakenAtEpoch(bytes) ?: now
+        } else {
+            payload = ExifTimes.rewriteToNow(context, bytes)
+            takenAt = now
+        }
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= 29) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/LeicaMoments")
+                put(MediaStore.Images.Media.RELATIVE_PATH, SettingsStore.saveRelativePath(context))
                 put(MediaStore.Images.Media.IS_PENDING, 1)
+                put(MediaStore.Images.ImageColumns.DATE_TAKEN, takenAt)
             }
         }
         val resolver = context.contentResolver
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
         try {
-            resolver.openOutputStream(uri)?.use { os -> os.write(bytes) }
+            resolver.openOutputStream(uri)?.use { os -> os.write(payload) }
             if (Build.VERSION.SDK_INT >= 29) {
                 values.clear()
                 values.put(MediaStore.Images.Media.IS_PENDING, 0)
