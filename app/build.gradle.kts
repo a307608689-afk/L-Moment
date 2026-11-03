@@ -6,13 +6,17 @@ plugins {
 android {
     namespace = "com.leicamoments.app"
     compileSdk = 34
+    // 预编译 ncnn（20261020）用较新的 NDK 构建，其静态库引用 NDK r26+ 才有的
+    // libc++ 符号（std::__hash_memory）。留在工具链默认的 r25 会链接失败，故显式钉版本；
+    // 缺失的符号由 LibcxxShim.cpp 补齐。
+    ndkVersion = "26.3.11579264"
 
     defaultConfig {
         applicationId = "com.leicamoments.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 10410
-        versionName = "1.4.1"
+        versionCode = 10500
+        versionName = "1.5.0"
         ndk {
             abiFilters.add("arm64-v8a")
         }
