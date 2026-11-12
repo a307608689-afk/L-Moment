@@ -47,8 +47,9 @@
             android:layout_height="1dp" />
     </LinearLayout>
 
-    <!-- 页面栈：同一时刻只有一页可见（首屏 + 5 个三级页） -->
+    <!-- 页面栈：同一时刻只有一页可见（首屏 + 5 个三级页）；宽屏档整列限宽 520dp 居中 -->
     <FrameLayout
+        android:id="@+id/settingsPages"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">

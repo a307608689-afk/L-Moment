@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 三级页：导出与元数据（徕卡徽章 / 保存位置 / 导出时间 / 设备标识） -->
+<!-- 三级页：导出与元数据（保存位置 / 导出时间 / 设备标识） -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -12,63 +12,6 @@
         android:layout_height="wrap_content"
         android:background="#000000"
         android:orientation="vertical">
-
-        <LinearLayout
-            android:id="@+id/rowLeicaBadge"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="16dp"
-            android:layout_marginTop="20dp"
-            android:layout_marginEnd="16dp"
-            android:background="@drawable/bg_settings_row"
-            android:clickable="true"
-            android:focusable="true"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:paddingStart="16dp"
-            android:paddingTop="16dp"
-            android:paddingEnd="16dp"
-            android:paddingBottom="16dp">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="徕卡徽章"
-                android:textColor="#E8E8EA"
-                android:textSize="15sp" />
-
-            <Space
-                android:layout_width="0dp"
-                android:layout_height="1dp"
-                android:layout_weight="1" />
-
-            <TextView
-                android:id="@+id/txtLeicaBadgeValue"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="开"
-                android:textColor="#8E8E93"
-                android:textSize="15sp" />
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="6dp"
-                android:text="›"
-                android:textColor="#5A5A5E"
-                android:textSize="15sp" />
-        </LinearLayout>
-
-        <TextView
-            android:id="@+id/txtLeicaBadgeHint"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:paddingStart="32dp"
-            android:paddingEnd="32dp"
-            android:text="开 = 导出写入徕卡识别元数据，相册显示「徕卡」徽章\n关 = 导出无徽章，并清除源图自带的徽章元数据\n机型、拍摄参数、GPS 等 EXIF 不受开关影响"
-            android:textColor="#5A5A5E"
-            android:textSize="12sp" />
 
         <LinearLayout
             android:id="@+id/rowSavePath"
@@ -106,7 +49,7 @@
                 android:ellipsize="end"
                 android:maxWidth="200dp"
                 android:maxLines="1"
-                android:text="Pictures/LeicaMoments"
+                android:text="Pictures/L-Moment"
                 android:textColor="#8E8E93"
                 android:textSize="15sp" />
 
@@ -184,6 +127,66 @@
             android:paddingStart="32dp"
             android:paddingEnd="32dp"
             android:text="原本时间 = 相册按源图拍摄时间显示与排序\n当下时间 = 导出的照片在相册里如刚拍摄\n文件属性时间始终为导出时刻（系统机制），GPS/机型/参数不受影响"
+            android:textColor="#5A5A5E"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/rowExportName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_settings_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="导出文件名格式"
+                android:textColor="#E8E8EA"
+                android:textSize="15sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/txtExportNameValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxWidth="200dp"
+                android:maxLines="1"
+                android:text="默认（LM · 色彩 · 时间戳）"
+                android:textColor="#8E8E93"
+                android:textSize="15sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="›"
+                android:textColor="#5A5A5E"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtExportNameHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:text="示例：LM_L-M9_1731312345678.jpg\n非默认档重名自动加序号（_2、_3…）；时间跟随「导出时间」档，机型跟随「设备标识」档\n只影响之后导出的文件；已导出的不受影响"
             android:textColor="#5A5A5E"
             android:textSize="12sp" />
 

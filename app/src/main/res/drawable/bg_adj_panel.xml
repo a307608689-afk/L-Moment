@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 调节面板底：深色渐变悬浮卡（顶部微提亮，圆角 20dp），配合 elevation 出投影 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="270"
+                android:startColor="#1C1C20"
+                android:endColor="#0C0C0E" />
+            <corners android:radius="20dp" />
+            <stroke
+                android:width="1dp"
+                android:color="#1FFFFFFF" />
+        </shape>
+    </item>
+</layer-list>

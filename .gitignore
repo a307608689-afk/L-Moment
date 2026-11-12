@@ -66,7 +66,7 @@ hs_err_pid*
 *.gif
 *.webp
 
-# ---- 自产资产白名单（34 个，全部可再分发）----
+# ---- 自产资产白名单（44 个，全部可再分发）----
 !app/src/main/assets/lut_kodak_400.bin
 !app/src/main/assets/lut_kodak_200.bin
 !app/src/main/assets/lut_kodak_100.bin
@@ -101,6 +101,16 @@ hs_err_pid*
 !app/src/main/assets/lut_hassel_hs.bin
 !app/src/main/assets/lut_hassel_hm.bin
 !app/src/main/assets/lut_hassel_hc.bin
+!app/src/main/assets/lut_r_pos.bin
+!app/src/main/assets/lut_r_bleach.bin
+!app/src/main/assets/lut_r_cross.bin
+!app/src/main/assets/lut_r_retro.bin
+!app/src/main/assets/lut_r_hbw.bin
+!app/src/main/assets/lut_r_std.bin
+!app/src/main/assets/lut_r_soft.bin
+!app/src/main/assets/lut_r_neg.bin
+!app/src/main/assets/lut_r_street.bin
+!app/src/main/assets/lut_r_cross2.bin
 # ---- GPU inference stack (third-party prebuilt + derived models; fetch on demand) ----
 /app/src/main/cpp/ncnn/
 /app/src/main/assets/ncnn/

@@ -195,7 +195,7 @@ void destroy(NetHandle* handle) {
 extern "C" {
 
 JNIEXPORT jint JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeGpuCount(JNIEnv*, jclass) {
+Java_com_lmcamera_app_NcnnNet_nativeGpuCount(JNIEnv*, jclass) {
 #if NCNN_VULKAN
     return ncnn::get_gpu_count();
 #else
@@ -204,7 +204,7 @@ Java_com_leicamoments_app_NcnnNet_nativeGpuCount(JNIEnv*, jclass) {
 }
 
 JNIEXPORT jstring JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeDeviceInfo(JNIEnv* env, jclass) {
+Java_com_lmcamera_app_NcnnNet_nativeDeviceInfo(JNIEnv* env, jclass) {
 #if NCNN_VULKAN
     const int count = ncnn::get_gpu_count();
     if (count <= 0) return env->NewStringUTF("no vulkan device");
@@ -231,7 +231,7 @@ Java_com_leicamoments_app_NcnnNet_nativeDeviceInfo(JNIEnv* env, jclass) {
  * @param fp16_arith  1 = fp16 arithmetic (faster, slightly less accurate)
  */
 JNIEXPORT jlong JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeCreate(JNIEnv* env, jclass, jstring param_path,
+Java_com_lmcamera_app_NcnnNet_nativeCreate(JNIEnv* env, jclass, jstring param_path,
                                                jstring bin_path, jstring cache_path,
                                                jint threads, jint use_vulkan, jint fp16,
                                                jint fp16_arith) {
@@ -340,7 +340,7 @@ Java_com_leicamoments_app_NcnnNet_nativeCreate(JNIEnv* env, jclass, jstring para
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeFlushCache(JNIEnv*, jclass, jlong ptr) {
+Java_com_lmcamera_app_NcnnNet_nativeFlushCache(JNIEnv*, jclass, jlong ptr) {
     NetHandle* handle = reinterpret_cast<NetHandle*>(ptr);
     if (handle == nullptr) return JNI_FALSE;
     std::lock_guard<std::mutex> guard(g_mutex);
@@ -360,7 +360,7 @@ Java_com_leicamoments_app_NcnnNet_nativeFlushCache(JNIEnv*, jclass, jlong ptr) {
  * Output: float[C*H*W] (CHW), or null on failure.
  */
 JNIEXPORT jfloatArray JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeRun(JNIEnv* env, jclass, jlong ptr, jobjectArray inputs,
+Java_com_lmcamera_app_NcnnNet_nativeRun(JNIEnv* env, jclass, jlong ptr, jobjectArray inputs,
                                             jintArray shape_c, jintArray shape_h,
                                             jintArray shape_w) {
     NetHandle* handle = reinterpret_cast<NetHandle*>(ptr);
@@ -415,7 +415,7 @@ Java_com_leicamoments_app_NcnnNet_nativeRun(JNIEnv* env, jclass, jlong ptr, jobj
 
 /** Warms up (compiles shaders for) the given shape; returns elapsed ms or -1. */
 JNIEXPORT jlong JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeWarmup(JNIEnv* env, jclass, jlong ptr, jintArray shape_c,
+Java_com_lmcamera_app_NcnnNet_nativeWarmup(JNIEnv* env, jclass, jlong ptr, jintArray shape_c,
                                                jintArray shape_h, jintArray shape_w) {
     NetHandle* handle = reinterpret_cast<NetHandle*>(ptr);
     if (handle == nullptr) return -1;
@@ -439,7 +439,7 @@ Java_com_leicamoments_app_NcnnNet_nativeWarmup(JNIEnv* env, jclass, jlong ptr, j
 }
 
 JNIEXPORT void JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeDestroy(JNIEnv*, jclass, jlong ptr) {
+Java_com_lmcamera_app_NcnnNet_nativeDestroy(JNIEnv*, jclass, jlong ptr) {
     NetHandle* handle = reinterpret_cast<NetHandle*>(ptr);
     if (handle == nullptr) return;
     std::lock_guard<std::mutex> guard(g_mutex);
@@ -447,7 +447,7 @@ Java_com_leicamoments_app_NcnnNet_nativeDestroy(JNIEnv*, jclass, jlong ptr) {
 }
 
 JNIEXPORT jstring JNICALL
-Java_com_leicamoments_app_NcnnNet_nativeLastError(JNIEnv* env, jclass) {
+Java_com_lmcamera_app_NcnnNet_nativeLastError(JNIEnv* env, jclass) {
     return env->NewStringUTF(g_last_error.c_str());
 }
 

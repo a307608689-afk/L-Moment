@@ -246,7 +246,7 @@ void applyRange(const Ctx& c, int32_t* px, int y0, int y1) {
 }  // namespace
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_leicamoments_app_AdaptiveColorNet_applyNative(
+Java_com_lmcamera_app_AdaptiveColorNet_applyNative(
         JNIEnv* env, jobject, jintArray pixels, jint w, jint h,
         jfloatArray affArr, jfloatArray knotsArr, jboolean protect, jboolean guard,
         jfloat strength, jboolean smooth) {
@@ -571,7 +571,7 @@ void buildMaskWindow(const int32_t* px, int w, int h,
 }  // namespace
 
 extern "C" JNIEXPORT jfloatArray JNICALL
-Java_com_leicamoments_app_AdaptiveColorNet_statsNative(
+Java_com_lmcamera_app_AdaptiveColorNet_statsNative(
         JNIEnv* env, jobject, jintArray pixels, jint w, jint h) {
     if (pixels == nullptr || w <= 0 || h <= 0) return nullptr;
     initLutsOnce();
@@ -624,7 +624,7 @@ Java_com_leicamoments_app_AdaptiveColorNet_statsNative(
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_leicamoments_app_AdaptiveColorNet_applyPreparedNative(
+Java_com_lmcamera_app_AdaptiveColorNet_applyPreparedNative(
         JNIEnv* env, jobject, jintArray pixels, jint w, jint extH,
         jfloatArray affArr, jfloatArray knotsArr, jboolean protect, jboolean guard,
         jfloat strength, jfloat gr, jfloat gg, jfloat gb, jfloat scale, jfloat offset,

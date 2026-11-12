@@ -172,7 +172,7 @@ static size_t findEoi(const unsigned char *d, size_t n) {
 extern "C" {
 
 JNIEXPORT jlong JNICALL
-Java_com_leicamoments_app_JpegStream_nativeOpen(JNIEnv *env, jclass, jstring jpath,
+Java_com_lmcamera_app_JpegStream_nativeOpen(JNIEnv *env, jclass, jstring jpath,
                                                 jint width, jint height,
                                                 jint quality, jint maxBandRows) {
   const char *path = env->GetStringUTFChars(jpath, NULL);
@@ -233,7 +233,7 @@ Java_com_leicamoments_app_JpegStream_nativeOpen(JNIEnv *env, jclass, jstring jpa
 }
 
 JNIEXPORT jint JNICALL
-Java_com_leicamoments_app_JpegStream_nativeBandRows(JNIEnv *, jclass, jlong handle) {
+Java_com_lmcamera_app_JpegStream_nativeBandRows(JNIEnv *, jclass, jlong handle) {
   StripEncoder *enc = (StripEncoder *)(intptr_t)handle;
   return enc ? enc->bandPx : 0;
 }
@@ -287,7 +287,7 @@ static int writeBandPixels(StripEncoder *enc, const unsigned char *pixels, int r
 }
 
 JNIEXPORT jint JNICALL
-Java_com_leicamoments_app_JpegStream_nativeWriteBand(JNIEnv *env, jclass,
+Java_com_lmcamera_app_JpegStream_nativeWriteBand(JNIEnv *env, jclass,
                                                      jlong handle, jbyteArray jrgba,
                                                      jint rows) {
   StripEncoder *enc = (StripEncoder *)(intptr_t)handle;
@@ -307,7 +307,7 @@ Java_com_leicamoments_app_JpegStream_nativeWriteBand(JNIEnv *env, jclass,
 
 /* Zero-copy variant: Kotlin hands us a direct ByteBuffer (native heap). */
 JNIEXPORT jint JNICALL
-Java_com_leicamoments_app_JpegStream_nativeWriteBandDirect(JNIEnv *env, jclass,
+Java_com_lmcamera_app_JpegStream_nativeWriteBandDirect(JNIEnv *env, jclass,
                                                            jlong handle, jobject jbuf,
                                                            jint rows) {
   StripEncoder *enc = (StripEncoder *)(intptr_t)handle;
@@ -333,7 +333,7 @@ Java_com_leicamoments_app_JpegStream_nativeWriteBandDirect(JNIEnv *env, jclass,
  * Returns NULL on any failure; callers must fall back to Bitmap.compress.
  */
 JNIEXPORT jbyteArray JNICALL
-Java_com_leicamoments_app_JpegStream_nativeEncodeBitmap(JNIEnv *env, jclass,
+Java_com_lmcamera_app_JpegStream_nativeEncodeBitmap(JNIEnv *env, jclass,
                                                        jobject jbitmap,
                                                        jint quality) {
   AndroidBitmapInfo info;
@@ -403,7 +403,7 @@ Java_com_leicamoments_app_JpegStream_nativeEncodeBitmap(JNIEnv *env, jclass,
 }
 
 JNIEXPORT jint JNICALL
-Java_com_leicamoments_app_JpegStream_nativeClose(JNIEnv *, jclass, jlong handle) {
+Java_com_lmcamera_app_JpegStream_nativeClose(JNIEnv *, jclass, jlong handle) {
   StripEncoder *enc = (StripEncoder *)(intptr_t)handle;
   if (!enc) return -1;
   int rc = 0;
@@ -419,7 +419,7 @@ Java_com_leicamoments_app_JpegStream_nativeClose(JNIEnv *, jclass, jlong handle)
 }
 
 JNIEXPORT void JNICALL
-Java_com_leicamoments_app_JpegStream_nativeAbort(JNIEnv *, jclass, jlong handle) {
+Java_com_lmcamera_app_JpegStream_nativeAbort(JNIEnv *, jclass, jlong handle) {
   StripEncoder *enc = (StripEncoder *)(intptr_t)handle;
   if (!enc) return;
   if (enc->fp) {
@@ -430,7 +430,7 @@ Java_com_leicamoments_app_JpegStream_nativeAbort(JNIEnv *, jclass, jlong handle)
 }
 
 JNIEXPORT jint JNICALL
-Java_com_leicamoments_app_JpegStream_nativeBandCount(JNIEnv *, jclass, jlong handle) {
+Java_com_lmcamera_app_JpegStream_nativeBandCount(JNIEnv *, jclass, jlong handle) {
   StripEncoder *enc = (StripEncoder *)(intptr_t)handle;
   if (!enc) return 0;
   return (enc->height + enc->bandPx - 1) / enc->bandPx;

@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include "libraw/libraw.h"
 
 #define LOG_TAG "RawDecoder"
@@ -15,7 +16,7 @@ extern "C" {
  * 厂商 ISP 渲染，色彩最准确；失败或无预览返回 null。
  */
 JNIEXPORT jbyteArray JNICALL
-Java_com_leicamoments_app_RawDecoder_nativeExtractPreview(JNIEnv *env, jclass, jbyteArray data) {
+Java_com_lmcamera_app_RawDecoder_nativeExtractPreview(JNIEnv *env, jclass, jbyteArray data) {
     if (data == nullptr) return nullptr;
     jsize len = env->GetArrayLength(data);
     if (len <= 0) return nullptr;
@@ -144,13 +145,13 @@ static jintArray decodeInternal(JNIEnv *env, jbyteArray data, jfloat autoBrightT
 
 /** 解码 RAW 字节（LibRaw 默认 auto_bright_thr = 0.01）。失败返回 null。 */
 JNIEXPORT jintArray JNICALL
-Java_com_leicamoments_app_RawDecoder_nativeDecode(JNIEnv *env, jclass, jbyteArray data) {
+Java_com_lmcamera_app_RawDecoder_nativeDecode(JNIEnv *env, jclass, jbyteArray data) {
     return decodeInternal(env, data, 0.01f);
 }
 
 /** 带 auto_bright_thr 的解码（RAW 解码亮度档位）。非法阈值回落到默认值。 */
 JNIEXPORT jintArray JNICALL
-Java_com_leicamoments_app_RawDecoder_nativeDecodeWithThr(JNIEnv *env, jclass, jbyteArray data,
+Java_com_lmcamera_app_RawDecoder_nativeDecodeWithThr(JNIEnv *env, jclass, jbyteArray data,
                                                          jfloat autoBrightThr) {
     if (!(autoBrightThr > 0.0f) || autoBrightThr >= 0.5f) autoBrightThr = 0.01f;
     return decodeInternal(env, data, autoBrightThr);
@@ -165,7 +166,7 @@ Java_com_leicamoments_app_RawDecoder_nativeDecodeWithThr(JNIEnv *env, jclass, jb
  * 内存由 malloc 分配（堆外，不受 Java 堆限制），必须由 nativeFreeLinear 释放。
  */
 JNIEXPORT jobject JNICALL
-Java_com_leicamoments_app_RawDecoder_nativeDecodeLinear(JNIEnv *env, jclass, jbyteArray data,
+Java_com_lmcamera_app_RawDecoder_nativeDecodeLinear(JNIEnv *env, jclass, jbyteArray data,
                                                         jdoubleArray wbMul, jboolean half) {
     if (data == nullptr) return nullptr;
     jsize len = env->GetArrayLength(data);
@@ -274,7 +275,7 @@ Java_com_leicamoments_app_RawDecoder_nativeDecodeLinear(JNIEnv *env, jclass, jby
  * 内存由 malloc 分配，必须由 nativeFreeLinear 释放。
  */
 JNIEXPORT jobject JNICALL
-Java_com_leicamoments_app_RawDecoder_nativeDecodeLinearSrgb(JNIEnv *env, jclass, jbyteArray data) {
+Java_com_lmcamera_app_RawDecoder_nativeDecodeLinearSrgb(JNIEnv *env, jclass, jbyteArray data) {
     if (data == nullptr) return nullptr;
     jsize len = env->GetArrayLength(data);
     if (len <= 0) return nullptr;
@@ -369,7 +370,7 @@ Java_com_leicamoments_app_RawDecoder_nativeDecodeLinearSrgb(JNIEnv *env, jclass,
  *                  1.0 = 关闭自动调整（用相机白点，超白点才可能保留）
  */
 JNIEXPORT jobject JNICALL
-Java_com_leicamoments_app_RawDecoder_nativeDecodeLinearSrgbEx(
+Java_com_lmcamera_app_RawDecoder_nativeDecodeLinearSrgbEx(
         JNIEnv *env, jclass, jbyteArray data, jint highlight, jfloat amt) {
     if (data == nullptr) return nullptr;
     jsize len = env->GetArrayLength(data);
@@ -458,10 +459,109 @@ Java_com_leicamoments_app_RawDecoder_nativeDecodeLinearSrgbEx(
 
 /** 释放 nativeDecodeLinear 的堆外缓冲。 */
 JNIEXPORT void JNICALL
-Java_com_leicamoments_app_RawDecoder_nativeFreeLinear(JNIEnv *env, jclass, jobject buffer) {
+Java_com_lmcamera_app_RawDecoder_nativeFreeLinear(JNIEnv *env, jclass, jobject buffer) {
     if (buffer == nullptr) return;
     void *addr = env->GetDirectBufferAddress(buffer);
     if (addr != nullptr) free(addr);
+}
+
+// ---- 厂商引擎桥（包名去 leica 的兼容层）----
+//
+// 两个预编译厂商库（无源码）内部按旧包名静态注册 JNI 符号：
+//   liblmembed.so     → Java_com_codex_leicaapp_LegendaryPostProcessor_*
+//   libmadridlegend.so → Java_com_codex_leicaapp_MadridLegendary_*
+// Java 侧包名已改为 com.codex.lmapp，JVM 按新名找符号必然失败；
+// 这里在自研 librawdecoder.so 里实现新名符号，dlopen 厂商库后 dlsym 旧名转发。
+// 函数签名必须与 Java 声明逐一严格一致（无重载 → 无签名修饰）。
+
+static void *lmEngineLib(const char *name) {
+    static void *warm = nullptr;
+    static void *madrid = nullptr;
+    if (strcmp(name, "liblmembed.so") == 0) {
+        if (!warm) warm = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        return warm;
+    }
+    if (strcmp(name, "libmadridlegend.so") == 0) {
+        if (!madrid) madrid = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        return madrid;
+    }
+    return nullptr;
+}
+
+static void *lmEngineSym(const char *lib, const char *sym) {
+    void *h = lmEngineLib(lib);
+    return h ? dlsym(h, sym) : nullptr;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_codex_lmapp_LegendaryPostProcessor_lmWarmEnsure(JNIEnv *, jclass) {
+    return lmEngineLib("liblmembed.so") != nullptr ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_codex_lmapp_LegendaryPostProcessor_applyOriginalFilter(
+        JNIEnv *env, jclass c, jobject b, jstring bin,
+        jfloat lux, jfloat cct, jfloat zoom, jfloat time) {
+    using Fn = jboolean (*)(JNIEnv *, jclass, jobject, jstring, jfloat, jfloat, jfloat, jfloat);
+    static Fn fn = reinterpret_cast<Fn>(lmEngineSym(
+            "liblmembed.so", "Java_com_codex_leicaapp_LegendaryPostProcessor_applyOriginalFilter"));
+    if (!fn) return JNI_FALSE;
+    return fn(env, c, b, bin, lux, cct, zoom, time);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_codex_lmapp_LegendaryPostProcessor_applyMonochrome(
+        JNIEnv *env, jclass c, jobject b, jstring runner, jstring cache) {
+    using Fn = jboolean (*)(JNIEnv *, jclass, jobject, jstring, jstring);
+    static Fn fn = reinterpret_cast<Fn>(lmEngineSym(
+            "liblmembed.so", "Java_com_codex_leicaapp_LegendaryPostProcessor_applyMonochrome"));
+    if (!fn) return JNI_FALSE;
+    return fn(env, c, b, runner, cache);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_codex_lmapp_LegendaryPostProcessor_applyStyle(
+        JNIEnv *env, jclass c, jobject b, jstring runner, jstring cache,
+        jstring models, jint rotation, jint lux, jint cct) {
+    using Fn = jboolean (*)(JNIEnv *, jclass, jobject, jstring, jstring, jstring, jint, jint, jint);
+    static Fn fn = reinterpret_cast<Fn>(lmEngineSym(
+            "liblmembed.so", "Java_com_codex_leicaapp_LegendaryPostProcessor_applyStyle"));
+    if (!fn) return JNI_FALSE;
+    return fn(env, c, b, runner, cache, models, rotation, lux, cct);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_codex_lmapp_LegendaryPostProcessor_applyWarmOriginalFilter(
+        JNIEnv *env, jclass c, jobject b, jstring bin,
+        jfloat lux, jfloat cct, jfloat zoom, jfloat time,
+        jfloat denoise, jfloat ev, jfloat warmth) {
+    using Fn = jboolean (*)(JNIEnv *, jclass, jobject, jstring,
+                            jfloat, jfloat, jfloat, jfloat, jfloat, jfloat, jfloat);
+    static Fn fn = reinterpret_cast<Fn>(lmEngineSym(
+            "liblmembed.so", "Java_com_codex_leicaapp_LegendaryPostProcessor_applyWarmOriginalFilter"));
+    if (!fn) return JNI_FALSE;
+    return fn(env, c, b, bin, lux, cct, zoom, time, denoise, ev, warmth);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_codex_lmapp_MadridLegendary_filter(
+        JNIEnv *env, jclass c, jobject bitmap, jstring binPath,
+        jfloat lux, jfloat cct, jfloat zoom, jfloat extra) {
+    using Fn = jboolean (*)(JNIEnv *, jclass, jobject, jstring, jfloat, jfloat, jfloat, jfloat);
+    static Fn fn = reinterpret_cast<Fn>(lmEngineSym(
+            "libmadridlegend.so", "Java_com_codex_leicaapp_MadridLegendary_filter"));
+    if (!fn) return JNI_FALSE;
+    return fn(env, c, bitmap, binPath, lux, cct, zoom, extra);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_codex_lmapp_MadridLegendary_grain(
+        JNIEnv *env, jclass c, jobject bitmap, jstring monopanRunnerPath, jstring cachePath) {
+    using Fn = jboolean (*)(JNIEnv *, jclass, jobject, jstring, jstring);
+    static Fn fn = reinterpret_cast<Fn>(lmEngineSym(
+            "libmadridlegend.so", "Java_com_codex_leicaapp_MadridLegendary_grain"));
+    if (!fn) return JNI_FALSE;
+    return fn(env, c, bitmap, monopanRunnerPath, cachePath);
 }
 
 } // extern "C"

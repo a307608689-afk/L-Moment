@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 调节滑杆轨道：3dp 圆角细轨（背景层 + 进度层），替代系统粗轨 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:id="@android:id/background"
+        android:gravity="center_vertical">
+        <shape android:shape="rectangle">
+            <size android:height="3dp" />
+            <corners android:radius="2dp" />
+            <solid android:color="#2EFFFFFF" />
+        </shape>
+    </item>
+    <item
+        android:id="@android:id/progress"
+        android:gravity="center_vertical">
+        <clip>
+            <shape android:shape="rectangle">
+                <size android:height="3dp" />
+                <corners android:radius="2dp" />
+                <solid android:color="#F2F2F2" />
+            </shape>
+        </clip>
+    </item>
+</layer-list>

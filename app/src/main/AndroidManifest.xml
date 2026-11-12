@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- AI 调色：直连 OpenAI 兼容服务与免费参考图搜索源（仅在使用 AI 功能时产生流量） -->
+    <!-- AI 调色：直连 OpenAI 兼容服务（仅在使用 AI 功能时产生流量） -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
@@ -26,7 +26,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.LeicaMoments">
+        android:theme="@style/Theme.LMCamera">
 
         <uses-native-library
             android:name="libSNPE.so"
@@ -42,7 +42,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -62,7 +62,7 @@
             android:name=".SettingsActivity"
             android:exported="false"
             android:label="设置"
-            android:theme="@style/Theme.LeicaMoments" />
+            android:theme="@style/Theme.LMCamera" />
 
         <!-- 模型色彩：独立界面（库 / 选择 / 新建 / 管理），只能由应用内部打开 -->
         <activity
@@ -70,7 +70,7 @@
             android:exported="false"
             android:label="模型色彩"
             android:parentActivityName=".MainActivity"
-            android:theme="@style/Theme.LeicaMoments" />
+            android:theme="@style/Theme.LMCamera" />
 
         <!-- 模型详情：参考图 / 排除 / 加图增强 / 版本回退 -->
         <activity
@@ -78,7 +78,7 @@
             android:exported="false"
             android:label="模型详情"
             android:parentActivityName=".ModelActivity"
-            android:theme="@style/Theme.LeicaMoments" />
+            android:theme="@style/Theme.LMCamera" />
 
         <!--
           BatchTestActivity（ADB 批量测试）与它所需的 MANAGE_EXTERNAL_STORAGE

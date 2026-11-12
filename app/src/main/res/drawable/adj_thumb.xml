@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 调节滑杆拇指：白圆点 + 2dp 投影晕圈，捏起来像 iOS 滑杆 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:width="18dp"
+        android:height="18dp"
+        android:gravity="center">
+        <shape android:shape="oval">
+            <solid android:color="#33000000" />
+        </shape>
+    </item>
+    <item
+        android:width="14dp"
+        android:height="14dp"
+        android:gravity="center">
+        <shape android:shape="oval">
+            <solid android:color="#FFFFFF" />
+        </shape>
+    </item>
+</layer-list>

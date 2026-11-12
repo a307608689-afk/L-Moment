@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.leicamoments.app"
+    namespace = "com.lmcamera.app"
     compileSdk = 34
     // 预编译 ncnn（20261020）用较新的 NDK 构建，其静态库引用 NDK r26+ 才有的
     // libc++ 符号（std::__hash_memory）。留在工具链默认的 r25 会链接失败，故显式钉版本；
@@ -12,7 +12,7 @@ android {
     ndkVersion = "26.3.11579264"
 
     defaultConfig {
-        applicationId = "com.leicamoments.app"
+        applicationId = "com.lmcamera.app"
         minSdk = 26
         targetSdk = 34
         versionCode = 10500

@@ -11,25 +11,25 @@
       背景是老的 9-patch（圆角约 2dp），所以看起来"很方"。这里换到 Material 的弹窗样式，
       并把 shape 的圆角对齐色彩卡：cardCorner = 12dp（MainActivity.cardCorner）。
     -->
-    <style name="Base.Theme.LeicaMoments" parent="Theme.Material3.Dark.NoActionBar">
+    <style name="Base.Theme.LMCamera" parent="Theme.Material3.Dark.NoActionBar">
         <item name="android:windowBackground">#FF000000</item>
         <item name="android:statusBarColor">#FF000000</item>
         <item name="android:navigationBarColor">#FF000000</item>
-        <item name="materialAlertDialogTheme">@style/ThemeOverlay.LeicaMoments.MaterialAlertDialog</item>
+        <item name="materialAlertDialogTheme">@style/ThemeOverlay.LMCamera.MaterialAlertDialog</item>
     </style>
 
-    <style name="Theme.LeicaMoments" parent="Base.Theme.LeicaMoments" />
+    <style name="Theme.LMCamera" parent="Base.Theme.LMCamera" />
 
     <!-- 弹窗外壳：沿用 M3 的配色/内边距，只替换容器形状 -->
-    <style name="ThemeOverlay.LeicaMoments.MaterialAlertDialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
-        <item name="alertDialogStyle">@style/MaterialAlertDialog.LeicaMoments</item>
+    <style name="ThemeOverlay.LMCamera.MaterialAlertDialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="alertDialogStyle">@style/MaterialAlertDialog.LMCamera</item>
     </style>
 
-    <style name="MaterialAlertDialog.LeicaMoments" parent="MaterialAlertDialog.Material3">
-        <item name="shapeAppearance">@style/ShapeAppearance.LeicaMoments.Dialog</item>
+    <style name="MaterialAlertDialog.LMCamera" parent="MaterialAlertDialog.Material3">
+        <item name="shapeAppearance">@style/ShapeAppearance.LMCamera.Dialog</item>
     </style>
 
-    <style name="ShapeAppearance.LeicaMoments.Dialog" parent="">
+    <style name="ShapeAppearance.LMCamera.Dialog" parent="">
         <item name="cornerFamily">rounded</item>
         <item name="cornerSize">12dp</item>
     </style>

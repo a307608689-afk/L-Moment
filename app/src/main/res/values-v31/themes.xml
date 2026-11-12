@@ -4,7 +4,7 @@
       避免冷启动时先白一下再进正文。
       公共项都放在 Base 里，这里只补 v31 独有的一条。
     -->
-    <style name="Theme.LeicaMoments" parent="Base.Theme.LeicaMoments">
+    <style name="Theme.LMCamera" parent="Base.Theme.LMCamera">
         <item name="android:windowSplashScreenBackground">#FF000000</item>
     </style>
 </resources>

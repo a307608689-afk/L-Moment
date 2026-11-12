@@ -96,7 +96,7 @@ endif()
 
 # ---- JNI 封装共享库 ----
 add_library(rawdecoder SHARED RawDecoder.cpp JpegStream.cpp ModelColor.cpp NcnnNet.cpp LibcxxShim.cpp)
-target_link_libraries(rawdecoder libraw jpegturbo log jnigraphics)
+target_link_libraries(rawdecoder libraw jpegturbo log jnigraphics dl)
 if(HAVE_NCNN)
     # ncnn 的 AAsset* 路径需要 libandroid
     target_link_libraries(rawdecoder android)

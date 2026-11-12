@@ -70,14 +70,27 @@
             android:textSize="15sp" />
     </LinearLayout>
 
-    <!-- 预览区 -->
+    <!-- 悬浮层舞台：包住预览区+右栏，调节浮层 adjPanel 运行时挂这里（横屏右下/竖屏左下） -->
     <FrameLayout
+        android:id="@+id/floatStage"
         android:layout_width="match_parent"
         android:layout_height="0dp"
+        android:layout_weight="1">
+
+    <!-- 预览区 + 平板右栏（横向容器：手机档右栏 gone，宽度全归预览，视觉与改前逐像素一致） -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="horizontal"
+        android:background="#000000">
+
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
         android:layout_weight="1"
         android:background="#000000">
 
-        <com.leicamoments.app.ZoomableImageView
+        <com.lmcamera.app.ZoomableImageView
             android:id="@+id/imgPreview"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
@@ -416,16 +429,105 @@
 
         </LinearLayout>
 
-        <!-- 调节浮层：点击「调节」向上展开五档滑杆（拖动调档，双击标签复位到 0）；再点收起 -->
+        <!-- 调节浮层：标题行（调节/重置/收起）+ 可滚动内容区（14 行滑杆）；
+             最高 45% 屏高在代码里约束（toggleAdjPanel），避免盖住整个预览 -->
         <LinearLayout
             android:id="@+id/adjPanel"
-            android:layout_width="wrap_content"
+            android:layout_width="272dp"
             android:layout_height="wrap_content"
             android:layout_gravity="bottom|start"
             android:layout_marginStart="16dp"
             android:layout_marginBottom="56dp"
+            android:background="@drawable/bg_adj_panel"
+            android:elevation="12dp"
             android:orientation="vertical"
+            android:paddingTop="4dp"
+            android:paddingBottom="6dp"
             android:visibility="gone">
+
+            <!-- 标题行：左标题、右重置与收起（实底黑，不再浮在天空上） -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:paddingBottom="2dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="调节"
+                    android:textColor="#8E8E93"
+                    android:textSize="13sp" />
+
+                <!-- 重置后的撤销组：紧跟「调节」标题，与右侧「重置」物理隔离防误触；5 秒自动消失 -->
+                <TextView
+                    android:id="@+id/adjUndoMsg"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="10dp"
+                    android:text="已重置 14 项"
+                    android:textColor="#7BC96F"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:id="@+id/adjUndoBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingStart="8dp"
+                    android:paddingTop="4dp"
+                    android:paddingEnd="4dp"
+                    android:paddingBottom="4dp"
+                    android:text="撤销"
+                    android:textColor="#F2F2F2"
+                    android:textSize="12.5sp"
+                    android:visibility="gone" />
+
+                <Space
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
+
+                <!-- 重置：幽灵按钮，默认隐藏（有调整时才出现，见 updateLumBarUi） -->
+                <TextView
+                    android:id="@+id/btnAdjReset"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingStart="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="10dp"
+                    android:paddingBottom="6dp"
+                    android:text="重置"
+                    android:textColor="#8E8E93"
+                    android:textSize="12.5sp"
+                    android:visibility="gone" />
+
+                <ImageView
+                    android:id="@+id/btnAdjClose"
+                    android:layout_width="30dp"
+                    android:layout_height="30dp"
+                    android:layout_marginStart="2dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="收起"
+                    android:src="@drawable/ic_chevron_down" />
+            </LinearLayout>
+
+            <ScrollView
+                android:id="@+id/adjScroll"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/adjPages"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:paddingStart="16dp"
+                    android:paddingEnd="16dp">
 
             <!-- 亮度滑杆组（排最前）：名称列统一 minWidth 44dp（=最宽名「黑色阶」），五行滑杆起止对齐；进度 0..20 ↔ 档位 -10..+10 -->
             <LinearLayout
@@ -755,9 +857,9 @@
 
             </LinearLayout>
 
-            <!-- 柔光（第八档）：正=Orton 柔雾，负=清晰化；进度 0..20 ↔ 档位 -10..+10 -->
+            <!-- 柔光（第八档）：正=Orton 柔雾，负=清晰化；进度 0..20 ↔ 档位 -10..+10；行宽与其余 13 行统一 240dp -->
             <LinearLayout
-                android:layout_width="match_parent"
+                android:layout_width="240dp"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:background="@drawable/bg_pill"
@@ -802,7 +904,336 @@
 
             </LinearLayout>
 
+            <!-- 色彩组：色温 / 色调（±10 档） -->
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="色温"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbTemp"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtTempVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="色调"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbTint"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="20"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="10"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtTintVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <!-- 强度组：0..100 百分比 -->
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="风格强度"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbLutStr"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="100"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="100"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtLutStrVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="100"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="黑白"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbMono"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="100"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="0"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtMonoVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="颗粒"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbGrain"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="100"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="0"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtGrainVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="240dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_pill"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="44dp"
+                    android:text="暗角"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/sbVignette"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:max="100"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:progress="0"
+                    android:progressBackgroundTint="#59FFFFFF"
+                    android:progressTint="#F2F2F2"
+                    android:thumbTint="#F2F2F2" />
+
+                <TextView
+                    android:id="@+id/txtVignetteVal"
+                    android:layout_width="34dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:gravity="end"
+                    android:text="0"
+                    android:textColor="#F2F2F2"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+                </LinearLayout>
+            </ScrollView>
         </LinearLayout>
+    </FrameLayout>
+
+    <!-- 平板双栏右栏：上部滤镜三列网格 + 分隔线 + 下部固定调节区（adjPanel 整体搬入，默认收起）。
+         手机/回落档整列 gone；宽度与调节区高度由代码按 FormFactor 设定 -->
+    <LinearLayout
+        android:id="@+id/tabletToolsColumn"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:background="#0A0A0B"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <ScrollView
+            android:id="@+id/tabletFilterScroll"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:scrollbars="none">
+
+            <LinearLayout
+                android:id="@+id/tabletFilterGrid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:paddingStart="8dp"
+                android:paddingTop="8dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="8dp">
+
+                <LinearLayout
+                    android:id="@+id/tabletCol0"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical" />
+
+                <LinearLayout
+                    android:id="@+id/tabletCol1"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical" />
+
+                <LinearLayout
+                    android:id="@+id/tabletCol2"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical" />
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+    </LinearLayout>
     </FrameLayout>
 
     <!-- 底部滤镜条 -->
