@@ -39,7 +39,9 @@ gradle assembleDebug
 
 ## 资产
 
-`app/src/main/assets/` 中随仓库分发的二进制共 44 个，均为本项目自产：
+`app/src/main/assets/` 中随仓库分发的二进制共 45 个，均为本项目自产：
+
+- AI 风格签名表：`ai_style_signatures.json`（各 LUT 档对多样化图集的典型作用量，供 AI 调色做过冲预判）
 
 - LUT：`lut_alexa`、`lut_p9vibrant`、`lut_arri709`、`lut_arrireveal`、`lut_arridune`、`lut_arrilala`、`lut_arrijoker`，F-胶片家族 `lut_fuji_acros`、`lut_fuji_chrome`、`lut_fuji_cneg`、`lut_fuji_nn`、`lut_fuji_pnh`，K-胶片家族 `lut_kodak_400`、`lut_kodak_200`、`lut_kodak_100`、`lut_kodak_64`，H 色彩家族 `lut_hassel_hn`、`lut_hassel_hb`、`lut_hassel_hg`、`lut_hassel_hp`、`lut_hassel_hw`、`lut_hassel_hs`、`lut_hassel_hm`、`lut_hassel_hc`，以及 R 色彩家族 `lut_r_pos`、`lut_r_bleach`、`lut_r_cross`、`lut_r_retro`、`lut_r_hbw`、`lut_r_std`、`lut_r_soft`、`lut_r_neg`、`lut_r_street`、`lut_r_cross2`
 - 风格参数表：`styleA_s0` ~ `styleA_s5`

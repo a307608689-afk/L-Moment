@@ -34,9 +34,11 @@ object StyleKeywordMap {
             listOf("徕卡味"),
             Preset("LP9", "L-P9", "徕卡鲜艳 · 相机光学味", saturation = 2, contrast = 1)
         ),
+        // 「徕卡」笼统词的断网兜底给 LM9（用户口径：一瞬/光学味/相机直出味 = L-M9）；
+        // 正常路径由 SYSTEM_PROMPT 双轨制让模型自主判断
         Rule(
-            listOf("徕卡", "leica"),
-            Preset("M9", "M9", "徕卡一瞬 · 彩色经典")
+            listOf("徕卡", "leica", "一瞬", "光学味", "相机味"),
+            Preset("LM9", "L-M9", "徕卡一瞬 · 相机直出味", saturation = 1, contrast = 1)
         ),
         Rule(
             listOf("柯达暖"),
@@ -49,6 +51,10 @@ object StyleKeywordMap {
         Rule(
             listOf("富士", "fuji", "fujifilm"),
             Preset("FCHROME", "经典铬", "富士经典铬 · 哑光纪实", contrast = 2, saturation = -1)
+        ),
+        Rule(
+            listOf("理光街拍", "理光扫街"),
+            Preset("RSTREET", "STREET", "街拍 · 纪实硬调", contrast = 2, saturation = -1)
         ),
         Rule(
             listOf("理光", "ricoh"),
@@ -71,10 +77,6 @@ object StyleKeywordMap {
             Preset("HN", "H·自然", "自然还原 · 通透")
         ),
         Rule(
-            listOf("哈苏蓝", "蓝调", "蓝天", "天空蓝", "hassel blue"),
-            Preset("HB", "H·蓝", "天空深青 · 层次", saturation = 1, contrast = 1)
-        ),
-        Rule(
             listOf("植被", "绿意", "森林", "橄榄绿"),
             Preset("HG", "H·绿", "橄榄绿植 · 不荧光", saturation = 1)
         ),
@@ -95,7 +97,7 @@ object StyleKeywordMap {
             Preset("CCDP", "CCD·粉", "粉白通透", saturation = 1, highlights = 1)
         ),
         Rule(
-            listOf("暖黄", "柯达暖", "暖色"),
+            listOf("暖黄", "暖色"),
             Preset("CCDW", "CCD·暖", "柯达暖黄", saturation = 1)
         ),
         Rule(
@@ -150,18 +152,19 @@ object StyleKeywordMap {
             listOf("柔和", "柔光", "朦胧", "梦幻"),
             Preset("FPNH", "人像负片·高", "人像高对比 · 肤色优先", glow = 3, contrast = -1)
         ),
-        // R 色彩家族：只收与既有规则不冲突的关键词（"反转"已归 K64、"复古"已归 FNN、
-        // "黑白"已归 M3，RRETRO/RHBW 不设兜底词，交给模型自选）
+        // R 色彩家族：只收与既有规则不冲突的关键词（"反转"已归 K64、"复古/褪色"已归 FNN、
+        // "黑白"已归 M3、"青影"已归 FCNEG——含这些词的复合词同样会被截走，一律不收；
+        // RRETRO/RHBW/RCROSS2 不设兜底词，交给模型自选）
         Rule(
-            listOf("正片", "幻灯片", "反转片", "positive"),
+            listOf("正片", "幻灯片", "positive"),
             Preset("RPOS", "Positive", "正片 · 浓彩反转", saturation = 2, contrast = 1)
         ),
         Rule(
-            listOf("漂白", "银灰", "bleach", "褪色硬调"),
+            listOf("漂白", "银灰", "bleach"),
             Preset("RBLEACH", "Bleach", "漂白 · 银灰硬调", saturation = -2, contrast = 2)
         ),
         Rule(
-            listOf("交叉冲洗", "cross process", "青影黄绿"),
+            listOf("交叉冲洗", "cross process"),
             Preset("RCROSS", "Cross", "交叉冲洗 · 青影黄绿", contrast = 2)
         ),
         // R 色彩第二批：只收与既有规则不冲突的词（"负片/青影"归 FCNEG、"灰阶"归 M3、
@@ -194,9 +197,9 @@ object StyleKeywordMap {
         return null
     }
 
-    /** 给模型的离线建议文本（无网络时拼进 prompt）。 */
+    /** 给模型的离线建议文本（无网络时拼进 prompt）；未命中返回空串（不注入噪音）。 */
     fun hintText(text: String): String {
-        val p = suggest(text) ?: return "（没有匹配到现成色彩，请按描述自选参数）"
+        val p = suggest(text) ?: return ""
         return "本地经验匹配：${p.styleLabel}（${p.reason}），建议起点 饱和${sign(p.saturation)} 对比${sign(p.contrast)} 阴影${sign(p.shadows)} 高光${sign(p.highlights)} 黑位${sign(p.black)} 曝光${sign(p.exposure)} 柔光${sign(p.glow)}"
     }
 

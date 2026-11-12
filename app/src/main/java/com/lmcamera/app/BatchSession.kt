@@ -57,6 +57,13 @@ class EditItem(val id: Long, val uri: Uri) {
     /** 八档档位，索引见 [LV_BRIGHT] 等常量 */
     val levels = IntArray(LEVEL_COUNT)
 
+    init {
+        // 新建条目必须套用尾部默认值（DEFAULTS_TAIL）：批量导入的装载链会把条目 levels
+        // 原样装回字段（applySessionFields），裸构造的强度槽 0 会让「什么都没调」的图
+        // 风格强度归零（单张导入不走装载回放，故仅批量复现）。
+        DEFAULTS_TAIL.copyInto(levels, LEVEL_COUNT - DEFAULTS_TAIL.size)
+    }
+
     /** HDR 输出开关（用户选择值；源图自带增益图时装载期会被压制，见 MainActivity） */
     var hdrBoost = false
 
@@ -179,6 +186,12 @@ class Recipe {
     var customId: String? = null
     val levels = IntArray(EditItem.LEVEL_COUNT)
     var hdrBoost = false
+
+    init {
+        // 强度类默认 100，不能是 0（与 clear() 同口径）：否则只调过其它档的配方
+        // copyFrom 前的裸构造态会把强度槽带成 0，套到未调过的图上=风格强度归零
+        levels[EditItem.LV_LUT_STRENGTH] = 100
+    }
 
     /** 空配方 = 没有任何色彩，此时无法批量导出（与「无色彩不能导出」的既有语义一致） */
     val isEmpty: Boolean

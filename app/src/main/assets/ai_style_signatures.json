@@ -1,0 +1,251 @@
+{
+ "version": 1,
+ "unit": "与原图统计同字段同口径（luma/contrast 0-255 域，sat/warmth 0-100），作用量=套该档后统计-原图统计的图集均值",
+ "styles": {
+  "M4": {
+   "luma": 6.0,
+   "contrast": 4.7,
+   "sat": -1.0,
+   "warmth": 1.1,
+   "n": 12
+  },
+  "A709": {
+   "luma": 4.7,
+   "contrast": 0.9,
+   "sat": -1.1,
+   "warmth": -0.1,
+   "n": 12
+  },
+  "REVEAL": {
+   "luma": 6.1,
+   "contrast": -0.1,
+   "sat": -2.3,
+   "warmth": 0.5,
+   "n": 12
+  },
+  "DUNE": {
+   "luma": 0.2,
+   "contrast": -9.8,
+   "sat": -16.3,
+   "warmth": 0.9,
+   "n": 12
+  },
+  "LALALAND": {
+   "luma": 5.2,
+   "contrast": 3.4,
+   "sat": 1.7,
+   "warmth": -0.2,
+   "n": 12
+  },
+  "JOKER": {
+   "luma": -1.3,
+   "contrast": -3.1,
+   "sat": -7.8,
+   "warmth": -0.0,
+   "n": 12
+  },
+  "FCHROME": {
+   "luma": 6.5,
+   "contrast": 5.5,
+   "sat": -6.6,
+   "warmth": -0.2,
+   "n": 12
+  },
+  "FCNEG": {
+   "luma": 7.6,
+   "contrast": 7.9,
+   "sat": -1.6,
+   "warmth": -0.8,
+   "n": 12
+  },
+  "FNN": {
+   "luma": 7.5,
+   "contrast": -5.0,
+   "sat": -9.5,
+   "warmth": 4.8,
+   "n": 12
+  },
+  "FPNH": {
+   "luma": 5.8,
+   "contrast": 3.9,
+   "sat": -7.2,
+   "warmth": 1.5,
+   "n": 12
+  },
+  "FACROS": {
+   "luma": 3.8,
+   "contrast": 5.2,
+   "sat": -34.3,
+   "warmth": -0.6,
+   "n": 12
+  },
+  "KP400": {
+   "luma": 2.5,
+   "contrast": -4.3,
+   "sat": -5.4,
+   "warmth": 1.4,
+   "n": 12
+  },
+  "KG200": {
+   "luma": 5.4,
+   "contrast": -0.2,
+   "sat": -2.7,
+   "warmth": 3.2,
+   "n": 12
+  },
+  "KE100": {
+   "luma": 3.2,
+   "contrast": 2.9,
+   "sat": 2.1,
+   "warmth": -0.1,
+   "n": 12
+  },
+  "KC64": {
+   "luma": 2.3,
+   "contrast": 3.8,
+   "sat": -0.3,
+   "warmth": 2.3,
+   "n": 12
+  },
+  "HN": {
+   "luma": 2.8,
+   "contrast": 2.6,
+   "sat": 0.5,
+   "warmth": -0.6,
+   "n": 12
+  },
+  "HB": {
+   "luma": -1.9,
+   "contrast": 0.2,
+   "sat": 4.5,
+   "warmth": -6.0,
+   "n": 12
+  },
+  "HG": {
+   "luma": 4.1,
+   "contrast": 3.1,
+   "sat": 1.0,
+   "warmth": -0.3,
+   "n": 12
+  },
+  "HP": {
+   "luma": 4.4,
+   "contrast": -0.7,
+   "sat": 4.0,
+   "warmth": 6.4,
+   "n": 12
+  },
+  "HW": {
+   "luma": 5.0,
+   "contrast": 3.5,
+   "sat": 5.4,
+   "warmth": 8.8,
+   "n": 12
+  },
+  "HS": {
+   "luma": 2.8,
+   "contrast": -11.1,
+   "sat": -18.0,
+   "warmth": -0.1,
+   "n": 12
+  },
+  "HM": {
+   "luma": 5.0,
+   "contrast": 4.4,
+   "sat": -34.3,
+   "warmth": -0.6,
+   "n": 12
+  },
+  "HC": {
+   "luma": 1.8,
+   "contrast": 0.7,
+   "sat": -5.4,
+   "warmth": -3.9,
+   "n": 12
+  },
+  "LP9": {
+   "luma": -4.1,
+   "contrast": -2.0,
+   "sat": 4.0,
+   "warmth": -0.9,
+   "n": 12
+  },
+  "RPOS": {
+   "luma": 3.4,
+   "contrast": 2.3,
+   "sat": 1.4,
+   "warmth": 0.2,
+   "n": 12
+  },
+  "RBLEACH": {
+   "luma": 4.4,
+   "contrast": 10.9,
+   "sat": -9.8,
+   "warmth": 0.1,
+   "n": 12
+  },
+  "RCROSS": {
+   "luma": 6.4,
+   "contrast": 4.3,
+   "sat": 1.0,
+   "warmth": -0.9,
+   "n": 12
+  },
+  "RRETRO": {
+   "luma": 6.9,
+   "contrast": -8.5,
+   "sat": -10.4,
+   "warmth": 4.1,
+   "n": 12
+  },
+  "RHBW": {
+   "luma": 4.3,
+   "contrast": 13.1,
+   "sat": -34.3,
+   "warmth": -0.6,
+   "n": 12
+  },
+  "RSTD": {
+   "luma": 3.2,
+   "contrast": -0.5,
+   "sat": -2.7,
+   "warmth": 0.0,
+   "n": 12
+  },
+  "RSOFT": {
+   "luma": 13.9,
+   "contrast": -7.5,
+   "sat": -34.3,
+   "warmth": -0.6,
+   "n": 12
+  },
+  "RNEG": {
+   "luma": 3.9,
+   "contrast": -7.2,
+   "sat": -8.6,
+   "warmth": 1.2,
+   "n": 12
+  },
+  "RSTREET": {
+   "luma": 2.1,
+   "contrast": 5.9,
+   "sat": 1.0,
+   "warmth": 0.6,
+   "n": 12
+  },
+  "RCROSS2": {
+   "luma": 6.4,
+   "contrast": 5.4,
+   "sat": -1.7,
+   "warmth": 0.2,
+   "n": 12
+  },
+  "LM9": {
+   "luma": -15.3,
+   "contrast": 0.8,
+   "sat": 3.7,
+   "warmth": -2.4,
+   "n": 12
+  }
+ }
+}

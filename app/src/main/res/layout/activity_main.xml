@@ -362,14 +362,17 @@
             android:layout_gravity="bottom|end"
             android:layout_margin="16dp"
             android:background="#80000000"
+            android:gravity="end"
             android:padding="8dp"
             android:text="M9 · 彩色经典"
             android:textColor="#FFFFFF"
             android:textSize="13sp"
             android:visibility="gone" />
 
-        <!-- 底部入口胶囊行：左「调节」右「完美」，悬浮在预览底部、与右下角描述同边距对齐 -->
+        <!-- 底部入口胶囊行：左「调节」右「完美」，悬浮在预览底部、与右下角描述同边距对齐。
+             id 供 MainActivity 实测行宽，把右下角小字 maxWidth 压到本行右缘（防三段长文案重叠） -->
         <LinearLayout
+            android:id="@+id/rowBottomPills"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="bottom|start"

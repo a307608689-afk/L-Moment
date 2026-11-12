@@ -111,6 +111,12 @@ class MainActivity : AppCompatActivity(), AiUiHost {
     private lateinit var imgPreview: ZoomableImageView
     private lateinit var txtEmpty: TextView
     private lateinit var txtStyleHint: TextView
+    /** 左下角胶囊行（调节/完美/HDR）：实测其宽度供右下角小字限宽，防三段长文案重叠 */
+    private lateinit var rowBottomPills: LinearLayout
+    /** 小字原始文案（未折行）：限宽变化（旋转/按钮显隐）时据此重算语义折行 */
+    private var hintRaw: String = ""
+    /** 内部回写折行文本时置位，防 TextWatcher 把折行结果误记为原始文案（无限循环） */
+    private var hintInternalSet = false
     private lateinit var progress: ProgressBar
     // 大图（≥1 亿像素）导出浮层：环形进度 + 百分比，替代普通转圈（仅 exportFullRes 大图分支）
     private lateinit var bigExportOverlay: View
@@ -906,6 +912,21 @@ class MainActivity : AppCompatActivity(), AiUiHost {
         tabletCol1 = findViewById(R.id.tabletCol1)
         tabletCol2 = findViewById(R.id.tabletCol2)
         floatStage = findViewById(R.id.floatStage)
+        rowBottomPills = findViewById(R.id.rowBottomPills)
+        // 右下角色彩小字限宽（防三段长文案压住左下按钮行）：
+        // 左按钮行宽度变化（完美/HDR 显隐）与舞台尺寸变化（旋转/换档）时自动重算
+        rowBottomPills.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyHintMaxWidth() }
+        floatStage.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyHintMaxWidth() }
+        // 记录原始文案并在限宽变化后重算语义折行（内部回写走 hintInternalSet 旁路）
+        txtStyleHint.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                if (hintInternalSet) return
+                hintRaw = s?.toString() ?: ""
+                refreshHintWrap()
+            }
+        })
         // 调节浮层统一挂到舞台层（预览区+右栏之上）：手机档视觉与原预览区内浮层一致，
         // 平板横屏才能悬浮在右栏右下角（XML 里 adjPanel 的宿主是预览区，够不到右栏）
         (adjPanel.parent as? ViewGroup)?.removeView(adjPanel)
@@ -1039,8 +1060,32 @@ class MainActivity : AppCompatActivity(), AiUiHost {
             it != FilterCategory.ALL && it != FilterCategory.CUSTOM && style in it.styles
         }
 
+    /**
+     * 风格签名（assets/ai_style_signatures.json，离线烘焙）：该档对多样化图集的
+     * 典型作用量（luma/contrast/sat/warmth，与 [imageStats] 同字段同口径）。
+     * 懒加载一次缓存；资产缺失/损坏返回 null（模型链档无签名是正常路径）。
+     */
+    private var styleSignatures: org.json.JSONObject? = null
+    private var styleSignaturesTried = false
+
+    private fun signaturesOf(styleId: String): org.json.JSONObject? {
+        if (!styleSignaturesTried) {
+            styleSignaturesTried = true
+            styleSignatures = try {
+                assets.open("ai_style_signatures.json").bufferedReader().use { it.readText() }
+                    .let { org.json.JSONObject(it).optJSONObject("styles") }
+            } catch (t: Throwable) {
+                DiagLog.w("AiHost", "签名表不可用：${t.message}")
+                null
+            }
+        }
+        return styleSignatures?.optJSONObject(styleId)
+    }
+
     override fun imageStats(): JSONObject? {
-        val bmp = onMainSync { currentDisplayBitmap() } ?: return null
+        // 统计基准必须固定为原图：套风格后 resultBitmap 是处理后的，多轮对话里模型
+        // 会失去「原图长什么样」的参照，无法做贴合微调。画布效果由 previewBase64 负责。
+        val bmp = onMainSync { originalBitmap ?: currentDisplayBitmap() } ?: return null
         return try {
             if (bmp.isRecycled) null else ImageStats.describe(bmp)
         } catch (t: Throwable) {
@@ -1140,6 +1185,10 @@ class MainActivity : AppCompatActivity(), AiUiHost {
                         put("note", "已切换「${builtIn.label}」" +
                             (if (aiStrengthPct < 100) "（按力度 $aiStrengthPct% 应用）" else "") +
                             "，渲染约 1~2 秒后生效")
+                        // 风格签名：该档对多样化图集的典型作用量（与原图统计同口径）。
+                        // 模型据此做「本图现状 × 作用量 → 过冲预判」的贴合微调；
+                        // 模型链档（M9 系等）无签名，缺省靠语义 + 统计微调。
+                        signaturesOf(builtIn.id)?.let { put("signature", it) }
                     }
                 }
                 custom != null -> {
@@ -4421,6 +4470,7 @@ class MainActivity : AppCompatActivity(), AiUiHost {
                 valueText.text = "$progress"
                 styleVal(valueText, progress, def)
                 dimIndexById[s.id]?.let { dimUserTouched[it] = true }
+                onUserSettingsChanged()   // 批量：这张被单独调整，同时成为本批新配方（与 setupSlider 同口径）
             }
 
             override fun onStartTrackingTouch(s: SeekBar) {
@@ -5959,10 +6009,10 @@ class MainActivity : AppCompatActivity(), AiUiHost {
                 DiagLog.i("FullRes", "自定义 LUT 走 CustomLutPost 全图引导滤波，无法按带等价复现 → 按工作版导出")
             }
         }
-        // 原图卡（无色彩）也允许导出「原图 + 调节」；两者皆无才拦截
+        // 原图卡（无色彩）也允许导出「原图 + 调节」；两者皆无 → 原样直通导出
+        // （JPG=导入原字节零重编码，RAW=导入期显影的全尺寸字节，见 [exportPassthrough]）
         if (!hasColor() && !hasAdjustments()) {
-            toast("请先选择一个滤镜")
-            notifyExportDone(false)
+            exportPassthrough(bytes)
             return
         }
         val customDef = currentCustomId?.let { CustomStyleStore.byId(it) }
@@ -6104,6 +6154,76 @@ class MainActivity : AppCompatActivity(), AiUiHost {
                     }
                 )
                 notifyExportDone(uri != null)
+            }
+        }
+    }
+
+    /**
+     * 原样直通导出（无色彩 + 无任何调节）：跳过解码与中性重编码，工作字节直接落盘。
+     *
+     * 字节来源按导入路径分档：
+     * - JPG 直通导入（引擎上限内）：originalBytes 即导入原字节（仅做过 EXIF 方向归一 /
+     *   动态照片截断），像素逐字节无损、EXIF 天然完整；
+     * - RAW 源：originalBytes 为导入期显影的全尺寸 JPEG95（LibRaw 解码 + 白平衡/曲线
+     *   与预览同源，已从源 DNG 回填 EXIF），跳过旧链的 8-bit 中性重放；
+     * - 超限 JPG / HEIF / PNG 等：导入期工作字节（全尺寸 JPEG95 + EXIF 回填），
+     *   比旧中性链少一代编码。
+     *
+     * 元数据语义与常规导出完全一致：ExportMark（徽章/设备标识，badge 关=剥源徽章）
+     * → HDR 装配（源自带增益图原样回嵌 / HDR 开关合成增益图）→ 保存。全程不触碰 SDR 像素。
+     * 收尾段（权限/徽章/HDR/保存/toast）与 [export] 的工作版尾部同口径——
+     * 任一侧改动必须同步另一侧。
+     */
+    private fun exportPassthrough(srcJpeg: ByteArray) {
+        progress.visible()
+        val gen = ++processingGeneration
+        // HDR 开关快照（同 export：进线程前定死本次语义）
+        val hdrOn = hdrBoost
+        executor.execute {
+            val t0 = System.currentTimeMillis()
+            try {
+                // HDR 数据解析与常规链同口径。srcSdr 传 null：无色彩无调节时输出==源 SDR，
+                // 源自带增益图无需重标定，原样回嵌即可（免一次双图解码）。
+                val rawLuma = ensureRawLinearLuma(hdrOn)
+                val hdrForExport = resolveHdrForExport(pendingHdr, null, srcJpeg, hdrOn, rawLuma)
+                mainHandler.post {
+                    progress.gone()
+                    if (gen != processingGeneration) { notifyExportDone(false); return@post }
+                    if (Build.VERSION.SDK_INT <= 28 && !hasWritePermission()) {
+                        requestWritePermission { export() }
+                        return@post
+                    }
+                    val badgeOn = SettingsStore.badgeEnabled(this)
+                    val deviceMode = SettingsStore.deviceInfoModeCode(this)
+                    val marked = ExportMark.mark(srcJpeg, badgeOn, deviceMode)
+                    if (marked === srcJpeg) DiagLog.w("Export",
+                        if (badgeOn) "徽章写入失败（返回原字节）" else "徽章关闭：源图无徽章元数据（原样返回）")
+                    // HDR 回嵌：徽章之后装配（徽章链会移除 XMP/MPF，不能放它前面）
+                    val hdrSrc = hdrForExport
+                    val finalBytes = if (hdrSrc != null) HdrGainMap.embed(marked, hdrSrc)
+                        else HdrGainMap.truncateToPrimary(marked)
+                    val hdrChk = HdrGainMap.verify(finalBytes)
+                    val uri = saveWithFormat(finalBytes, "orig")
+                    DiagLog.i("Export", "原样直通导出 ${finalBytes.size}B " +
+                        (if (sourceIsRaw) "(RAW显影字节) " else "") +
+                        "HDR=${hdrSrc != null} 耗时 ${System.currentTimeMillis() - t0}ms · " +
+                        "保存${if (uri != null) "成功" else "失败"}")
+                    toast(
+                        when {
+                            uri == null -> "导出失败，请重试（详情见日志）"
+                            hdrSrc != null && !hdrChk.ok -> "已保存到相册 · HDR 数据未完整保留"
+                            else -> "已保存到相册"
+                        }
+                    )
+                    notifyExportDone(uri != null)
+                }
+            } catch (t: Throwable) {
+                DiagLog.e("Export", "原样导出异常", t)
+                mainHandler.post {
+                    progress.gone()
+                    if (gen == processingGeneration) toast("导出失败，请重试（详情见日志）")
+                    notifyExportDone(false)
+                }
             }
         }
     }
@@ -6808,6 +6928,60 @@ class MainActivity : AppCompatActivity(), AiUiHost {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /**
+     * 右下角小字（txtStyleHint）限宽：右缘不得超过左下按钮行（rowBottomPills）的左缘。
+     * 三段式长文案（如「ARRI 709 · 基础影视 · 干净中性」）超宽时自动折两行、右对齐，
+     * 结构上杜绝与「调节/完美/HDR」重叠。舞台未布局或按钮行尚未测量时直接跳过
+     * （监听器会在其布局完成后再次触发）。下限 140dp 防极端窄屏下小字退化。
+     */
+    private fun applyHintMaxWidth() {
+        val stageW = floatStage.width
+        if (stageW <= 0) return
+        val avail = stageW - dp(16) * 2 - dp(8) - rowBottomPills.width
+        val w = maxOf(avail, dp(140))
+        if (txtStyleHint.maxWidth != w) txtStyleHint.maxWidth = w
+        refreshHintWrap()
+    }
+
+    /**
+     * 小字语义折行（方案 A）：单行放不下时不在字中间硬断（会产生孤字成行），
+     * 而是按「 · 」分段贪心装箱——每行尽量多装完整语义段，断点永远落在分隔符上：
+     * ```
+     * ARRI 709 · 基础影视
+     * 干净中性
+     * ```
+     * 无「 · 」或未超宽时保持原文；限宽变化（旋转/完美/HDR 显隐）后按 hintRaw 重算。
+     */
+    private fun refreshHintWrap() {
+        val raw = hintRaw
+        val maxW = txtStyleHint.maxWidth
+        if (raw.isEmpty() || maxW <= 0 || !raw.contains(" · ") ||
+            txtStyleHint.paint.measureText(raw) <= maxW
+        ) {
+            setHintTextInternal(raw)
+            return
+        }
+        val segs = raw.split(" · ")
+        val lines = ArrayList<String>(segs.size)
+        var cur = segs[0]
+        for (i in 1 until segs.size) {
+            val cand = "$cur · ${segs[i]}"
+            if (txtStyleHint.paint.measureText(cand) <= maxW) cur = cand else {
+                lines.add(cur); cur = segs[i]
+            }
+        }
+        lines.add(cur)
+        setHintTextInternal(lines.joinToString("\n"))
+    }
+
+    /** 回写折行文本（旁路 hintInternalSet 防 TextWatcher 回环）；内容相同不写避免无谓重排 */
+    private fun setHintTextInternal(t: String) {
+        if (txtStyleHint.text?.toString() == t) return
+        hintInternalSet = true
+        txtStyleHint.text = t
+        hintInternalSet = false
+    }
 
     private fun fallbackMsg(style: ColorEngine.Style): String =
         if (style == ColorEngine.Style.LM9) "「${style.label}」模型不可用，已切换为 M9"

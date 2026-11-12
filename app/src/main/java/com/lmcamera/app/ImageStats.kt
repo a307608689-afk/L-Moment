@@ -42,6 +42,11 @@ object ImageStats {
         var sumLum2 = 0.0
         var hueWeight = DoubleArray(12)
         var satPixels = 0
+        // 场景线索（RGB 启发式，给纯文本模型的「看图选型」原料）：误报代价低——
+        // 沙漠/黄墙误报肤色只是倾向选肤色友好档，vision 模型有图可推翻。
+        var skinPx = 0
+        var skyPx = 0
+        var greenPx = 0
 
         for (p in px) {
             val r = (p shr 16) and 0xFF
@@ -51,6 +56,13 @@ object ImageStats {
             val lum = (299 * r + 587 * g + 114 * b) / 1000
             hist[lum]++
             sumLum2 += (lum.toDouble() * lum)
+
+            // 肤色：经典 RGB 窗口（暖主导、中高亮度）
+            if (r > 95 && g > 40 && b > 20 && r > g && g >= b && (r - b) > 15) skinPx++
+            // 天空：蓝主导且亮（含青白高光）
+            if (b > 120 && b > r + 20 && b >= g && lum > 140) skyPx++
+            // 绿植：绿主导且有一定饱和
+            if (g > 70 && g > r + 15 && g > b + 15) greenPx++
 
             val mx = maxOf(r, maxOf(g, b))
             val mn = minOf(r, minOf(g, b))
@@ -79,6 +91,9 @@ object ImageStats {
 
         val warmth = ((sumR - sumB).toDouble() / n) / 255.0 * 100.0
         val meanSat = sumSat / n * 100.0
+        val skinPct = round1(skinPx * 100.0 / n)
+        val skyPct = round1(skyPx * 100.0 / n)
+        val greenPct = round1(greenPx * 100.0 / n)
 
         val topHues = JSONArray()
         val order = (0 until 12).sortedByDescending { hueWeight[it] }
@@ -108,6 +123,11 @@ object ImageStats {
             put("meanSaturation", round1(meanSat))
             put("warmth", round1(warmth))
             put("dominantHues", topHues)
+            put("sceneHints", JSONObject().apply {
+                put("skinPct", skinPct)
+                put("skyPct", skyPct)
+                put("greenPct", greenPct)
+            })
         }
         json.put("summary", toText(json))
         return json
@@ -158,10 +178,19 @@ object ImageStats {
         } else {
             "无明显主色"
         }
+        // 场景线索：≥8% 才列出（低占比视为无该场景，防模型把沙漠当人像硬套人像档）
+        val scene = j.optJSONObject("sceneHints")
+        val sceneText = if (scene != null) {
+            val parts = ArrayList<String>()
+            if (scene.optDouble("skinPct", 0.0) >= 8.0) parts.add("人物/肤色 ${scene.optDouble("skinPct", 0.0)}%")
+            if (scene.optDouble("skyPct", 0.0) >= 8.0) parts.add("天空 ${scene.optDouble("skyPct", 0.0)}%")
+            if (scene.optDouble("greenPct", 0.0) >= 8.0) parts.add("绿植 ${scene.optDouble("greenPct", 0.0)}%")
+            if (parts.isNotEmpty()) "画面线索（启发式，仅供选型参考）：${parts.joinToString("、")}。" else ""
+        } else ""
         return "亮度均值 ${round1(mean)}（$tone），对比 ${round1(contrast)}（$cText），" +
             "饱和度 ${round1(sat)}（$sText），$wText；" +
             (if (clip.isEmpty()) "" else "注意：$clip") +
-            "主色：$hueText。"
+            "主色：$hueText。$sceneText"
     }
 
     private fun percentile(hist: IntArray, total: Int, q: Double): Int {
@@ -201,9 +230,9 @@ object ImageStats {
 
     private fun round1(v: Double): Double = Math.round(v * 10.0) / 10.0
 
-    /** 供「无视觉模型」时拼进 user 消息的文本块。 */
+    /** 供「无视觉模型」时拼进 user 消息的文本块（统计口径 = 原图，未套任何风格）。 */
     fun promptBlock(stats: JSONObject): String {
-        return "当前照片统计：" + stats.optString("summary") +
+        return "原图统计（未套任何风格）：\n" + stats.optString("summary") +
             "\n原始指标：" + stats.toString()
     }
 
